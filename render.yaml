@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: cinema-dashboard
+    runtime: static
+    rootDir: frontend
+    buildCommand: npm install && npm run build
+    staticPublishPath: build
+    envVars:
+      - key: REACT_APP_API_URL
+        value: ""
