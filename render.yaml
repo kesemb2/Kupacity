@@ -19,6 +19,4 @@ services:
     staticPublishPath: build
     envVars:
       - key: REACT_APP_API_URL
-        # Set this to the cinema-api URL after deploying, e.g.:
-        # https://cinema-api-xxxx.onrender.com
-        value: ""
+        value: "https://cinema-1-4p9y.onrender.com"
