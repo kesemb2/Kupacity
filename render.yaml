@@ -1,4 +1,16 @@
 services:
+  # Backend API (FastAPI)
+  - type: web
+    name: cinema-api
+    runtime: python
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11"
+
+  # Frontend Dashboard (React static site)
   - type: web
     name: cinema-dashboard
     runtime: static
@@ -7,4 +19,6 @@ services:
     staticPublishPath: build
     envVars:
       - key: REACT_APP_API_URL
+        # Set this to the cinema-api URL after deploying, e.g.:
+        # https://cinema-api-xxxx.onrender.com
         value: ""
