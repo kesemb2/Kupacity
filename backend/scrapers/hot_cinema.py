@@ -1,9 +1,11 @@
 """
-Scraper for Hot Cinema chain using Playwright (headless browser).
+Scraper for Hot Cinema chain using SeleniumBase in UC (Undetected
+Chromedriver) mode.
 
-No API needed - scrapes directly from the rendered website pages,
-including entering each screening's seat selection page to count
-occupied vs available seats.
+UC mode patches the chromedriver binary at runtime so that Cloudflare,
+DataDome, and similar bot-detection services cannot fingerprint it as
+automated.  This replaces the previous Playwright + stealth approach
+which was still getting 403'd.
 
 URL patterns:
 - Theater page:  https://hotcinema.co.il/theater/{id}/{slug}
@@ -13,49 +15,29 @@ URL patterns:
 Schedule:
 - Weekly:  scrape_movies()         - full movie catalog from all theaters
 - Daily:   scrape_screenings()     - screening schedule for next 7 days
-- 5 hours: scrape_ticket_updates() - enter each screening's seat page and count sold seats
+- 5 hours: scrape_ticket_updates() - enter each screening's seat page
 
-Anti-detection:
-- Rotates real-browser User-Agent strings each session
-- Randomised delays (2-7 s) between navigations
-- Human-like mouse movement + scroll before data extraction
-- playwright-stealth patches (webdriver, chrome.runtime, etc.)
-- Optional proxy via SCRAPER_PROXY_SERVER env var
+Proxy:
+    SCRAPER_PROXY_SERVER=http://user:pass@host:port
+
+Debug:
+    A screenshot is saved to backend/debug.png after the first page load
+    so you can visually confirm whether you're getting a CAPTCHA / block.
 """
 import asyncio
 import logging
 import os
 import random
 import re
+import time
 from datetime import datetime, timedelta
-from playwright.async_api import async_playwright, Page, Browser
-from playwright_stealth import stealth_async
+
+from seleniumbase import SB
+from selenium.webdriver.common.by import By
 
 from scrapers.base import BaseScraper, ScrapedMovie, ScrapedScreening
 
 logger = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-# Real-browser User-Agent pool (Chrome / Firefox / Edge on Windows & Mac)
-# ---------------------------------------------------------------------------
-_USER_AGENTS = [
-    # Chrome 131 – Windows
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-    # Chrome 130 – Mac
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
-    # Chrome 129 – Windows
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
-    # Firefox 132 – Windows
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:132.0) Gecko/20100101 Firefox/132.0",
-    # Firefox 131 – Mac
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:131.0) Gecko/20100101 Firefox/131.0",
-    # Edge 131 – Windows
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0",
-    # Chrome 131 – Linux
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-    # Safari 17 – Mac
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Safari/605.1.15",
-]
 
 # Branch list based on actual site data
 HOT_CINEMA_BRANCHES = {
@@ -74,6 +56,9 @@ HOT_CINEMA_BRANCHES = {
 BASE_URL = "https://hotcinema.co.il"
 TICKETS_URL = "https://tickets.hotcinema.co.il"
 
+# Where to save the debug screenshot (relative to the backend dir)
+_DEBUG_SCREENSHOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "debug.png")
+
 
 class HotCinemaScraper(BaseScraper):
 
@@ -90,135 +75,106 @@ class HotCinemaScraper(BaseScraper):
         return BASE_URL
 
     # ------------------------------------------------------------------
+    # SB context builder
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _sb_kwargs() -> dict:
+        """Build keyword arguments for ``SB(...)``."""
+        kwargs: dict = {
+            "uc": True,
+            "headless": True,
+            "locale_code": "en-US",
+        }
+
+        proxy = os.environ.get("SCRAPER_PROXY_SERVER")
+        if proxy:
+            # SB accepts "host:port" or "user:pass@host:port"
+            # Strip the scheme if present (SB adds its own).
+            cleaned = re.sub(r"^https?://", "", proxy)
+            kwargs["proxy"] = cleaned
+            logger.info(f"[Hot Cinema] Using proxy: {proxy}")
+
+        return kwargs
+
+    # ------------------------------------------------------------------
     # Anti-detection helpers
     # ------------------------------------------------------------------
 
     @staticmethod
-    async def _human_delay(lo: float = 2.0, hi: float = 7.0):
+    def _human_delay(lo: float = 2.0, hi: float = 7.0):
         """Sleep for a random duration to mimic human pacing."""
-        await asyncio.sleep(random.uniform(lo, hi))
+        time.sleep(random.uniform(lo, hi))
 
     @staticmethod
-    async def _simulate_human(page: Page):
-        """Move mouse to random coordinates and scroll slightly."""
-        # Random mouse movement (3-6 points)
-        for _ in range(random.randint(3, 6)):
-            x = random.randint(100, 1800)
-            y = random.randint(100, 900)
-            await page.mouse.move(x, y, steps=random.randint(5, 15))
-            await asyncio.sleep(random.uniform(0.05, 0.2))
+    def _simulate_human(sb):
+        """Scroll a bit and move mouse to look human."""
+        try:
+            scroll_y = random.randint(150, 500)
+            sb.execute_script(f"window.scrollBy(0, {scroll_y});")
+            time.sleep(random.uniform(0.3, 0.8))
+            sb.execute_script(f"window.scrollBy(0, -{random.randint(50, scroll_y)});")
+            time.sleep(random.uniform(0.2, 0.5))
+        except Exception:
+            pass
 
-        # Gentle scroll down then back up
-        scroll_y = random.randint(150, 500)
-        await page.mouse.wheel(0, scroll_y)
-        await asyncio.sleep(random.uniform(0.3, 0.8))
-        await page.mouse.wheel(0, -random.randint(50, scroll_y))
-        await asyncio.sleep(random.uniform(0.2, 0.5))
+    def _open_url(self, sb, url: str, *, take_debug_screenshot: bool = False):
+        """Navigate with UC reconnect, random delay, and human jitter.
 
-    # ------------------------------------------------------------------
-    # Browser / page lifecycle
-    # ------------------------------------------------------------------
-
-    async def _launch_browser(self) -> tuple:
-        """Launch Playwright Chromium with stealth flags and optional proxy.
-
-        To route traffic through a proxy, set the env var:
-            SCRAPER_PROXY_SERVER=http://user:pass@host:port
+        ``uc_open_with_reconnect`` lets SeleniumBase handle Cloudflare
+        challenge pages automatically (it waits, clicks the checkbox if
+        needed, and reconnects the driver).
         """
-        pw = await async_playwright().start()
+        self._human_delay()
+        try:
+            sb.uc_open_with_reconnect(url, reconnect_time=6)
+        except Exception:
+            # Fallback for sites that don't trigger a challenge
+            sb.open(url)
 
-        launch_kwargs: dict = {
-            "headless": True,
-            "args": [
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
-                "--disable-blink-features=AutomationControlled",
-                "--disable-infobars",
-                "--window-size=1920,1080",
-            ],
-        }
-
-        # ---- Proxy configuration (optional) ----------------------------
-        proxy_server = os.environ.get("SCRAPER_PROXY_SERVER")
-        if proxy_server:
-            proxy_cfg: dict = {"server": proxy_server}
-            proxy_user = os.environ.get("SCRAPER_PROXY_USERNAME")
-            proxy_pass = os.environ.get("SCRAPER_PROXY_PASSWORD")
-            if proxy_user:
-                proxy_cfg["username"] = proxy_user
-            if proxy_pass:
-                proxy_cfg["password"] = proxy_pass
-            launch_kwargs["proxy"] = proxy_cfg
-            logger.info(f"[Hot Cinema] Using proxy: {proxy_server}")
-        # ----------------------------------------------------------------
-
-        browser = await pw.chromium.launch(**launch_kwargs)
-        return pw, browser
-
-    async def _new_page(self, browser: Browser) -> Page:
-        """Create a new browser context + page with a random UA and stealth."""
-        ua = random.choice(_USER_AGENTS)
-        logger.debug(f"[Hot Cinema] Selected UA: {ua}")
-
-        context = await browser.new_context(
-            viewport={"width": 1920, "height": 1080},
-            locale="en-US",
-            timezone_id="Asia/Jerusalem",
-            user_agent=ua,
-            java_script_enabled=True,
-            color_scheme="light",
-            # Extra realistic headers
-            extra_http_headers={
-                "Accept-Language": "he-IL,he;q=0.9,en-US;q=0.8,en;q=0.7",
-                "Accept-Encoding": "gzip, deflate, br",
-                "Sec-CH-UA": '"Chromium";v="131", "Not_A Brand";v="24"',
-                "Sec-CH-UA-Mobile": "?0",
-                "Sec-CH-UA-Platform": '"Windows"',
-            },
-        )
-
-        page = await context.new_page()
-        await stealth_async(page)
-        return page
-
-    async def _goto_with_stealth(self, page: Page, url: str,
-                                  timeout: int = 30000) -> object:
-        """Navigate to *url* with human-like delay + mouse jitter."""
-        await self._human_delay()
-        resp = await page.goto(url, wait_until="networkidle", timeout=timeout)
-
-        # Log the actual response for debugging 403s
-        if resp and resp.status >= 400:
-            body_snippet = ""
+        if take_debug_screenshot:
             try:
-                body_snippet = (await resp.text())[:300]
-            except Exception:
-                pass
-            logger.warning(
-                f"[Hot Cinema] HTTP {resp.status} for {url}"
-                + (f" | body: {body_snippet}" if body_snippet else "")
-            )
+                sb.save_screenshot(_DEBUG_SCREENSHOT)
+                logger.info(f"[Hot Cinema] Debug screenshot saved → {_DEBUG_SCREENSHOT}")
+            except Exception as e:
+                logger.debug(f"Screenshot failed: {e}")
 
-        await self._simulate_human(page)
-        return resp
+        self._simulate_human(sb)
 
     # ------------------------------------------------------------------
-    # Seat counting: enter the booking/seats page and count occupied seats
+    # Selenium-based element helpers
     # ------------------------------------------------------------------
 
-    async def _count_seats_on_page(self, page: Page) -> tuple[int, int]:
-        """
-        On a seat selection page, count total seats and occupied seats.
-        Returns (total_seats, tickets_sold).
+    @staticmethod
+    def _find_elements(sb, css: str) -> list:
+        """Wrapper around find_elements that never raises."""
+        try:
+            return sb.find_elements(css)
+        except Exception:
+            return []
 
-        Seat maps typically show seats as SVG elements, divs, or buttons.
-        Available seats are clickable/selectable, occupied seats have a
-        different class/style (e.g. 'sold', 'occupied', 'taken', 'unavailable').
-        """
+    @staticmethod
+    def _el_text(el) -> str:
+        try:
+            return (el.text or "").strip()
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _el_attr(el, attr: str) -> str:
+        try:
+            return (el.get_attribute(attr) or "").strip()
+        except Exception:
+            return ""
+
+    # ------------------------------------------------------------------
+    # Seat counting
+    # ------------------------------------------------------------------
+
+    def _count_seats_on_page(self, sb) -> tuple[int, int]:
         total = 0
         sold = 0
 
-        # Strategy 1: Look for individual seat elements with status indicators
         seat_selectors = [
             'svg [class*="seat"], svg [data-seat], svg rect[class], svg circle[class]',
             '[class*="seat"]:not([class*="seatmap"]):not([class*="seating"]):not([class*="seats-"]), '
@@ -228,35 +184,37 @@ class HotCinemaScraper(BaseScraper):
 
         for selector in seat_selectors:
             try:
-                seats = await page.query_selector_all(selector)
+                seats = self._find_elements(sb, selector)
                 if len(seats) < 5:
                     continue
 
                 total = len(seats)
                 for seat in seats:
-                    classes = (await seat.get_attribute('class') or "").lower()
-                    data_status = (await seat.get_attribute('data-status') or "").lower()
-                    aria_disabled = (await seat.get_attribute('aria-disabled') or "").lower()
-                    style = (await seat.get_attribute('style') or "").lower()
+                    classes = self._el_attr(seat, "class").lower()
+                    data_status = self._el_attr(seat, "data-status").lower()
+                    aria_disabled = self._el_attr(seat, "aria-disabled").lower()
+                    style = self._el_attr(seat, "style").lower()
 
                     is_sold = any([
-                        'sold' in classes,
-                        'occupied' in classes,
-                        'taken' in classes,
-                        'unavailable' in classes,
-                        'reserved' in classes,
-                        'disabled' in classes,
-                        'booked' in classes,
-                        'תפוס' in classes,
-                        data_status in ('sold', 'occupied', 'taken', 'unavailable', 'reserved', 'booked'),
-                        aria_disabled == 'true',
-                        'pointer-events: none' in style and 'opacity' in style,
+                        "sold" in classes,
+                        "occupied" in classes,
+                        "taken" in classes,
+                        "unavailable" in classes,
+                        "reserved" in classes,
+                        "disabled" in classes,
+                        "booked" in classes,
+                        "תפוס" in classes,
+                        data_status in ("sold", "occupied", "taken", "unavailable", "reserved", "booked"),
+                        aria_disabled == "true",
+                        "pointer-events: none" in style and "opacity" in style,
                     ])
 
-                    fill = (await seat.get_attribute('fill') or "").lower()
+                    fill = self._el_attr(seat, "fill").lower()
                     if fill and not is_sold:
-                        sold_colors = ['#ccc', '#ddd', '#999', '#888', '#666', 'gray', 'grey',
-                                       '#ff0000', 'red', '#c0c0c0', '#808080']
+                        sold_colors = [
+                            "#ccc", "#ddd", "#999", "#888", "#666", "gray", "grey",
+                            "#ff0000", "red", "#c0c0c0", "#808080",
+                        ]
                         if any(c in fill for c in sold_colors):
                             is_sold = True
 
@@ -269,17 +227,14 @@ class HotCinemaScraper(BaseScraper):
                 logger.debug(f"Seat selector '{selector}' failed: {e}")
                 continue
 
-        # Strategy 2: text-based seat indicator
         if total == 0:
             try:
-                body_text = await page.inner_text('body')
-                remaining_match = re.search(r'נותרו\s+(\d+)\s+מקומות', body_text)
+                body_text = sb.get_text("body")
+                remaining_match = re.search(r"נותרו\s+(\d+)\s+מקומות", body_text)
                 if remaining_match:
-                    available = int(remaining_match.group(1))
-                    total = available
+                    total = int(remaining_match.group(1))
                     sold = 0
-
-                ratio_match = re.search(r'(\d+)\s*/\s*(\d+)', body_text)
+                ratio_match = re.search(r"(\d+)\s*/\s*(\d+)", body_text)
                 if ratio_match:
                     sold = int(ratio_match.group(1))
                     total = int(ratio_match.group(2))
@@ -288,87 +243,74 @@ class HotCinemaScraper(BaseScraper):
 
         return total, sold
 
-    async def _get_seat_count_for_screening(self, page: Page, screening_url: str) -> tuple[int, int]:
-        """Navigate to a screening's seat selection page and count seats."""
+    def _get_seat_count_for_screening(self, sb, screening_url: str) -> tuple[int, int]:
         try:
-            resp = await self._goto_with_stealth(page, screening_url)
-            if resp and resp.status >= 400:
-                return 0, 0
-            await page.wait_for_timeout(3000)
-            total, sold = await self._count_seats_on_page(page)
-            return total, sold
+            self._open_url(sb, screening_url)
+            time.sleep(3)
+            return self._count_seats_on_page(sb)
         except Exception as e:
             logger.warning(f"Seat count failed for {screening_url}: {e}")
             return 0, 0
 
     # ------------------------------------------------------------------
-    # Theater page scraping: get movies and showtimes with booking links
+    # Theater page scraping
     # ------------------------------------------------------------------
 
-    async def _scrape_theater_page(self, page: Page, branch_id: str,
-                                    branch_info: dict) -> tuple[list[ScrapedMovie], list[dict]]:
-        """
-        Scrape a single theater page for movies and screenings.
-        Returns movies and screening_infos (dicts with booking URLs for later seat counting).
-        """
-        movies = []
-        screening_infos = []
+    def _scrape_theater_page(self, sb, branch_id: str,
+                              branch_info: dict) -> tuple[list[ScrapedMovie], list[dict]]:
+        movies: list[ScrapedMovie] = []
+        screening_infos: list[dict] = []
 
         url = f"{BASE_URL}/theater/{branch_id}/{branch_info['slug']}"
         try:
-            resp = await self._goto_with_stealth(page, url)
-            if resp and resp.status >= 400:
-                return movies, screening_infos
+            self._open_url(sb, url, take_debug_screenshot=(branch_id == "1"))
 
-            # Find movie elements
-            movie_elements = await page.query_selector_all(
+            movie_elements = self._find_elements(
+                sb,
                 '[class*="movie"], [class*="Movie"], [class*="film"], [class*="Film"], '
-                '[data-movie], article, .card, [class*="item"]'
+                '[data-movie], article, .card, [class*="item"]',
             )
 
             for elem in movie_elements:
                 try:
-                    title_el = await elem.query_selector(
-                        'h2, h3, h4, [class*="title"], [class*="name"], [class*="Title"], [class*="Name"]'
+                    title_els = elem.find_elements(
+                        By.CSS_SELECTOR,
+                        'h2, h3, h4, [class*="title"], [class*="name"], [class*="Title"], [class*="Name"]',
                     )
-                    if not title_el:
+                    if not title_els:
                         continue
-                    title = (await title_el.inner_text()).strip()
+                    title = self._el_text(title_els[0])
                     if not title or len(title) < 2:
                         continue
 
                     poster_url = ""
-                    img_el = await elem.query_selector('img')
-                    if img_el:
-                        poster_url = await img_el.get_attribute('src') or ""
-                        if poster_url and not poster_url.startswith('http'):
+                    imgs = elem.find_elements(By.CSS_SELECTOR, "img")
+                    if imgs:
+                        poster_url = self._el_attr(imgs[0], "src")
+                        if poster_url and not poster_url.startswith("http"):
                             poster_url = f"{BASE_URL}{poster_url}"
 
-                    movie = ScrapedMovie(
-                        title=title,
-                        title_he=title,
-                        poster_url=poster_url,
-                    )
-                    movies.append(movie)
+                    movies.append(ScrapedMovie(title=title, title_he=title, poster_url=poster_url))
 
-                    showtime_elements = await elem.query_selector_all(
+                    showtime_els = elem.find_elements(
+                        By.CSS_SELECTOR,
                         'a[href*="tickets"], a[href*="booking"], a[href*="order"], '
                         'a[href*="seats"], a[href*="site"], '
                         '[class*="showtime"], [class*="time"], [class*="screening"], '
                         '[class*="Showtime"], [class*="Time"], [class*="Screening"], '
-                        'button[class*="time"], a[class*="time"]'
+                        'button[class*="time"], a[class*="time"]',
                     )
 
-                    for st_el in showtime_elements:
+                    for st_el in showtime_els:
                         try:
-                            time_text = (await st_el.inner_text()).strip()
-                            time_match = re.search(r'(\d{1,2}):(\d{2})', time_text)
+                            time_text = self._el_text(st_el)
+                            time_match = re.search(r"(\d{1,2}):(\d{2})", time_text)
                             if not time_match:
                                 continue
 
                             hour, minute = int(time_match.group(1)), int(time_match.group(2))
                             showtime = datetime.now().replace(
-                                hour=hour, minute=minute, second=0, microsecond=0
+                                hour=hour, minute=minute, second=0, microsecond=0,
                             )
                             if showtime < datetime.now():
                                 showtime += timedelta(days=1)
@@ -376,9 +318,14 @@ class HotCinemaScraper(BaseScraper):
                             format_text = time_text.upper()
                             parent_text = ""
                             try:
-                                parent = await st_el.evaluate_handle('el => el.closest("[class*=format], [class*=Format], [class*=type], [class*=Type]")')
+                                parent = sb.execute_script(
+                                    "return arguments[0].closest("
+                                    "'[class*=format],[class*=Format],[class*=type],[class*=Type]'"
+                                    ")",
+                                    st_el,
+                                )
                                 if parent:
-                                    parent_text = (await parent.inner_text() if hasattr(parent, 'inner_text') else "").upper()
+                                    parent_text = (parent.text or "").upper()
                             except Exception:
                                 pass
                             combined_text = format_text + " " + parent_text
@@ -393,22 +340,29 @@ class HotCinemaScraper(BaseScraper):
                             elif "SCREENX" in combined_text:
                                 screen_format = "ScreenX"
 
-                            hall = ""
-                            hall_attr = await st_el.get_attribute('data-hall')
-                            if hall_attr:
-                                hall = hall_attr
+                            hall = self._el_attr(st_el, "data-hall")
 
                             booking_url = ""
-                            href = await st_el.get_attribute('href')
+                            href = self._el_attr(st_el, "href")
                             if href:
-                                if href.startswith('http'):
+                                if href.startswith("http"):
                                     booking_url = href
-                                elif href.startswith('/'):
-                                    booking_url = f"{TICKETS_URL}{href}" if 'site' in href or 'seats' in href else f"{BASE_URL}{href}"
+                                elif href.startswith("/"):
+                                    booking_url = (
+                                        f"{TICKETS_URL}{href}"
+                                        if "site" in href or "seats" in href
+                                        else f"{BASE_URL}{href}"
+                                    )
                             else:
-                                data_url = await st_el.get_attribute('data-url') or await st_el.get_attribute('data-href') or ""
+                                data_url = (
+                                    self._el_attr(st_el, "data-url")
+                                    or self._el_attr(st_el, "data-href")
+                                )
                                 if data_url:
-                                    booking_url = data_url if data_url.startswith('http') else f"{TICKETS_URL}{data_url}"
+                                    booking_url = (
+                                        data_url if data_url.startswith("http")
+                                        else f"{TICKETS_URL}{data_url}"
+                                    )
 
                             screening_infos.append({
                                 "movie_title": title,
@@ -419,56 +373,51 @@ class HotCinemaScraper(BaseScraper):
                                 "format": screen_format,
                                 "booking_url": booking_url,
                             })
-
                         except Exception as e:
                             logger.debug(f"Showtime parse error: {e}")
                             continue
-
                 except Exception as e:
                     logger.debug(f"Movie element parse error: {e}")
                     continue
-
         except Exception as e:
             logger.warning(f"Hot Cinema theater {branch_id} page scrape failed: {e}")
 
         return movies, screening_infos
 
-    async def _scrape_movie_detail(self, page: Page, movie_path: str) -> ScrapedMovie | None:
-        """Scrape detailed info from a movie's dedicated page."""
+    def _scrape_movie_detail(self, sb, movie_path: str) -> ScrapedMovie | None:
         try:
-            url = f"{BASE_URL}{movie_path}" if movie_path.startswith('/') else movie_path
-            resp = await self._goto_with_stealth(page, url, timeout=20000)
-            if resp and resp.status >= 400:
-                return None
+            url = f"{BASE_URL}{movie_path}" if movie_path.startswith("/") else movie_path
+            self._open_url(sb, url)
 
             title = ""
-            title_el = await page.query_selector('h1, [class*="movieTitle"], [class*="MovieTitle"]')
-            if title_el:
-                title = (await title_el.inner_text()).strip()
+            title_els = self._find_elements(sb, 'h1, [class*="movieTitle"], [class*="MovieTitle"]')
+            if title_els:
+                title = self._el_text(title_els[0])
 
             genre = ""
-            genre_el = await page.query_selector('[class*="genre"], [class*="Genre"]')
-            if genre_el:
-                genre = (await genre_el.inner_text()).strip()
+            genre_els = self._find_elements(sb, '[class*="genre"], [class*="Genre"]')
+            if genre_els:
+                genre = self._el_text(genre_els[0])
 
             duration = 0
-            duration_el = await page.query_selector('[class*="duration"], [class*="Duration"], [class*="length"]')
-            if duration_el:
-                dur_text = await duration_el.inner_text()
-                dur_match = re.search(r'(\d+)', dur_text)
+            dur_els = self._find_elements(sb, '[class*="duration"], [class*="Duration"], [class*="length"]')
+            if dur_els:
+                dur_match = re.search(r"(\d+)", self._el_text(dur_els[0]))
                 if dur_match:
                     duration = int(dur_match.group(1))
 
             director = ""
-            director_el = await page.query_selector('[class*="director"], [class*="Director"]')
-            if director_el:
-                director = (await director_el.inner_text()).strip()
+            dir_els = self._find_elements(sb, '[class*="director"], [class*="Director"]')
+            if dir_els:
+                director = self._el_text(dir_els[0])
 
             poster_url = ""
-            poster_el = await page.query_selector('[class*="poster"] img, [class*="Poster"] img, .movie-image img')
-            if poster_el:
-                poster_url = await poster_el.get_attribute('src') or ""
-                if poster_url and not poster_url.startswith('http'):
+            poster_els = self._find_elements(
+                sb, '[class*="poster"] img, [class*="Poster"] img, .movie-image img',
+            )
+            if poster_els:
+                poster_url = self._el_attr(poster_els[0], "src")
+                if poster_url and not poster_url.startswith("http"):
                     poster_url = f"{BASE_URL}{poster_url}"
 
             if title:
@@ -481,42 +430,33 @@ class HotCinemaScraper(BaseScraper):
         return None
 
     # ------------------------------------------------------------------
-    # Public scrape methods (called by the scheduler)
+    # Sync implementations (run inside SB context)
     # ------------------------------------------------------------------
 
-    async def scrape_movies(self) -> list[ScrapedMovie]:
-        """Weekly: scrape all movies from all theater pages + movie detail pages."""
-        all_movies = {}
-        pw, browser = await self._launch_browser()
-        try:
-            page = await self._new_page(browser)
-
+    def _sync_scrape_movies(self) -> list[ScrapedMovie]:
+        all_movies: dict[str, ScrapedMovie] = {}
+        with SB(**self._sb_kwargs()) as sb:
             for branch_id, branch_info in HOT_CINEMA_BRANCHES.items():
-                movies, _ = await self._scrape_theater_page(page, branch_id, branch_info)
+                movies, _ = self._scrape_theater_page(sb, branch_id, branch_info)
                 for m in movies:
                     if m.title and m.title not in all_movies:
                         all_movies[m.title] = m
 
-            # Also scrape movie detail pages from the homepage
+            # Movie detail pages from homepage
             try:
-                await self._goto_with_stealth(page, BASE_URL)
-                movie_links = await page.query_selector_all('a[href*="/movie/"]')
-                movie_paths = set()
-                for link in movie_links:
-                    href = await link.get_attribute('href')
-                    if href and '/movie/' in href:
+                self._open_url(sb, BASE_URL)
+                links = self._find_elements(sb, 'a[href*="/movie/"]')
+                movie_paths: set[str] = set()
+                for link in links:
+                    href = self._el_attr(link, "href")
+                    if href and "/movie/" in href:
                         movie_paths.add(href)
                 for path in list(movie_paths)[:30]:
-                    movie = await self._scrape_movie_detail(page, path)
+                    movie = self._scrape_movie_detail(sb, path)
                     if movie and movie.title and movie.title not in all_movies:
                         all_movies[movie.title] = movie
             except Exception as e:
                 logger.warning(f"Hot Cinema homepage scrape failed: {e}")
-
-            await page.close()
-        finally:
-            await browser.close()
-            await pw.stop()
 
         result = list(all_movies.values())
         if not result:
@@ -524,27 +464,24 @@ class HotCinemaScraper(BaseScraper):
         logger.info(f"[Hot Cinema] Scraped {len(result)} unique movies")
         return result
 
-    async def scrape_screenings(self) -> list[ScrapedScreening]:
-        """Daily: scrape screenings from all theater pages for next 7 days."""
-        all_screenings = []
-        pw, browser = await self._launch_browser()
-        try:
-            page = await self._new_page(browser)
-
+    def _sync_scrape_screenings(self) -> list[ScrapedScreening]:
+        all_screenings: list[ScrapedScreening] = []
+        with SB(**self._sb_kwargs()) as sb:
             for branch_id, branch_info in HOT_CINEMA_BRANCHES.items():
-                _, screening_infos = await self._scrape_theater_page(page, branch_id, branch_info)
+                _, screening_infos = self._scrape_theater_page(sb, branch_id, branch_info)
 
                 # Try clicking date buttons for next 7 days
                 try:
-                    date_buttons = await page.query_selector_all(
+                    date_buttons = self._find_elements(
+                        sb,
                         '[class*="date"], [class*="Date"], [class*="day"], [class*="Day"], '
-                        '[data-date], button[class*="calendar"]'
+                        '[data-date], button[class*="calendar"]',
                     )
                     for btn in date_buttons[1:7]:
                         try:
-                            await btn.click()
-                            await self._human_delay(1.5, 4.0)
-                            _, day_infos = await self._scrape_theater_page(page, branch_id, branch_info)
+                            btn.click()
+                            self._human_delay(1.5, 4.0)
+                            _, day_infos = self._scrape_theater_page(sb, branch_id, branch_info)
                             screening_infos.extend(day_infos)
                         except Exception:
                             continue
@@ -567,26 +504,14 @@ class HotCinemaScraper(BaseScraper):
                     screening.revenue = 0
                     all_screenings.append(screening)
 
-            await page.close()
-        finally:
-            await browser.close()
-            await pw.stop()
-
         logger.info(f"[Hot Cinema] Daily scrape: {len(all_screenings)} screenings")
         return all_screenings
 
-    async def scrape_ticket_updates(self) -> list[ScrapedScreening]:
-        """
-        Every 5 hours: enter each screening's seat selection page
-        and count how many seats are sold vs available.
-        """
-        all_screenings = []
-        pw, browser = await self._launch_browser()
-        try:
-            page = await self._new_page(browser)
-
+    def _sync_scrape_ticket_updates(self) -> list[ScrapedScreening]:
+        all_screenings: list[ScrapedScreening] = []
+        with SB(**self._sb_kwargs()) as sb:
             for branch_id, branch_info in HOT_CINEMA_BRANCHES.items():
-                _, screening_infos = await self._scrape_theater_page(page, branch_id, branch_info)
+                _, screening_infos = self._scrape_theater_page(sb, branch_id, branch_info)
 
                 for info in screening_infos:
                     if info["showtime"] < datetime.now():
@@ -597,7 +522,7 @@ class HotCinemaScraper(BaseScraper):
 
                     booking_url = info.get("booking_url", "")
                     if booking_url:
-                        total, sold = await self._get_seat_count_for_screening(page, booking_url)
+                        total, sold = self._get_seat_count_for_screening(sb, booking_url)
                         if total > 0:
                             total_seats = total
                             tickets_sold = sold
@@ -608,23 +533,24 @@ class HotCinemaScraper(BaseScraper):
                             )
                     else:
                         try:
-                            await self._goto_with_stealth(
-                                page,
+                            self._open_url(
+                                sb,
                                 f"{BASE_URL}/theater/{branch_id}/{branch_info['slug']}",
                             )
                             time_str = info["showtime"].strftime("%H:%M")
-                            time_buttons = await page.query_selector_all(
-                                f'text="{time_str}", [class*="time"]:has-text("{time_str}")'
+                            time_buttons = self._find_elements(
+                                sb, f'[class*="time"]',
                             )
                             for btn in time_buttons:
+                                if time_str not in self._el_text(btn):
+                                    continue
                                 try:
-                                    async with page.expect_navigation(timeout=10000):
-                                        await btn.click()
-
-                                    current_url = page.url
-                                    if 'seats' in current_url or 'ticket' in current_url or 'booking' in current_url:
-                                        await page.wait_for_timeout(3000)
-                                        total, sold = await self._count_seats_on_page(page)
+                                    btn.click()
+                                    time.sleep(3)
+                                    current_url = sb.get_current_url()
+                                    if any(kw in current_url for kw in ("seats", "ticket", "booking")):
+                                        time.sleep(3)
+                                        total, sold = self._count_seats_on_page(sb)
                                         if total > 0:
                                             total_seats = total
                                             tickets_sold = sold
@@ -649,10 +575,21 @@ class HotCinemaScraper(BaseScraper):
                     screening.revenue = screening.tickets_sold * screening.ticket_price
                     all_screenings.append(screening)
 
-            await page.close()
-        finally:
-            await browser.close()
-            await pw.stop()
-
         logger.info(f"[Hot Cinema] Ticket update: {len(all_screenings)} screenings counted")
         return all_screenings
+
+    # ------------------------------------------------------------------
+    # Public async interface (called by the scheduler / manager)
+    # ------------------------------------------------------------------
+
+    async def scrape_movies(self) -> list[ScrapedMovie]:
+        """Weekly: scrape all movies (runs sync SB in a thread)."""
+        return await asyncio.to_thread(self._sync_scrape_movies)
+
+    async def scrape_screenings(self) -> list[ScrapedScreening]:
+        """Daily: scrape screenings (runs sync SB in a thread)."""
+        return await asyncio.to_thread(self._sync_scrape_screenings)
+
+    async def scrape_ticket_updates(self) -> list[ScrapedScreening]:
+        """Every 5 hours: count seats sold (runs sync SB in a thread)."""
+        return await asyncio.to_thread(self._sync_scrape_ticket_updates)
