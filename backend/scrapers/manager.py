@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session
 
 from models.models import CinemaChain, Cinema, Movie, Screening, ScrapeLog
 from scrapers.base import BaseScraper, ScrapedMovie, ScrapedScreening
-from scrapers.hot_cinema import HotCinemaScraper
+from scrapers.hot_cinema import HotCinemaScraper, HOT_CINEMA_BRANCHES
 
 logger = logging.getLogger(__name__)
 
@@ -27,10 +27,12 @@ def _get_or_create_chain(db: Session, name: str, name_he: str, website: str) -> 
     return chain
 
 
-def _get_or_create_cinema(db: Session, chain_id: int, name: str, city: str) -> Cinema:
+def _get_or_create_cinema(db: Session, chain_id: int, name: str, city: str,
+                          name_he: str = "", city_he: str = "") -> Cinema:
     cinema = db.query(Cinema).filter_by(name=name, chain_id=chain_id).first()
     if not cinema:
-        cinema = Cinema(chain_id=chain_id, name=name, city=city)
+        cinema = Cinema(chain_id=chain_id, name=name, city=city,
+                        name_he=name_he, city_he=city_he)
         db.add(cinema)
         db.flush()
     return cinema
@@ -54,10 +56,20 @@ def _get_or_create_movie(db: Session, scraped: ScrapedMovie) -> Movie:
     return movie
 
 
+def _lookup_hebrew(cinema_name: str) -> tuple[str, str]:
+    """Look up Hebrew name and city for a Hot Cinema branch."""
+    for branch in HOT_CINEMA_BRANCHES.values():
+        if branch["name"] == cinema_name:
+            return branch["name_he"], branch["city_he"]
+    return "", ""
+
+
 def _upsert_screenings(db: Session, chain: CinemaChain, screenings: list[ScrapedScreening]):
     """Insert new screenings or update existing ones (tickets_sold)."""
     for ss in screenings:
-        cinema = _get_or_create_cinema(db, chain.id, ss.cinema_name, ss.city)
+        name_he, city_he = _lookup_hebrew(ss.cinema_name)
+        cinema = _get_or_create_cinema(db, chain.id, ss.cinema_name, ss.city,
+                                       name_he=name_he, city_he=city_he)
         movie = db.query(Movie).filter_by(title=ss.movie_title).first()
         if not movie:
             movie = _get_or_create_movie(db, ScrapedMovie(title=ss.movie_title))

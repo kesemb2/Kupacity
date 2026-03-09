@@ -22,16 +22,16 @@ async def lifespan(app: FastAPI):
     # Startup: create tables and seed if empty
     Base.metadata.create_all(bind=engine)
 
-    from models.models import Movie
+    from models.models import CinemaChain
     db = SessionLocal()
     try:
-        if db.query(Movie).count() == 0:
-            logger.info("Database empty - loading seed data...")
+        if db.query(CinemaChain).count() == 0:
+            logger.info("No cinema chains - seeding Hot Cinema branches...")
             from seed_data import seed_database
             seed_database()
-            logger.info("Seed data loaded successfully")
+            logger.info("Hot Cinema branches seeded successfully")
         else:
-            logger.info("Database already has data")
+            logger.info("Cinema chains already exist")
     except Exception as e:
         logger.warning(f"Seed data loading failed: {e}")
     finally:
