@@ -6,7 +6,7 @@ import CinemasPage from './pages/CinemasPage';
 import CitiesPage from './pages/CitiesPage';
 import MovieDetail from './pages/MovieDetail';
 import ScrapePage from './pages/ScrapePage';
-import { checkHealth } from './api/client';
+import { checkHealth, getDebugScreenshotUrl } from './api/client';
 
 const NAV_ITEMS = [
   { key: 'dashboard', label: 'דאשבורד' },
@@ -86,6 +86,30 @@ function App() {
             </h1>
           </div>
 
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <button
+              onClick={() => window.open(getDebugScreenshotUrl(), '_blank')}
+              title="צילום מסך סקרייפר"
+              style={{
+                padding: '6px 12px',
+                borderRadius: 8,
+                border: '1px solid #334155',
+                cursor: 'pointer',
+                fontSize: 13,
+                fontWeight: 500,
+                fontFamily: 'Heebo, sans-serif',
+                background: 'rgba(99,102,241,0.15)',
+                color: '#a5b4fc',
+                transition: 'all 0.2s',
+                display: 'flex',
+                alignItems: 'center',
+                gap: 6,
+              }}
+            >
+              <span style={{ fontSize: 15 }}>📸</span>
+              Debug
+            </button>
+
           <nav style={{ display: 'flex', gap: 4 }}>
             {NAV_ITEMS.map(item => (
               <button
@@ -108,6 +132,7 @@ function App() {
               </button>
             ))}
           </nav>
+          </div>
         </div>
       </header>
 
