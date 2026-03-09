@@ -117,17 +117,22 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+@app.get("/api/health")
+def health():
+    return {"status": "ok", "service": "Israel Cinema Box Office Dashboard"}
+
+
+@app.get("/")
+def root():
+    return {"status": "ok", "service": "Israel Cinema Box Office Dashboard", "docs": "/docs"}
+
+
 app.include_router(router)
 
 # Serve frontend build if it exists
 frontend_build = os.path.join(os.path.dirname(__file__), "..", "frontend", "build")
 if os.path.exists(frontend_build):
     app.mount("/", StaticFiles(directory=frontend_build, html=True), name="frontend")
-
-
-@app.get("/api/health")
-def health():
-    return {"status": "ok", "service": "Israel Cinema Box Office Dashboard"}
 
 
 if __name__ == "__main__":
