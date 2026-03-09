@@ -17,7 +17,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Scraper proxy – set these env vars on your hosting provider (e.g. Render)
-# to route Playwright traffic through a residential/rotating proxy:
+# to route SeleniumBase UC mode traffic through a residential/rotating proxy:
 #   SCRAPER_PROXY_SERVER   = "http://proxy-host:port"
 #   SCRAPER_PROXY_USERNAME = "user"        (optional)
 #   SCRAPER_PROXY_PASSWORD = "password"    (optional)
