@@ -28,6 +28,8 @@ import logging
 import os
 import random
 import re
+import shutil
+import subprocess
 import time
 from datetime import datetime, timedelta
 
@@ -80,7 +82,25 @@ class HotCinemaScraper(BaseScraper):
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _create_driver() -> uc.Chrome:
+    def _detect_chrome_major_version() -> int | None:
+        """Return the major version of the installed Chrome/Chromium, or None."""
+        for binary in ("google-chrome", "google-chrome-stable", "chromium", "chromium-browser"):
+            path = shutil.which(binary)
+            if not path:
+                continue
+            try:
+                out = subprocess.check_output([path, "--version"], text=True, timeout=5)
+                match = re.search(r"(\d+)\.", out)
+                if match:
+                    ver = int(match.group(1))
+                    logger.info(f"[Hot Cinema] Detected Chrome {ver} at {path}")
+                    return ver
+            except Exception:
+                continue
+        return None
+
+    @classmethod
+    def _create_driver(cls) -> uc.Chrome:
         """Create an undetected Chrome driver with optional proxy.
 
         Set env var to route through a proxy:
@@ -95,13 +115,19 @@ class HotCinemaScraper(BaseScraper):
 
         proxy = os.environ.get("SCRAPER_PROXY_SERVER")
         if proxy:
-            # undetected-chromedriver accepts --proxy-server for simple proxies
-            # For authenticated proxies, strip scheme for Chrome flag format
             cleaned = re.sub(r"^https?://", "", proxy)
             options.add_argument(f"--proxy-server={cleaned}")
             logger.info(f"[Hot Cinema] Using proxy: {proxy}")
 
-        driver = uc.Chrome(options=options, headless=True)
+        # Pin chromedriver to the installed Chrome version so they never
+        # drift apart (e.g. Chrome 145 vs chromedriver 146).
+        chrome_ver = cls._detect_chrome_major_version()
+
+        driver = uc.Chrome(
+            options=options,
+            headless=True,
+            version_main=chrome_ver,  # None → auto-detect (UC default)
+        )
         driver.set_page_load_timeout(30)
         return driver
 
