@@ -19,9 +19,23 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup: create tables (no seed data - real data comes from scraper)
+    # Startup: create tables and seed if empty
     Base.metadata.create_all(bind=engine)
-    logger.info("Database initialized (no seed data)")
+
+    from models.models import Movie
+    db = SessionLocal()
+    try:
+        if db.query(Movie).count() == 0:
+            logger.info("Database empty - loading seed data...")
+            from seed_data import seed_database
+            seed_database()
+            logger.info("Seed data loaded successfully")
+        else:
+            logger.info("Database already has data")
+    except Exception as e:
+        logger.warning(f"Seed data loading failed: {e}")
+    finally:
+        db.close()
 
     # Start scheduler for Hot Cinema scraping
     try:
