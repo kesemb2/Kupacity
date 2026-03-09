@@ -17,6 +17,7 @@ export const fetchTicketsByBranch = () => api.get('/analytics/tickets-by-branch'
 export const fetchTopMovies = (limit = 10) => api.get(`/analytics/top-movies?limit=${limit}`).then(r => r.data);
 export const fetchOccupancyByFormat = () => api.get('/analytics/occupancy-by-format').then(r => r.data);
 export const fetchScrapeLogs = () => api.get('/scrape-logs').then(r => r.data);
+export const triggerScrape = () => api.post('/scrape/trigger').then(r => r.data);
 
 export const checkHealth = () => api.get('/health', { timeout: 15000 })
   .then(() => ({ ok: true }))
