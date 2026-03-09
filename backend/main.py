@@ -12,7 +12,6 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from database import engine, Base, SessionLocal
 from api.routes import router
-from seed_data import seed_database
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -20,34 +19,22 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup: create tables and seed data
+    # Startup: create tables (no seed data - real data comes from scraper)
     Base.metadata.create_all(bind=engine)
-    seed_database()
-    logger.info("Database initialized and seeded")
+    logger.info("Database initialized (no seed data)")
 
-    # Start scheduler for periodic scraping with different intervals
+    # Start scheduler for Hot Cinema scraping
     try:
         from apscheduler.schedulers.asyncio import AsyncIOScheduler
         from scrapers.manager import (
-            run_all_scrapers,
             hot_cinema_weekly_movies,
             hot_cinema_daily_screenings,
             hot_cinema_update_tickets,
             close_expired_screenings,
+            run_initial_scrape,
         )
 
         scheduler = AsyncIOScheduler()
-
-        # --- General scrape for all chains (every 30 min) ---
-        async def scheduled_scrape():
-            db = SessionLocal()
-            try:
-                await run_all_scrapers(db)
-            finally:
-                db.close()
-
-        scheduler.add_job(scheduled_scrape, "interval", minutes=30,
-                          id="all_scrapers")
 
         # --- Hot Cinema: weekly movie catalog refresh (every Sunday at 03:00) ---
         async def scheduled_hot_weekly():
@@ -94,8 +81,22 @@ async def lifespan(app: FastAPI):
                           id="close_expired_screenings")
 
         scheduler.start()
-        logger.info("Scheduler started: all_scrapers(30m), hot_weekly(Sun 03:00), "
+        logger.info("Scheduler started: hot_weekly(Sun 03:00), "
                      "hot_daily(06:00), hot_tickets(5h), close_expired(1m)")
+
+        # Run initial scrape if DB is empty
+        async def initial_scrape():
+            from models.models import Movie
+            db = SessionLocal()
+            try:
+                if db.query(Movie).count() == 0:
+                    logger.info("Database empty - running initial Hot Cinema scrape...")
+                    await run_initial_scrape(db)
+            finally:
+                db.close()
+
+        await initial_scrape()
+
     except Exception as e:
         logger.warning(f"Scheduler not started: {e}")
 
@@ -103,9 +104,9 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="Israel Cinema Box Office Dashboard",
-    description="דאשבורד בוקס אופיס לבתי קולנוע בישראל",
-    version="1.0.0",
+    title="Hot Cinema Israel Dashboard",
+    description="דאשבורד כרטיסים - הוט סינמה ישראל",
+    version="2.0.0",
     lifespan=lifespan,
 )
 
@@ -119,12 +120,12 @@ app.add_middleware(
 
 @app.get("/api/health")
 def health():
-    return {"status": "ok", "service": "Israel Cinema Box Office Dashboard"}
+    return {"status": "ok", "service": "Hot Cinema Dashboard"}
 
 
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "Israel Cinema Box Office Dashboard", "docs": "/docs"}
+    return {"status": "ok", "service": "Hot Cinema Dashboard", "docs": "/docs"}
 
 
 app.include_router(router)

@@ -1,5 +1,5 @@
 """
-Scraper manager - coordinates all scrapers and persists data to DB.
+Scraper manager - coordinates Hot Cinema scraper and persists data to DB.
 
 Hot Cinema schedule:
 - Weekly:       full movie catalog refresh
@@ -13,19 +13,9 @@ from sqlalchemy.orm import Session
 
 from models.models import CinemaChain, Cinema, Movie, Screening, ScrapeLog
 from scrapers.base import BaseScraper, ScrapedMovie, ScrapedScreening
-from scrapers.cinema_city import CinemaCityScraper
 from scrapers.hot_cinema import HotCinemaScraper
-from scrapers.lev_cinema import LevCinemaScraper
-from scrapers.globus_max import GlobusMaxScraper
 
 logger = logging.getLogger(__name__)
-
-ALL_SCRAPERS: list[type[BaseScraper]] = [
-    CinemaCityScraper,
-    HotCinemaScraper,
-    LevCinemaScraper,
-    GlobusMaxScraper,
-]
 
 
 def _get_or_create_chain(db: Session, name: str, name_he: str, website: str) -> CinemaChain:
@@ -65,7 +55,7 @@ def _get_or_create_movie(db: Session, scraped: ScrapedMovie) -> Movie:
 
 
 def _upsert_screenings(db: Session, chain: CinemaChain, screenings: list[ScrapedScreening]):
-    """Insert new screenings or update existing ones (tickets_sold, revenue)."""
+    """Insert new screenings or update existing ones (tickets_sold)."""
     for ss in screenings:
         cinema = _get_or_create_cinema(db, chain.id, ss.cinema_name, ss.city)
         movie = db.query(Movie).filter_by(title=ss.movie_title).first()
@@ -80,7 +70,7 @@ def _upsert_screenings(db: Session, chain: CinemaChain, screenings: list[Scraped
 
         if existing:
             existing.tickets_sold = ss.tickets_sold
-            existing.revenue = ss.revenue
+            existing.total_seats = ss.total_seats or existing.total_seats
             existing.scraped_at = datetime.utcnow()
         else:
             screening = Screening(
@@ -93,59 +83,51 @@ def _upsert_screenings(db: Session, chain: CinemaChain, screenings: list[Scraped
                 ticket_price=ss.ticket_price,
                 tickets_sold=ss.tickets_sold,
                 total_seats=ss.total_seats,
-                revenue=ss.revenue,
                 status="active",
             )
             db.add(screening)
 
 
-async def run_all_scrapers(db: Session):
-    """Run all scrapers and persist results to the database."""
-    for scraper_cls in ALL_SCRAPERS:
-        scraper = scraper_cls()
-        start = datetime.utcnow()
-        try:
-            movies, screenings = await scraper.run()
-
-            chain = _get_or_create_chain(
-                db, scraper.chain_name, scraper.chain_name_he, scraper.base_url
-            )
-
-            for sm in movies:
-                _get_or_create_movie(db, sm)
-
-            _upsert_screenings(db, chain, screenings)
-
-            duration = (datetime.utcnow() - start).total_seconds()
-            log = ScrapeLog(
-                chain_name=scraper.chain_name,
-                status="success",
-                movies_found=len(movies),
-                screenings_found=len(screenings),
-                duration_seconds=duration,
-            )
-            db.add(log)
-            db.commit()
-
-        except Exception as e:
-            duration = (datetime.utcnow() - start).total_seconds()
-            log = ScrapeLog(
-                chain_name=scraper.chain_name,
-                status="error",
-                error_message=str(e),
-                duration_seconds=duration,
-            )
-            db.add(log)
-            db.commit()
-            logger.error(f"Scraper {scraper.chain_name} failed: {e}")
-
-        finally:
-            await scraper.close()
-
-
 # ---------------------------------------------------------------------------
 # Hot Cinema specific scheduled tasks
 # ---------------------------------------------------------------------------
+
+async def run_initial_scrape(db: Session):
+    """Run on startup if DB is empty - scrape movies and screenings from Hot Cinema."""
+    scraper = HotCinemaScraper()
+    start = datetime.utcnow()
+    try:
+        movies = await scraper.scrape_movies()
+        chain = _get_or_create_chain(
+            db, scraper.chain_name, scraper.chain_name_he, scraper.base_url
+        )
+        for sm in movies:
+            _get_or_create_movie(db, sm)
+
+        screenings = await scraper.scrape_screenings()
+        _upsert_screenings(db, chain, screenings)
+
+        duration = (datetime.utcnow() - start).total_seconds()
+        db.add(ScrapeLog(
+            chain_name="Hot Cinema",
+            status="success",
+            movies_found=len(movies),
+            screenings_found=len(screenings),
+            duration_seconds=duration,
+        ))
+        db.commit()
+        logger.info(f"[Hot Cinema] Initial scrape: {len(movies)} movies, {len(screenings)} screenings")
+    except Exception as e:
+        duration = (datetime.utcnow() - start).total_seconds()
+        db.add(ScrapeLog(
+            chain_name="Hot Cinema", status="error",
+            error_message=str(e), duration_seconds=duration,
+        ))
+        db.commit()
+        logger.error(f"[Hot Cinema] Initial scrape failed: {e}")
+    finally:
+        await scraper.close()
+
 
 async def hot_cinema_weekly_movies(db: Session):
     """Weekly: refresh full movie catalog from Hot Cinema."""

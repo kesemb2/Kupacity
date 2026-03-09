@@ -17,36 +17,32 @@ def get_dashboard_summary(db: Session = Depends(get_db)):
     """סיכום כללי לדאשבורד הראשי"""
     total_movies = db.query(Movie).count()
     total_cinemas = db.query(Cinema).count()
-    total_chains = db.query(CinemaChain).count()
     total_screenings = db.query(Screening).count()
-    total_revenue = db.query(func.sum(Screening.revenue)).scalar() or 0
     total_tickets = db.query(func.sum(Screening.tickets_sold)).scalar() or 0
 
-    # Top movie by revenue
+    # Top movie by tickets sold
     top_movie_row = (
         db.query(
             Movie.title, Movie.title_he,
-            func.sum(Screening.revenue).label("total_revenue"),
             func.sum(Screening.tickets_sold).label("total_tickets"),
+            func.count(Screening.id).label("total_screenings"),
         )
         .join(Screening)
         .group_by(Movie.id)
-        .order_by(desc("total_revenue"))
+        .order_by(desc("total_tickets"))
         .first()
     )
 
     return {
         "total_movies": total_movies,
         "total_cinemas": total_cinemas,
-        "total_chains": total_chains,
         "total_screenings": total_screenings,
-        "total_revenue": round(total_revenue, 2),
         "total_tickets_sold": total_tickets,
         "top_movie": {
             "title": top_movie_row[0] if top_movie_row else None,
             "title_he": top_movie_row[1] if top_movie_row else None,
-            "revenue": round(top_movie_row[2], 2) if top_movie_row else 0,
-            "tickets_sold": top_movie_row[3] if top_movie_row else 0,
+            "tickets_sold": top_movie_row[2] if top_movie_row else 0,
+            "screenings": top_movie_row[3] if top_movie_row else 0,
         } if top_movie_row else None,
     }
 
@@ -55,18 +51,17 @@ def get_dashboard_summary(db: Session = Depends(get_db)):
 
 @router.get("/movies")
 def get_movies(db: Session = Depends(get_db)):
-    """רשימת כל הסרטים עם סיכום הכנסות"""
+    """רשימת כל הסרטים עם סיכום כרטיסים"""
     results = (
         db.query(
             Movie,
             func.count(Screening.id).label("screenings_count"),
             func.sum(Screening.tickets_sold).label("total_tickets"),
-            func.sum(Screening.revenue).label("total_revenue"),
             func.avg(Screening.tickets_sold * 100.0 / func.nullif(Screening.total_seats, 0)).label("avg_occupancy"),
         )
         .outerjoin(Screening)
         .group_by(Movie.id)
-        .order_by(desc("total_revenue"))
+        .order_by(desc("total_tickets"))
         .all()
     )
 
@@ -83,10 +78,9 @@ def get_movies(db: Session = Depends(get_db)):
             "director": movie.director,
             "screenings_count": screenings_count or 0,
             "total_tickets_sold": total_tickets or 0,
-            "total_revenue": round(total_revenue or 0, 2),
             "avg_occupancy": round(avg_occ or 0, 1),
         }
-        for movie, screenings_count, total_tickets, total_revenue, avg_occ in results
+        for movie, screenings_count, total_tickets, avg_occ in results
     ]
 
 
@@ -97,29 +91,26 @@ def get_movie_detail(movie_id: int, db: Session = Depends(get_db)):
     if not movie:
         return {"error": "Movie not found"}
 
-    # Revenue by cinema
+    # Tickets by cinema
     by_cinema = (
         db.query(
             Cinema.name, Cinema.city,
-            CinemaChain.name.label("chain_name"),
             func.count(Screening.id).label("screenings"),
             func.sum(Screening.tickets_sold).label("tickets"),
-            func.sum(Screening.revenue).label("revenue"),
         )
         .join(Screening, Screening.cinema_id == Cinema.id)
-        .join(CinemaChain, Cinema.chain_id == CinemaChain.id)
         .filter(Screening.movie_id == movie_id)
         .group_by(Cinema.id)
-        .order_by(desc("revenue"))
+        .order_by(desc("tickets"))
         .all()
     )
 
-    # Revenue by date
+    # Tickets by date
     by_date = (
         db.query(
             func.date(Screening.showtime).label("date"),
             func.sum(Screening.tickets_sold).label("tickets"),
-            func.sum(Screening.revenue).label("revenue"),
+            func.count(Screening.id).label("screenings"),
         )
         .filter(Screening.movie_id == movie_id)
         .group_by(func.date(Screening.showtime))
@@ -142,16 +133,14 @@ def get_movie_detail(movie_id: int, db: Session = Depends(get_db)):
             {
                 "cinema": name,
                 "city": city,
-                "chain": chain_name,
                 "screenings": s,
                 "tickets_sold": t,
-                "revenue": round(r, 2),
             }
-            for name, city, chain_name, s, t, r in by_cinema
+            for name, city, s, t in by_cinema
         ],
         "by_date": [
-            {"date": str(d), "tickets_sold": t, "revenue": round(r, 2)}
-            for d, t, r in by_date
+            {"date": str(d), "tickets_sold": t, "screenings": s}
+            for d, t, s in by_date
         ],
     }
 
@@ -168,12 +157,11 @@ def get_cinemas(db: Session = Depends(get_db)):
             CinemaChain.name_he.label("chain_name_he"),
             func.count(Screening.id).label("screenings_count"),
             func.sum(Screening.tickets_sold).label("total_tickets"),
-            func.sum(Screening.revenue).label("total_revenue"),
         )
         .join(CinemaChain, Cinema.chain_id == CinemaChain.id)
         .outerjoin(Screening)
         .group_by(Cinema.id)
-        .order_by(desc("total_revenue"))
+        .order_by(desc("total_tickets"))
         .all()
     )
 
@@ -189,9 +177,8 @@ def get_cinemas(db: Session = Depends(get_db)):
             "halls_count": cinema.halls_count,
             "screenings_count": sc or 0,
             "total_tickets_sold": tt or 0,
-            "total_revenue": round(tr or 0, 2),
         }
-        for cinema, chain_name, chain_he, sc, tt, tr in results
+        for cinema, chain_name, chain_he, sc, tt in results
     ]
 
 
@@ -207,11 +194,10 @@ def get_cities(db: Session = Depends(get_db)):
             func.count(func.distinct(Cinema.id)).label("cinemas_count"),
             func.count(Screening.id).label("screenings_count"),
             func.sum(Screening.tickets_sold).label("total_tickets"),
-            func.sum(Screening.revenue).label("total_revenue"),
         )
         .outerjoin(Screening)
         .group_by(Cinema.city)
-        .order_by(desc("total_revenue"))
+        .order_by(desc("total_tickets"))
         .all()
     )
 
@@ -222,57 +208,20 @@ def get_cities(db: Session = Depends(get_db)):
             "cinemas_count": cc,
             "screenings_count": sc or 0,
             "total_tickets_sold": tt or 0,
-            "total_revenue": round(tr or 0, 2),
         }
-        for city, city_he, cc, sc, tt, tr in results
+        for city, city_he, cc, sc, tt in results
     ]
 
 
-# ─── Chains ──────────────────────────────────────────────────────────
+# ─── Analytics ────────────────────────────────────────────────────────
 
-@router.get("/chains")
-def get_chains(db: Session = Depends(get_db)):
-    """סיכום לפי רשתות קולנוע"""
-    results = (
-        db.query(
-            CinemaChain,
-            func.count(func.distinct(Cinema.id)).label("cinemas_count"),
-            func.count(Screening.id).label("screenings_count"),
-            func.sum(Screening.tickets_sold).label("total_tickets"),
-            func.sum(Screening.revenue).label("total_revenue"),
-        )
-        .outerjoin(Cinema)
-        .outerjoin(Screening)
-        .group_by(CinemaChain.id)
-        .order_by(desc("total_revenue"))
-        .all()
-    )
-
-    return [
-        {
-            "id": chain.id,
-            "name": chain.name,
-            "name_he": chain.name_he,
-            "website": chain.website,
-            "cinemas_count": cc,
-            "screenings_count": sc or 0,
-            "total_tickets_sold": tt or 0,
-            "total_revenue": round(tr or 0, 2),
-        }
-        for chain, cc, sc, tt, tr in results
-    ]
-
-
-# ─── Revenue Over Time ──────────────────────────────────────────────
-
-@router.get("/analytics/revenue-by-date")
-def get_revenue_by_date(days: int = Query(default=14), db: Session = Depends(get_db)):
-    """הכנסות לפי תאריך"""
+@router.get("/analytics/tickets-by-date")
+def get_tickets_by_date(days: int = Query(default=14), db: Session = Depends(get_db)):
+    """כרטיסים לפי תאריך"""
     cutoff = datetime.now() - timedelta(days=days)
     results = (
         db.query(
             func.date(Screening.showtime).label("date"),
-            func.sum(Screening.revenue).label("revenue"),
             func.sum(Screening.tickets_sold).label("tickets"),
             func.count(Screening.id).label("screenings"),
         )
@@ -285,52 +234,49 @@ def get_revenue_by_date(days: int = Query(default=14), db: Session = Depends(get
     return [
         {
             "date": str(d),
-            "revenue": round(r, 2),
             "tickets_sold": t,
             "screenings_count": s,
         }
-        for d, r, t, s in results
+        for d, t, s in results
     ]
 
 
-@router.get("/analytics/revenue-by-chain")
-def get_revenue_by_chain(db: Session = Depends(get_db)):
-    """הכנסות לפי רשת קולנוע"""
+@router.get("/analytics/tickets-by-branch")
+def get_tickets_by_branch(db: Session = Depends(get_db)):
+    """כרטיסים לפי סניף הוט סינמה"""
     results = (
         db.query(
-            CinemaChain.name,
-            CinemaChain.name_he,
-            func.sum(Screening.revenue).label("revenue"),
+            Cinema.name,
+            Cinema.city,
             func.sum(Screening.tickets_sold).label("tickets"),
+            func.count(Screening.id).label("screenings"),
         )
-        .join(Cinema, Cinema.chain_id == CinemaChain.id)
         .join(Screening, Screening.cinema_id == Cinema.id)
-        .group_by(CinemaChain.id)
-        .order_by(desc("revenue"))
+        .group_by(Cinema.id)
+        .order_by(desc("tickets"))
         .all()
     )
 
     return [
-        {"name": n, "name_he": nh, "revenue": round(r, 2), "tickets_sold": t}
-        for n, nh, r, t in results
+        {"name": n, "city": c, "tickets_sold": t, "screenings_count": s}
+        for n, c, t, s in results
     ]
 
 
 @router.get("/analytics/top-movies")
 def get_top_movies(limit: int = Query(default=10), db: Session = Depends(get_db)):
-    """הסרטים המובילים"""
+    """הסרטים המובילים לפי כרטיסים"""
     results = (
         db.query(
             Movie.title,
             Movie.title_he,
             Movie.genre,
-            func.sum(Screening.revenue).label("total_revenue"),
             func.sum(Screening.tickets_sold).label("total_tickets"),
             func.count(Screening.id).label("screenings"),
         )
         .join(Screening)
         .group_by(Movie.id)
-        .order_by(desc("total_revenue"))
+        .order_by(desc("total_tickets"))
         .limit(limit)
         .all()
     )
@@ -338,10 +284,10 @@ def get_top_movies(limit: int = Query(default=10), db: Session = Depends(get_db)
     return [
         {
             "title": t, "title_he": th, "genre": g,
-            "total_revenue": round(r, 2), "total_tickets_sold": tt,
+            "total_tickets_sold": tt,
             "screenings_count": s,
         }
-        for t, th, g, r, tt, s in results
+        for t, th, g, tt, s in results
     ]
 
 
@@ -353,10 +299,10 @@ def get_occupancy_by_format(db: Session = Depends(get_db)):
             Screening.format,
             func.count(Screening.id).label("screenings"),
             func.avg(Screening.tickets_sold * 100.0 / func.nullif(Screening.total_seats, 0)).label("avg_occupancy"),
-            func.sum(Screening.revenue).label("total_revenue"),
+            func.sum(Screening.tickets_sold).label("total_tickets"),
         )
         .group_by(Screening.format)
-        .order_by(desc("total_revenue"))
+        .order_by(desc("total_tickets"))
         .all()
     )
 
@@ -365,9 +311,9 @@ def get_occupancy_by_format(db: Session = Depends(get_db)):
             "format": f,
             "screenings_count": s,
             "avg_occupancy": round(o or 0, 1),
-            "total_revenue": round(r or 0, 2),
+            "total_tickets": t or 0,
         }
-        for f, s, o, r in results
+        for f, s, o, t in results
     ]
 
 

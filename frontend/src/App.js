@@ -10,7 +10,7 @@ import { checkHealth } from './api/client';
 const NAV_ITEMS = [
   { key: 'dashboard', label: 'דאשבורד' },
   { key: 'movies', label: 'סרטים' },
-  { key: 'cinemas', label: 'בתי קולנוע' },
+  { key: 'cinemas', label: 'סניפים' },
   { key: 'cities', label: 'ערים' },
 ];
 
@@ -78,7 +78,7 @@ function App() {
               WebkitBackgroundClip: 'text',
               WebkitTextFillColor: 'transparent',
             }}>
-              בוקס אופיס ישראל
+              הוט סינמה - כרטיסים
             </h1>
           </div>
 
@@ -130,7 +130,7 @@ function App() {
         alignItems: 'center',
         gap: 16,
       }}>
-        <span>דאשבורד בוקס אופיס קולנוע ישראלי • הנתונים מתעדכנים כל 30 דקות</span>
+        <span>הוט סינמה • נתוני כרטיסים מתעדכנים אוטומטית</span>
         <span style={{
           display: 'inline-flex',
           alignItems: 'center',

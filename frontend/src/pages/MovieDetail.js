@@ -7,7 +7,6 @@ import { fetchMovieDetail } from '../api/client';
 import ChartCard from '../components/ChartCard';
 import DataTable from '../components/DataTable';
 
-const formatCurrency = (val) => `₪${(val || 0).toLocaleString()}`;
 const formatNumber = (val) => (val || 0).toLocaleString();
 
 function MovieDetail({ movieId, onBack }) {
@@ -33,19 +32,17 @@ function MovieDetail({ movieId, onBack }) {
 
   const { movie, by_cinema, by_date } = data;
 
-  const totalRevenue = by_cinema.reduce((s, c) => s + c.revenue, 0);
   const totalTickets = by_cinema.reduce((s, c) => s + c.tickets_sold, 0);
+  const totalScreenings = by_cinema.reduce((s, c) => s + c.screenings, 0);
 
   const cinemaColumns = [
-    { header: 'בית קולנוע', key: 'cinema' },
+    { header: 'סניף', key: 'cinema' },
     { header: 'עיר', key: 'city' },
-    { header: 'רשת', key: 'chain' },
     { header: 'הקרנות', render: r => formatNumber(r.screenings), align: 'center' },
-    { header: 'כרטיסים', render: r => formatNumber(r.tickets_sold), align: 'center' },
     {
-      header: 'הכנסות',
-      render: r => <span style={{ color: '#10b981', fontWeight: 600 }}>{formatCurrency(r.revenue)}</span>,
-      align: 'left',
+      header: 'כרטיסים',
+      render: r => <span style={{ color: '#3b82f6', fontWeight: 600 }}>{formatNumber(r.tickets_sold)}</span>,
+      align: 'center',
     },
   ];
 
@@ -64,7 +61,7 @@ function MovieDetail({ movieId, onBack }) {
           padding: 0,
         }}
       >
-        → חזרה לרשימת הסרטים
+        ← חזרה לרשימת הסרטים
       </button>
 
       {/* Movie Header */}
@@ -90,15 +87,15 @@ function MovieDetail({ movieId, onBack }) {
         </div>
         <div style={{ display: 'flex', gap: 40, marginTop: 16 }}>
           <div>
-            <div style={{ color: '#94a3b8', fontSize: 13 }}>סה״כ הכנסות</div>
-            <div style={{ color: '#10b981', fontSize: 24, fontWeight: 700 }}>{formatCurrency(totalRevenue)}</div>
-          </div>
-          <div>
             <div style={{ color: '#94a3b8', fontSize: 13 }}>כרטיסים</div>
             <div style={{ color: '#3b82f6', fontSize: 24, fontWeight: 700 }}>{formatNumber(totalTickets)}</div>
           </div>
           <div>
-            <div style={{ color: '#94a3b8', fontSize: 13 }}>בתי קולנוע</div>
+            <div style={{ color: '#94a3b8', fontSize: 13 }}>הקרנות</div>
+            <div style={{ color: '#f59e0b', fontSize: 24, fontWeight: 700 }}>{formatNumber(totalScreenings)}</div>
+          </div>
+          <div>
+            <div style={{ color: '#94a3b8', fontSize: 13 }}>סניפים</div>
             <div style={{ color: '#8b5cf6', fontSize: 24, fontWeight: 700 }}>{by_cinema.length}</div>
           </div>
         </div>
@@ -106,44 +103,44 @@ function MovieDetail({ movieId, onBack }) {
 
       {/* Charts */}
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16, marginBottom: 24 }}>
-        <ChartCard title="הכנסות יומיות">
+        <ChartCard title="כרטיסים יומיים">
           <ResponsiveContainer width="100%" height={280}>
             <LineChart data={by_date}>
               <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
               <XAxis dataKey="date" tick={{ fill: '#94a3b8', fontSize: 11 }}
                      tickFormatter={d => d ? d.slice(5) : ''} />
               <YAxis tick={{ fill: '#94a3b8', fontSize: 11 }}
-                     tickFormatter={v => `₪${(v / 1000).toFixed(0)}K`} />
+                     tickFormatter={v => v >= 1000 ? `${(v / 1000).toFixed(0)}K` : v} />
               <Tooltip
                 contentStyle={{ background: '#1e293b', border: '1px solid #475569', borderRadius: 8 }}
-                formatter={(v) => [formatCurrency(v), '']}
+                formatter={(v) => [formatNumber(v), '']}
               />
-              <Line type="monotone" dataKey="revenue" stroke="#10b981" strokeWidth={2.5}
-                    dot={{ fill: '#10b981', r: 4 }} name="הכנסות" />
+              <Line type="monotone" dataKey="tickets_sold" stroke="#3b82f6" strokeWidth={2.5}
+                    dot={{ fill: '#3b82f6', r: 4 }} name="כרטיסים" />
             </LineChart>
           </ResponsiveContainer>
         </ChartCard>
 
-        <ChartCard title="הכנסות לפי בית קולנוע (טופ 10)">
+        <ChartCard title="כרטיסים לפי סניף (טופ 10)">
           <ResponsiveContainer width="100%" height={280}>
             <BarChart data={by_cinema.slice(0, 10)} layout="vertical">
               <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
               <XAxis type="number" tick={{ fill: '#94a3b8', fontSize: 11 }}
-                     tickFormatter={v => `₪${(v / 1000).toFixed(0)}K`} />
+                     tickFormatter={v => v >= 1000 ? `${(v / 1000).toFixed(0)}K` : v} />
               <YAxis type="category" dataKey="cinema" width={160}
                      tick={{ fill: '#e2e8f0', fontSize: 11 }} />
               <Tooltip
                 contentStyle={{ background: '#1e293b', border: '1px solid #475569', borderRadius: 8 }}
-                formatter={(v) => formatCurrency(v)}
+                formatter={(v) => formatNumber(v)}
               />
-              <Bar dataKey="revenue" fill="#3b82f6" radius={[0, 4, 4, 0]} name="הכנסות" />
+              <Bar dataKey="tickets_sold" fill="#3b82f6" radius={[0, 4, 4, 0]} name="כרטיסים" />
             </BarChart>
           </ResponsiveContainer>
         </ChartCard>
       </div>
 
       {/* Cinema Table */}
-      <h3 style={{ fontSize: 18, fontWeight: 600, marginBottom: 12 }}>פירוט לפי בתי קולנוע</h3>
+      <h3 style={{ fontSize: 18, fontWeight: 600, marginBottom: 12 }}>פירוט לפי סניפים</h3>
       <DataTable columns={cinemaColumns} data={by_cinema} />
     </div>
   );

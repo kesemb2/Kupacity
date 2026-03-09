@@ -2,14 +2,13 @@ import React, { useState, useEffect } from 'react';
 import { fetchMovies } from '../api/client';
 import DataTable from '../components/DataTable';
 
-const formatCurrency = (val) => `₪${(val || 0).toLocaleString()}`;
 const formatNumber = (val) => (val || 0).toLocaleString();
 
 function MoviesPage({ onMovieClick }) {
   const [movies, setMovies] = useState([]);
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState('');
-  const [sortBy, setSortBy] = useState('total_revenue');
+  const [sortBy, setSortBy] = useState('total_tickets_sold');
 
   useEffect(() => {
     fetchMovies().then(data => {
@@ -26,7 +25,7 @@ function MoviesPage({ onMovieClick }) {
     .sort((a, b) => (b[sortBy] || 0) - (a[sortBy] || 0));
 
   const columns = [
-    { header: '#', render: (_, idx) => idx + 1, align: 'center' },
+    { header: '#', render: (row) => filtered.indexOf(row) + 1, align: 'center' },
     {
       header: 'סרט',
       render: (row) => (
@@ -40,50 +39,40 @@ function MoviesPage({ onMovieClick }) {
     { header: 'דירוג', key: 'rating' },
     { header: 'במאי', key: 'director' },
     { header: 'הקרנות', render: (row) => formatNumber(row.screenings_count), align: 'center' },
-    { header: 'כרטיסים', render: (row) => formatNumber(row.total_tickets_sold), align: 'center' },
     {
-      header: 'הכנסות',
+      header: 'כרטיסים',
       render: (row) => (
-        <span style={{ color: '#10b981', fontWeight: 600 }}>
-          {formatCurrency(row.total_revenue)}
+        <span style={{ color: '#3b82f6', fontWeight: 600 }}>
+          {formatNumber(row.total_tickets_sold)}
         </span>
       ),
-      align: 'left',
+      align: 'center',
     },
     {
       header: 'תפוסה',
       render: (row) => (
-        <div style={{
-          background: '#334155',
-          borderRadius: 4,
-          overflow: 'hidden',
-          width: 60,
-          height: 8,
-          display: 'inline-block',
-          position: 'relative',
-        }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
           <div style={{
-            background: row.avg_occupancy > 70 ? '#10b981' : row.avg_occupancy > 40 ? '#f59e0b' : '#ef4444',
-            width: `${Math.min(100, row.avg_occupancy)}%`,
-            height: '100%',
+            background: '#334155',
             borderRadius: 4,
-          }} />
+            overflow: 'hidden',
+            width: 60,
+            height: 8,
+            display: 'inline-block',
+          }}>
+            <div style={{
+              background: row.avg_occupancy > 70 ? '#10b981' : row.avg_occupancy > 40 ? '#f59e0b' : '#ef4444',
+              width: `${Math.min(100, row.avg_occupancy)}%`,
+              height: '100%',
+              borderRadius: 4,
+            }} />
+          </div>
+          <span style={{ color: '#94a3b8', fontSize: 12 }}>{Math.round(row.avg_occupancy)}%</span>
         </div>
       ),
       align: 'center',
     },
   ];
-
-  // Fix the render with index
-  const columnsWithIndex = columns.map(col => {
-    if (col.header === '#') {
-      return {
-        ...col,
-        render: (row) => filtered.indexOf(row) + 1,
-      };
-    }
-    return col;
-  });
 
   if (loading) {
     return <div style={{ textAlign: 'center', padding: 60, color: '#64748b' }}>טוען סרטים...</div>;
@@ -125,7 +114,6 @@ function MoviesPage({ onMovieClick }) {
               outline: 'none',
             }}
           >
-            <option value="total_revenue">מיון: הכנסות</option>
             <option value="total_tickets_sold">מיון: כרטיסים</option>
             <option value="screenings_count">מיון: הקרנות</option>
             <option value="avg_occupancy">מיון: תפוסה</option>
@@ -134,7 +122,7 @@ function MoviesPage({ onMovieClick }) {
       </div>
 
       <DataTable
-        columns={columnsWithIndex}
+        columns={columns}
         data={filtered}
         onRowClick={(row) => onMovieClick(row.id)}
       />
