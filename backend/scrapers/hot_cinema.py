@@ -1,8 +1,14 @@
 """
 Scraper for Hot Cinema chain.
+
+Schedule logic:
+- Weekly:  scrape_movies()       - refresh full movie catalog
+- Daily:   scrape_screenings()   - refresh screening schedule for next 7 days
+- 5 hours: update_ticket_counts() - update tickets_sold for active screenings
+- 10 min after showtime: screening is marked as "closed" (handled by manager)
 """
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from bs4 import BeautifulSoup
 
 from scrapers.base import BaseScraper, ScrapedMovie, ScrapedScreening
@@ -36,6 +42,7 @@ class HotCinemaScraper(BaseScraper):
         return "https://hotcinema.co.il"
 
     async def scrape_movies(self) -> list[ScrapedMovie]:
+        """Weekly task: fetch the full movie catalog."""
         movies = []
         try:
             url = f"{self.base_url}/api/movies"
@@ -59,6 +66,51 @@ class HotCinemaScraper(BaseScraper):
         return movies
 
     async def scrape_screenings(self) -> list[ScrapedScreening]:
+        """Daily task: fetch screening schedule for the next 7 days."""
+        screenings = []
+        today = datetime.now()
+
+        for day_offset in range(7):
+            date_str = (today + timedelta(days=day_offset)).strftime("%Y-%m-%d")
+
+            for branch_id, branch_info in HOT_CINEMA_BRANCHES.items():
+                try:
+                    url = f"{self.base_url}/api/screenings?cinema={branch_id}&date={date_str}"
+                    resp = await self.client.get(url)
+                    if resp.status_code != 200:
+                        continue
+
+                    data = resp.json()
+                    items = data if isinstance(data, list) else data.get("screenings", [])
+
+                    for item in items:
+                        try:
+                            showtime = datetime.fromisoformat(item.get("datetime", ""))
+                        except (ValueError, AttributeError):
+                            showtime = datetime.now()
+
+                        screening = ScrapedScreening(
+                            movie_title=item.get("movieTitle", item.get("title", "Unknown")),
+                            cinema_name=branch_info["name"],
+                            city=branch_info["city"],
+                            showtime=showtime,
+                            hall=item.get("hall", ""),
+                            format=item.get("format", "2D"),
+                            language=item.get("language", "subtitled"),
+                            ticket_price=float(item.get("price", 39.0)),
+                            total_seats=int(item.get("totalSeats", 200)),
+                            tickets_sold=int(item.get("soldSeats", 0)),
+                        )
+                        screening.revenue = screening.tickets_sold * screening.ticket_price
+                        screenings.append(screening)
+
+                except Exception as e:
+                    logger.warning(f"Hot Cinema branch {branch_id} date {date_str} scrape failed: {e}")
+
+        return screenings
+
+    async def scrape_ticket_updates(self) -> list[ScrapedScreening]:
+        """Every 5 hours: fetch updated ticket counts for today's screenings only."""
         screenings = []
         today = datetime.now().strftime("%Y-%m-%d")
 
@@ -94,6 +146,6 @@ class HotCinemaScraper(BaseScraper):
                     screenings.append(screening)
 
             except Exception as e:
-                logger.warning(f"Hot Cinema branch {branch_id} scrape failed: {e}")
+                logger.warning(f"Hot Cinema branch {branch_id} ticket update failed: {e}")
 
         return screenings

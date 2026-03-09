@@ -74,6 +74,7 @@ class Screening(Base):
     tickets_sold = Column(Integer, default=0)
     total_seats = Column(Integer)
     revenue = Column(Float, default=0.0)
+    status = Column(String, default="active")  # active, closed
     scraped_at = Column(DateTime, default=datetime.utcnow)
     created_at = Column(DateTime, default=datetime.utcnow)
 

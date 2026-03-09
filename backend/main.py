@@ -25,13 +25,20 @@ async def lifespan(app: FastAPI):
     seed_database()
     logger.info("Database initialized and seeded")
 
-    # Optionally start the scheduler for periodic scraping
+    # Start scheduler for periodic scraping with different intervals
     try:
         from apscheduler.schedulers.asyncio import AsyncIOScheduler
-        from scrapers.manager import run_all_scrapers
+        from scrapers.manager import (
+            run_all_scrapers,
+            hot_cinema_weekly_movies,
+            hot_cinema_daily_screenings,
+            hot_cinema_update_tickets,
+            close_expired_screenings,
+        )
 
         scheduler = AsyncIOScheduler()
 
+        # --- General scrape for all chains (every 30 min) ---
         async def scheduled_scrape():
             db = SessionLocal()
             try:
@@ -39,10 +46,56 @@ async def lifespan(app: FastAPI):
             finally:
                 db.close()
 
-        # Run scraper every 30 minutes
-        scheduler.add_job(scheduled_scrape, "interval", minutes=30)
+        scheduler.add_job(scheduled_scrape, "interval", minutes=30,
+                          id="all_scrapers")
+
+        # --- Hot Cinema: weekly movie catalog refresh (every Sunday at 03:00) ---
+        async def scheduled_hot_weekly():
+            db = SessionLocal()
+            try:
+                await hot_cinema_weekly_movies(db)
+            finally:
+                db.close()
+
+        scheduler.add_job(scheduled_hot_weekly, "cron", day_of_week="sun",
+                          hour=3, minute=0, id="hot_weekly_movies")
+
+        # --- Hot Cinema: daily screenings refresh (every day at 06:00) ---
+        async def scheduled_hot_daily():
+            db = SessionLocal()
+            try:
+                await hot_cinema_daily_screenings(db)
+            finally:
+                db.close()
+
+        scheduler.add_job(scheduled_hot_daily, "cron", hour=6, minute=0,
+                          id="hot_daily_screenings")
+
+        # --- Hot Cinema: ticket count updates (every 5 hours) ---
+        async def scheduled_hot_tickets():
+            db = SessionLocal()
+            try:
+                await hot_cinema_update_tickets(db)
+            finally:
+                db.close()
+
+        scheduler.add_job(scheduled_hot_tickets, "interval", hours=5,
+                          id="hot_ticket_updates")
+
+        # --- Close expired screenings (every minute) ---
+        def scheduled_close_expired():
+            db = SessionLocal()
+            try:
+                close_expired_screenings(db)
+            finally:
+                db.close()
+
+        scheduler.add_job(scheduled_close_expired, "interval", minutes=1,
+                          id="close_expired_screenings")
+
         scheduler.start()
-        logger.info("Scraper scheduler started (every 30 min)")
+        logger.info("Scheduler started: all_scrapers(30m), hot_weekly(Sun 03:00), "
+                     "hot_daily(06:00), hot_tickets(5h), close_expired(1m)")
     except Exception as e:
         logger.warning(f"Scheduler not started: {e}")
 
