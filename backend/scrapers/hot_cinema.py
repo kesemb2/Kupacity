@@ -204,7 +204,10 @@ class HotCinemaScraper(BaseScraper):
 
         url = f"{BASE_URL}/theater/{branch_id}/{branch_info['slug']}"
         try:
-            await page.goto(url, wait_until="networkidle", timeout=30000)
+            resp = await page.goto(url, wait_until="networkidle", timeout=30000)
+            if resp and resp.status >= 400:
+                logger.warning(f"Hot Cinema theater {branch_id} returned HTTP {resp.status}")
+                return movies, screening_infos
             await page.wait_for_timeout(2000)
 
             # Find movie elements
@@ -415,6 +418,8 @@ class HotCinemaScraper(BaseScraper):
             await pw.stop()
 
         result = list(all_movies.values())
+        if not result:
+            logger.warning("[Hot Cinema] No movies found - site may be unreachable or structure changed")
         logger.info(f"[Hot Cinema] Scraped {len(result)} unique movies")
         return result
 
