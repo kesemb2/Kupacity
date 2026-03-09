@@ -18,4 +18,4 @@ services:
     staticPublishPath: build
     envVars:
       - key: REACT_APP_API_URL
-        value: "https://cinema-1-4p9y.onrender.com"
+        value: "https://cinema-back-kjkx.onrender.com"
