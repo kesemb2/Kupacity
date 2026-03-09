@@ -1,11 +1,10 @@
 """
-Scraper for Hot Cinema chain using SeleniumBase in UC (Undetected
-Chromedriver) mode.
+Scraper for Hot Cinema chain using undetected-chromedriver.
 
-UC mode patches the chromedriver binary at runtime so that Cloudflare,
-DataDome, and similar bot-detection services cannot fingerprint it as
-automated.  This replaces the previous Playwright + stealth approach
-which was still getting 403'd.
+undetected-chromedriver patches the chromedriver binary at runtime so
+Cloudflare, DataDome, and similar bot-detection services cannot
+fingerprint it as automated.  This replaces the previous Playwright +
+stealth approach which was still getting 403'd.
 
 URL patterns:
 - Theater page:  https://hotcinema.co.il/theater/{id}/{slug}
@@ -32,8 +31,10 @@ import re
 import time
 from datetime import datetime, timedelta
 
-from seleniumbase import SB
+import undetected_chromedriver as uc
 from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
 
 from scrapers.base import BaseScraper, ScrapedMovie, ScrapedScreening
 
@@ -75,27 +76,34 @@ class HotCinemaScraper(BaseScraper):
         return BASE_URL
 
     # ------------------------------------------------------------------
-    # SB context builder
+    # Browser lifecycle
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _sb_kwargs() -> dict:
-        """Build keyword arguments for ``SB(...)``."""
-        kwargs: dict = {
-            "uc": True,
-            "headless": True,
-            "locale_code": "en-US",
-        }
+    def _create_driver() -> uc.Chrome:
+        """Create an undetected Chrome driver with optional proxy.
+
+        Set env var to route through a proxy:
+            SCRAPER_PROXY_SERVER=http://user:pass@host:port
+        """
+        options = uc.ChromeOptions()
+        options.add_argument("--no-sandbox")
+        options.add_argument("--disable-setuid-sandbox")
+        options.add_argument("--disable-infobars")
+        options.add_argument("--window-size=1920,1080")
+        options.add_argument("--lang=en-US")
 
         proxy = os.environ.get("SCRAPER_PROXY_SERVER")
         if proxy:
-            # SB accepts "host:port" or "user:pass@host:port"
-            # Strip the scheme if present (SB adds its own).
+            # undetected-chromedriver accepts --proxy-server for simple proxies
+            # For authenticated proxies, strip scheme for Chrome flag format
             cleaned = re.sub(r"^https?://", "", proxy)
-            kwargs["proxy"] = cleaned
+            options.add_argument(f"--proxy-server={cleaned}")
             logger.info(f"[Hot Cinema] Using proxy: {proxy}")
 
-        return kwargs
+        driver = uc.Chrome(options=options, headless=True)
+        driver.set_page_load_timeout(30)
+        return driver
 
     # ------------------------------------------------------------------
     # Anti-detection helpers
@@ -107,49 +115,47 @@ class HotCinemaScraper(BaseScraper):
         time.sleep(random.uniform(lo, hi))
 
     @staticmethod
-    def _simulate_human(sb):
-        """Scroll a bit and move mouse to look human."""
+    def _simulate_human(driver):
+        """Scroll a bit to look human."""
         try:
             scroll_y = random.randint(150, 500)
-            sb.execute_script(f"window.scrollBy(0, {scroll_y});")
+            driver.execute_script(f"window.scrollBy(0, {scroll_y});")
             time.sleep(random.uniform(0.3, 0.8))
-            sb.execute_script(f"window.scrollBy(0, -{random.randint(50, scroll_y)});")
+            driver.execute_script(f"window.scrollBy(0, -{random.randint(50, scroll_y)});")
             time.sleep(random.uniform(0.2, 0.5))
         except Exception:
             pass
 
-    def _open_url(self, sb, url: str, *, take_debug_screenshot: bool = False):
-        """Navigate with UC reconnect, random delay, and human jitter.
-
-        ``uc_open_with_reconnect`` lets SeleniumBase handle Cloudflare
-        challenge pages automatically (it waits, clicks the checkbox if
-        needed, and reconnects the driver).
-        """
+    def _open_url(self, driver, url: str, *, take_debug_screenshot: bool = False):
+        """Navigate with random delay and human jitter."""
         self._human_delay()
+        driver.get(url)
+        # Wait for page to be fully loaded
         try:
-            sb.uc_open_with_reconnect(url, reconnect_time=6)
+            WebDriverWait(driver, 15).until(
+                lambda d: d.execute_script("return document.readyState") == "complete"
+            )
         except Exception:
-            # Fallback for sites that don't trigger a challenge
-            sb.open(url)
+            pass
 
         if take_debug_screenshot:
             try:
-                sb.save_screenshot(_DEBUG_SCREENSHOT)
+                driver.save_screenshot(_DEBUG_SCREENSHOT)
                 logger.info(f"[Hot Cinema] Debug screenshot saved → {_DEBUG_SCREENSHOT}")
             except Exception as e:
                 logger.debug(f"Screenshot failed: {e}")
 
-        self._simulate_human(sb)
+        self._simulate_human(driver)
 
     # ------------------------------------------------------------------
-    # Selenium-based element helpers
+    # Element helpers
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _find_elements(sb, css: str) -> list:
-        """Wrapper around find_elements that never raises."""
+    def _find_elements(driver, css: str) -> list:
+        """find_elements wrapper that never raises."""
         try:
-            return sb.find_elements(css)
+            return driver.find_elements(By.CSS_SELECTOR, css)
         except Exception:
             return []
 
@@ -171,7 +177,7 @@ class HotCinemaScraper(BaseScraper):
     # Seat counting
     # ------------------------------------------------------------------
 
-    def _count_seats_on_page(self, sb) -> tuple[int, int]:
+    def _count_seats_on_page(self, driver) -> tuple[int, int]:
         total = 0
         sold = 0
 
@@ -184,7 +190,7 @@ class HotCinemaScraper(BaseScraper):
 
         for selector in seat_selectors:
             try:
-                seats = self._find_elements(sb, selector)
+                seats = self._find_elements(driver, selector)
                 if len(seats) < 5:
                     continue
 
@@ -229,7 +235,7 @@ class HotCinemaScraper(BaseScraper):
 
         if total == 0:
             try:
-                body_text = sb.get_text("body")
+                body_text = driver.find_element(By.TAG_NAME, "body").text
                 remaining_match = re.search(r"נותרו\s+(\d+)\s+מקומות", body_text)
                 if remaining_match:
                     total = int(remaining_match.group(1))
@@ -243,11 +249,11 @@ class HotCinemaScraper(BaseScraper):
 
         return total, sold
 
-    def _get_seat_count_for_screening(self, sb, screening_url: str) -> tuple[int, int]:
+    def _get_seat_count_for_screening(self, driver, screening_url: str) -> tuple[int, int]:
         try:
-            self._open_url(sb, screening_url)
+            self._open_url(driver, screening_url)
             time.sleep(3)
-            return self._count_seats_on_page(sb)
+            return self._count_seats_on_page(driver)
         except Exception as e:
             logger.warning(f"Seat count failed for {screening_url}: {e}")
             return 0, 0
@@ -256,17 +262,17 @@ class HotCinemaScraper(BaseScraper):
     # Theater page scraping
     # ------------------------------------------------------------------
 
-    def _scrape_theater_page(self, sb, branch_id: str,
+    def _scrape_theater_page(self, driver, branch_id: str,
                               branch_info: dict) -> tuple[list[ScrapedMovie], list[dict]]:
         movies: list[ScrapedMovie] = []
         screening_infos: list[dict] = []
 
         url = f"{BASE_URL}/theater/{branch_id}/{branch_info['slug']}"
         try:
-            self._open_url(sb, url, take_debug_screenshot=(branch_id == "1"))
+            self._open_url(driver, url, take_debug_screenshot=(branch_id == "1"))
 
             movie_elements = self._find_elements(
-                sb,
+                driver,
                 '[class*="movie"], [class*="Movie"], [class*="film"], [class*="Film"], '
                 '[data-movie], article, .card, [class*="item"]',
             )
@@ -318,7 +324,7 @@ class HotCinemaScraper(BaseScraper):
                             format_text = time_text.upper()
                             parent_text = ""
                             try:
-                                parent = sb.execute_script(
+                                parent = driver.execute_script(
                                     "return arguments[0].closest("
                                     "'[class*=format],[class*=Format],[class*=type],[class*=Type]'"
                                     ")",
@@ -384,36 +390,36 @@ class HotCinemaScraper(BaseScraper):
 
         return movies, screening_infos
 
-    def _scrape_movie_detail(self, sb, movie_path: str) -> ScrapedMovie | None:
+    def _scrape_movie_detail(self, driver, movie_path: str) -> ScrapedMovie | None:
         try:
             url = f"{BASE_URL}{movie_path}" if movie_path.startswith("/") else movie_path
-            self._open_url(sb, url)
+            self._open_url(driver, url)
 
             title = ""
-            title_els = self._find_elements(sb, 'h1, [class*="movieTitle"], [class*="MovieTitle"]')
+            title_els = self._find_elements(driver, 'h1, [class*="movieTitle"], [class*="MovieTitle"]')
             if title_els:
                 title = self._el_text(title_els[0])
 
             genre = ""
-            genre_els = self._find_elements(sb, '[class*="genre"], [class*="Genre"]')
+            genre_els = self._find_elements(driver, '[class*="genre"], [class*="Genre"]')
             if genre_els:
                 genre = self._el_text(genre_els[0])
 
             duration = 0
-            dur_els = self._find_elements(sb, '[class*="duration"], [class*="Duration"], [class*="length"]')
+            dur_els = self._find_elements(driver, '[class*="duration"], [class*="Duration"], [class*="length"]')
             if dur_els:
                 dur_match = re.search(r"(\d+)", self._el_text(dur_els[0]))
                 if dur_match:
                     duration = int(dur_match.group(1))
 
             director = ""
-            dir_els = self._find_elements(sb, '[class*="director"], [class*="Director"]')
+            dir_els = self._find_elements(driver, '[class*="director"], [class*="Director"]')
             if dir_els:
                 director = self._el_text(dir_els[0])
 
             poster_url = ""
             poster_els = self._find_elements(
-                sb, '[class*="poster"] img, [class*="Poster"] img, .movie-image img',
+                driver, '[class*="poster"] img, [class*="Poster"] img, .movie-image img',
             )
             if poster_els:
                 poster_url = self._el_attr(poster_els[0], "src")
@@ -430,33 +436,36 @@ class HotCinemaScraper(BaseScraper):
         return None
 
     # ------------------------------------------------------------------
-    # Sync implementations (run inside SB context)
+    # Sync implementations (run inside a driver session)
     # ------------------------------------------------------------------
 
     def _sync_scrape_movies(self) -> list[ScrapedMovie]:
         all_movies: dict[str, ScrapedMovie] = {}
-        with SB(**self._sb_kwargs()) as sb:
+        driver = self._create_driver()
+        try:
             for branch_id, branch_info in HOT_CINEMA_BRANCHES.items():
-                movies, _ = self._scrape_theater_page(sb, branch_id, branch_info)
+                movies, _ = self._scrape_theater_page(driver, branch_id, branch_info)
                 for m in movies:
                     if m.title and m.title not in all_movies:
                         all_movies[m.title] = m
 
             # Movie detail pages from homepage
             try:
-                self._open_url(sb, BASE_URL)
-                links = self._find_elements(sb, 'a[href*="/movie/"]')
+                self._open_url(driver, BASE_URL)
+                links = self._find_elements(driver, 'a[href*="/movie/"]')
                 movie_paths: set[str] = set()
                 for link in links:
                     href = self._el_attr(link, "href")
                     if href and "/movie/" in href:
                         movie_paths.add(href)
                 for path in list(movie_paths)[:30]:
-                    movie = self._scrape_movie_detail(sb, path)
+                    movie = self._scrape_movie_detail(driver, path)
                     if movie and movie.title and movie.title not in all_movies:
                         all_movies[movie.title] = movie
             except Exception as e:
                 logger.warning(f"Hot Cinema homepage scrape failed: {e}")
+        finally:
+            driver.quit()
 
         result = list(all_movies.values())
         if not result:
@@ -466,14 +475,15 @@ class HotCinemaScraper(BaseScraper):
 
     def _sync_scrape_screenings(self) -> list[ScrapedScreening]:
         all_screenings: list[ScrapedScreening] = []
-        with SB(**self._sb_kwargs()) as sb:
+        driver = self._create_driver()
+        try:
             for branch_id, branch_info in HOT_CINEMA_BRANCHES.items():
-                _, screening_infos = self._scrape_theater_page(sb, branch_id, branch_info)
+                _, screening_infos = self._scrape_theater_page(driver, branch_id, branch_info)
 
                 # Try clicking date buttons for next 7 days
                 try:
                     date_buttons = self._find_elements(
-                        sb,
+                        driver,
                         '[class*="date"], [class*="Date"], [class*="day"], [class*="Day"], '
                         '[data-date], button[class*="calendar"]',
                     )
@@ -481,7 +491,7 @@ class HotCinemaScraper(BaseScraper):
                         try:
                             btn.click()
                             self._human_delay(1.5, 4.0)
-                            _, day_infos = self._scrape_theater_page(sb, branch_id, branch_info)
+                            _, day_infos = self._scrape_theater_page(driver, branch_id, branch_info)
                             screening_infos.extend(day_infos)
                         except Exception:
                             continue
@@ -503,15 +513,18 @@ class HotCinemaScraper(BaseScraper):
                     )
                     screening.revenue = 0
                     all_screenings.append(screening)
+        finally:
+            driver.quit()
 
         logger.info(f"[Hot Cinema] Daily scrape: {len(all_screenings)} screenings")
         return all_screenings
 
     def _sync_scrape_ticket_updates(self) -> list[ScrapedScreening]:
         all_screenings: list[ScrapedScreening] = []
-        with SB(**self._sb_kwargs()) as sb:
+        driver = self._create_driver()
+        try:
             for branch_id, branch_info in HOT_CINEMA_BRANCHES.items():
-                _, screening_infos = self._scrape_theater_page(sb, branch_id, branch_info)
+                _, screening_infos = self._scrape_theater_page(driver, branch_id, branch_info)
 
                 for info in screening_infos:
                     if info["showtime"] < datetime.now():
@@ -522,7 +535,7 @@ class HotCinemaScraper(BaseScraper):
 
                     booking_url = info.get("booking_url", "")
                     if booking_url:
-                        total, sold = self._get_seat_count_for_screening(sb, booking_url)
+                        total, sold = self._get_seat_count_for_screening(driver, booking_url)
                         if total > 0:
                             total_seats = total
                             tickets_sold = sold
@@ -534,23 +547,21 @@ class HotCinemaScraper(BaseScraper):
                     else:
                         try:
                             self._open_url(
-                                sb,
+                                driver,
                                 f"{BASE_URL}/theater/{branch_id}/{branch_info['slug']}",
                             )
                             time_str = info["showtime"].strftime("%H:%M")
-                            time_buttons = self._find_elements(
-                                sb, f'[class*="time"]',
-                            )
+                            time_buttons = self._find_elements(driver, '[class*="time"]')
                             for btn in time_buttons:
                                 if time_str not in self._el_text(btn):
                                     continue
                                 try:
                                     btn.click()
                                     time.sleep(3)
-                                    current_url = sb.get_current_url()
+                                    current_url = driver.current_url
                                     if any(kw in current_url for kw in ("seats", "ticket", "booking")):
                                         time.sleep(3)
-                                        total, sold = self._count_seats_on_page(sb)
+                                        total, sold = self._count_seats_on_page(driver)
                                         if total > 0:
                                             total_seats = total
                                             tickets_sold = sold
@@ -574,6 +585,8 @@ class HotCinemaScraper(BaseScraper):
                     )
                     screening.revenue = screening.tickets_sold * screening.ticket_price
                     all_screenings.append(screening)
+        finally:
+            driver.quit()
 
         logger.info(f"[Hot Cinema] Ticket update: {len(all_screenings)} screenings counted")
         return all_screenings
@@ -583,13 +596,13 @@ class HotCinemaScraper(BaseScraper):
     # ------------------------------------------------------------------
 
     async def scrape_movies(self) -> list[ScrapedMovie]:
-        """Weekly: scrape all movies (runs sync SB in a thread)."""
+        """Weekly: scrape all movies (runs sync driver in a thread)."""
         return await asyncio.to_thread(self._sync_scrape_movies)
 
     async def scrape_screenings(self) -> list[ScrapedScreening]:
-        """Daily: scrape screenings (runs sync SB in a thread)."""
+        """Daily: scrape screenings (runs sync driver in a thread)."""
         return await asyncio.to_thread(self._sync_scrape_screenings)
 
     async def scrape_ticket_updates(self) -> list[ScrapedScreening]:
-        """Every 5 hours: count seats sold (runs sync SB in a thread)."""
+        """Every 5 hours: count seats sold (runs sync driver in a thread)."""
         return await asyncio.to_thread(self._sync_scrape_ticket_updates)

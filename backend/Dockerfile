@@ -2,7 +2,9 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# ---- Install Google Chrome stable (needed by SeleniumBase UC mode) -------
+# ---- Install Google Chrome stable ----------------------------------------
+# Required by undetected-chromedriver (it patches the real chromedriver
+# binary at runtime to bypass Cloudflare / bot detection).
 RUN apt-get update && apt-get install -y --no-install-recommends \
     wget \
     gnupg \
@@ -33,8 +35,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# ---- Install matching chromedriver for SeleniumBase ----------------------
-RUN sbase install chromedriver
+# undetected-chromedriver auto-downloads a matching chromedriver on first
+# run, so no manual driver install step is needed.
 
 # ---- Copy application code -----------------------------------------------
 COPY . .
