@@ -1,13 +1,17 @@
+import asyncio
+import logging
+
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.orm import Session
 from sqlalchemy import func, desc
 from typing import Optional
 from datetime import datetime, timedelta
 
-from database import get_db
+from database import get_db, SessionLocal
 from models.models import CinemaChain, Cinema, Movie, Screening, ScrapeLog
 
 router = APIRouter(prefix="/api")
+logger = logging.getLogger(__name__)
 
 
 # ─── Dashboard Summary ───────────────────────────────────────────────
@@ -315,6 +319,25 @@ def get_occupancy_by_format(db: Session = Depends(get_db)):
         }
         for f, s, o, t in results
     ]
+
+
+# ─── Manual Scrape Trigger ────────────────────────────────────────────
+
+@router.post("/scrape/trigger")
+async def trigger_scrape():
+    """הפעלת סריקה ידנית - רץ ברקע"""
+    async def run_scrape():
+        from scrapers.manager import run_initial_scrape
+        db = SessionLocal()
+        try:
+            await run_initial_scrape(db)
+        except Exception as e:
+            logger.error(f"Manual scrape failed: {e}")
+        finally:
+            db.close()
+
+    asyncio.create_task(run_scrape())
+    return {"status": "started", "message": "סריקה הופעלה ברקע. בדוק בלוגים את ההתקדמות."}
 
 
 # ─── Scrape Logs ─────────────────────────────────────────────────────
