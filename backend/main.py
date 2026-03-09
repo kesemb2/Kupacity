@@ -5,6 +5,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 # Ensure backend directory is in path
@@ -149,6 +150,20 @@ def root():
 
 
 app.include_router(router)
+
+# Debug endpoint: view the last scraper screenshot
+# Visit https://<your-render-url>/api/debug-screenshot in your browser
+_DEBUG_SCREENSHOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "debug.png")
+
+
+@app.get("/api/debug-screenshot")
+def debug_screenshot():
+    if os.path.exists(_DEBUG_SCREENSHOT):
+        return FileResponse(_DEBUG_SCREENSHOT, media_type="image/png")
+    return JSONResponse(
+        status_code=404,
+        content={"detail": "No debug screenshot yet. Run a scrape first."},
+    )
 
 # Serve frontend build if it exists
 frontend_build = os.path.join(os.path.dirname(__file__), "..", "frontend", "build")
