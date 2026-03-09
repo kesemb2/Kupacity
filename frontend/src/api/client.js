@@ -19,4 +19,8 @@ export const fetchTopMovies = (limit = 10) => api.get(`/analytics/top-movies?lim
 export const fetchOccupancyByFormat = () => api.get('/analytics/occupancy-by-format').then(r => r.data);
 export const fetchScrapeLogs = () => api.get('/scrape-logs').then(r => r.data);
 
+export const checkHealth = () => api.get('/dashboard/summary', { timeout: 5000 })
+  .then(() => ({ ok: true }))
+  .catch(() => ({ ok: false }));
+
 export default api;

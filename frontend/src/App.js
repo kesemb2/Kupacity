@@ -1,10 +1,11 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import './index.css';
 import Dashboard from './pages/Dashboard';
 import MoviesPage from './pages/MoviesPage';
 import CinemasPage from './pages/CinemasPage';
 import CitiesPage from './pages/CitiesPage';
 import MovieDetail from './pages/MovieDetail';
+import { checkHealth } from './api/client';
 
 const NAV_ITEMS = [
   { key: 'dashboard', label: 'דאשבורד' },
@@ -16,6 +17,16 @@ const NAV_ITEMS = [
 function App() {
   const [page, setPage] = useState('dashboard');
   const [selectedMovieId, setSelectedMovieId] = useState(null);
+  const [backendStatus, setBackendStatus] = useState('checking'); // 'checking' | 'online' | 'offline'
+
+  useEffect(() => {
+    const check = () => {
+      checkHealth().then(({ ok }) => setBackendStatus(ok ? 'online' : 'offline'));
+    };
+    check();
+    const interval = setInterval(check, 30000);
+    return () => clearInterval(interval);
+  }, []);
 
   const navigateToMovie = (id) => {
     setSelectedMovieId(id);
@@ -114,8 +125,40 @@ function App() {
         color: '#64748b',
         fontSize: 13,
         borderTop: '1px solid #1e293b',
+        display: 'flex',
+        justifyContent: 'center',
+        alignItems: 'center',
+        gap: 16,
       }}>
-        דאשבורד בוקס אופיס קולנוע ישראלי • הנתונים מתעדכנים כל 30 דקות
+        <span>דאשבורד בוקס אופיס קולנוע ישראלי • הנתונים מתעדכנים כל 30 דקות</span>
+        <span style={{
+          display: 'inline-flex',
+          alignItems: 'center',
+          gap: 6,
+          padding: '4px 12px',
+          borderRadius: 20,
+          fontSize: 12,
+          fontWeight: 500,
+          background: backendStatus === 'online' ? 'rgba(34,197,94,0.15)' :
+                      backendStatus === 'offline' ? 'rgba(239,68,68,0.15)' :
+                      'rgba(234,179,8,0.15)',
+          color: backendStatus === 'online' ? '#22c55e' :
+                 backendStatus === 'offline' ? '#ef4444' :
+                 '#eab308',
+        }}>
+          <span style={{
+            width: 8,
+            height: 8,
+            borderRadius: '50%',
+            background: backendStatus === 'online' ? '#22c55e' :
+                        backendStatus === 'offline' ? '#ef4444' :
+                        '#eab308',
+            animation: backendStatus === 'online' ? 'none' : 'pulse 1.5s infinite',
+          }} />
+          {backendStatus === 'online' ? 'שרת מחובר' :
+           backendStatus === 'offline' ? 'שרת מנותק' :
+           'בודק חיבור...'}
+        </span>
       </footer>
     </div>
   );

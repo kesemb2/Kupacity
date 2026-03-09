@@ -24,3 +24,8 @@ body {
   background: #475569;
   border-radius: 4px;
 }
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.3; }
+}
