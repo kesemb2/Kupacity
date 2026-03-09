@@ -19,6 +19,7 @@ import logging
 import re
 from datetime import datetime, timedelta
 from playwright.async_api import async_playwright, Page, Browser
+from playwright_stealth import stealth_async
 
 from scrapers.base import BaseScraper, ScrapedMovie, ScrapedScreening
 
@@ -57,26 +58,32 @@ class HotCinemaScraper(BaseScraper):
         return BASE_URL
 
     async def _launch_browser(self) -> tuple:
-        """Launch Playwright browser and return (playwright, browser)."""
+        """Launch Playwright browser with stealth to bypass bot detection."""
         pw = await async_playwright().start()
         browser = await pw.chromium.launch(
             headless=True,
-            args=["--no-sandbox", "--disable-setuid-sandbox"],
+            args=[
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-blink-features=AutomationControlled",
+            ],
         )
         return pw, browser
 
     async def _new_page(self, browser: Browser) -> Page:
-        """Create a new page with realistic browser settings."""
+        """Create a new page with stealth to avoid bot detection."""
         context = await browser.new_context(
             viewport={"width": 1920, "height": 1080},
             locale="he-IL",
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
+                "Chrome/131.0.0.0 Safari/537.36"
             ),
+            java_script_enabled=True,
         )
         page = await context.new_page()
+        await stealth_async(page)
         return page
 
     # ------------------------------------------------------------------
