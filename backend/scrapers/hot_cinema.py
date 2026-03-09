@@ -123,10 +123,15 @@ class HotCinemaScraper(BaseScraper):
         # drift apart (e.g. Chrome 145 vs chromedriver 146).
         chrome_ver = cls._detect_chrome_major_version()
 
+        # In Docker the Chromium binary lives at /usr/bin/chromium;
+        # use it explicitly so UC doesn't try to download Google Chrome.
+        chromium_path = shutil.which("chromium") or shutil.which("chromium-browser")
+
         driver = uc.Chrome(
             options=options,
             headless=True,
             version_main=chrome_ver,  # None → auto-detect (UC default)
+            browser_executable_path=chromium_path,  # works on ARM & AMD64
         )
         driver.set_page_load_timeout(30)
         return driver
