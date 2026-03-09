@@ -14,8 +14,18 @@ Schedule:
 - Weekly:  scrape_movies()         - full movie catalog from all theaters
 - Daily:   scrape_screenings()     - screening schedule for next 7 days
 - 5 hours: scrape_ticket_updates() - enter each screening's seat page and count sold seats
+
+Anti-detection:
+- Rotates real-browser User-Agent strings each session
+- Randomised delays (2-7 s) between navigations
+- Human-like mouse movement + scroll before data extraction
+- playwright-stealth patches (webdriver, chrome.runtime, etc.)
+- Optional proxy via SCRAPER_PROXY_SERVER env var
 """
+import asyncio
 import logging
+import os
+import random
 import re
 from datetime import datetime, timedelta
 from playwright.async_api import async_playwright, Page, Browser
@@ -24,6 +34,28 @@ from playwright_stealth import stealth_async
 from scrapers.base import BaseScraper, ScrapedMovie, ScrapedScreening
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Real-browser User-Agent pool (Chrome / Firefox / Edge on Windows & Mac)
+# ---------------------------------------------------------------------------
+_USER_AGENTS = [
+    # Chrome 131 – Windows
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    # Chrome 130 – Mac
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+    # Chrome 129 – Windows
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
+    # Firefox 132 – Windows
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:132.0) Gecko/20100101 Firefox/132.0",
+    # Firefox 131 – Mac
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:131.0) Gecko/20100101 Firefox/131.0",
+    # Edge 131 – Windows
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0",
+    # Chrome 131 – Linux
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    # Safari 17 – Mac
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Safari/605.1.15",
+]
 
 # Branch list based on actual site data
 HOT_CINEMA_BRANCHES = {
@@ -57,34 +89,118 @@ class HotCinemaScraper(BaseScraper):
     def base_url(self) -> str:
         return BASE_URL
 
+    # ------------------------------------------------------------------
+    # Anti-detection helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    async def _human_delay(lo: float = 2.0, hi: float = 7.0):
+        """Sleep for a random duration to mimic human pacing."""
+        await asyncio.sleep(random.uniform(lo, hi))
+
+    @staticmethod
+    async def _simulate_human(page: Page):
+        """Move mouse to random coordinates and scroll slightly."""
+        # Random mouse movement (3-6 points)
+        for _ in range(random.randint(3, 6)):
+            x = random.randint(100, 1800)
+            y = random.randint(100, 900)
+            await page.mouse.move(x, y, steps=random.randint(5, 15))
+            await asyncio.sleep(random.uniform(0.05, 0.2))
+
+        # Gentle scroll down then back up
+        scroll_y = random.randint(150, 500)
+        await page.mouse.wheel(0, scroll_y)
+        await asyncio.sleep(random.uniform(0.3, 0.8))
+        await page.mouse.wheel(0, -random.randint(50, scroll_y))
+        await asyncio.sleep(random.uniform(0.2, 0.5))
+
+    # ------------------------------------------------------------------
+    # Browser / page lifecycle
+    # ------------------------------------------------------------------
+
     async def _launch_browser(self) -> tuple:
-        """Launch Playwright browser with stealth to bypass bot detection."""
+        """Launch Playwright Chromium with stealth flags and optional proxy.
+
+        To route traffic through a proxy, set the env var:
+            SCRAPER_PROXY_SERVER=http://user:pass@host:port
+        """
         pw = await async_playwright().start()
-        browser = await pw.chromium.launch(
-            headless=True,
-            args=[
+
+        launch_kwargs: dict = {
+            "headless": True,
+            "args": [
                 "--no-sandbox",
                 "--disable-setuid-sandbox",
                 "--disable-blink-features=AutomationControlled",
+                "--disable-infobars",
+                "--window-size=1920,1080",
             ],
-        )
+        }
+
+        # ---- Proxy configuration (optional) ----------------------------
+        proxy_server = os.environ.get("SCRAPER_PROXY_SERVER")
+        if proxy_server:
+            proxy_cfg: dict = {"server": proxy_server}
+            proxy_user = os.environ.get("SCRAPER_PROXY_USERNAME")
+            proxy_pass = os.environ.get("SCRAPER_PROXY_PASSWORD")
+            if proxy_user:
+                proxy_cfg["username"] = proxy_user
+            if proxy_pass:
+                proxy_cfg["password"] = proxy_pass
+            launch_kwargs["proxy"] = proxy_cfg
+            logger.info(f"[Hot Cinema] Using proxy: {proxy_server}")
+        # ----------------------------------------------------------------
+
+        browser = await pw.chromium.launch(**launch_kwargs)
         return pw, browser
 
     async def _new_page(self, browser: Browser) -> Page:
-        """Create a new page with stealth to avoid bot detection."""
+        """Create a new browser context + page with a random UA and stealth."""
+        ua = random.choice(_USER_AGENTS)
+        logger.debug(f"[Hot Cinema] Selected UA: {ua}")
+
         context = await browser.new_context(
             viewport={"width": 1920, "height": 1080},
-            locale="he-IL",
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/131.0.0.0 Safari/537.36"
-            ),
+            locale="en-US",
+            timezone_id="Asia/Jerusalem",
+            user_agent=ua,
             java_script_enabled=True,
+            color_scheme="light",
+            # Extra realistic headers
+            extra_http_headers={
+                "Accept-Language": "he-IL,he;q=0.9,en-US;q=0.8,en;q=0.7",
+                "Accept-Encoding": "gzip, deflate, br",
+                "Sec-CH-UA": '"Chromium";v="131", "Not_A Brand";v="24"',
+                "Sec-CH-UA-Mobile": "?0",
+                "Sec-CH-UA-Platform": '"Windows"',
+            },
         )
+
         page = await context.new_page()
         await stealth_async(page)
         return page
+
+    async def _goto_with_stealth(self, page: Page, url: str,
+                                  timeout: int = 30000) -> object:
+        """Navigate to *url* with human-like delay + mouse jitter."""
+        await self._human_delay()
+        resp = await page.goto(url, wait_until="networkidle", timeout=timeout)
+
+        # Log the actual response for debugging 403s
+        if resp and resp.status >= 400:
+            body_snippet = ""
+            try:
+                body_snippet = (await resp.text())[:300]
+            except Exception:
+                pass
+            logger.warning(
+                f"[Hot Cinema] HTTP {resp.status} for {url}"
+                + (f" | body: {body_snippet}" if body_snippet else "")
+            )
+
+        await self._simulate_human(page)
+        return resp
 
     # ------------------------------------------------------------------
     # Seat counting: enter the booking/seats page and count occupied seats
@@ -103,21 +219,17 @@ class HotCinemaScraper(BaseScraper):
         sold = 0
 
         # Strategy 1: Look for individual seat elements with status indicators
-        # Common patterns: seats as SVG rects/circles, divs, or buttons
         seat_selectors = [
-            # SVG-based seat maps
             'svg [class*="seat"], svg [data-seat], svg rect[class], svg circle[class]',
-            # Div/button-based seat maps
             '[class*="seat"]:not([class*="seatmap"]):not([class*="seating"]):not([class*="seats-"]), '
             '[data-seat-id], [data-seat], [class*="Seat"]:not([class*="Seatmap"])',
-            # Generic clickable seat elements
             '.seat, .chair, [role="button"][class*="seat"]',
         ]
 
         for selector in seat_selectors:
             try:
                 seats = await page.query_selector_all(selector)
-                if len(seats) < 5:  # too few to be a real seat map
+                if len(seats) < 5:
                     continue
 
                 total = len(seats)
@@ -127,7 +239,6 @@ class HotCinemaScraper(BaseScraper):
                     aria_disabled = (await seat.get_attribute('aria-disabled') or "").lower()
                     style = (await seat.get_attribute('style') or "").lower()
 
-                    # Check multiple indicators for a sold/occupied seat
                     is_sold = any([
                         'sold' in classes,
                         'occupied' in classes,
@@ -142,10 +253,8 @@ class HotCinemaScraper(BaseScraper):
                         'pointer-events: none' in style and 'opacity' in style,
                     ])
 
-                    # Also check fill color for SVG (gray/red = sold, green/blue = available)
                     fill = (await seat.get_attribute('fill') or "").lower()
                     if fill and not is_sold:
-                        # Typical sold colors: gray, red, dark
                         sold_colors = ['#ccc', '#ddd', '#999', '#888', '#666', 'gray', 'grey',
                                        '#ff0000', 'red', '#c0c0c0', '#808080']
                         if any(c in fill for c in sold_colors):
@@ -155,24 +264,21 @@ class HotCinemaScraper(BaseScraper):
                         sold += 1
 
                 if total > 0:
-                    break  # found seats with this selector
+                    break
             except Exception as e:
                 logger.debug(f"Seat selector '{selector}' failed: {e}")
                 continue
 
-        # Strategy 2: If no seats found, try to read a text indicator on the page
-        # e.g., "נותרו 45 מקומות" or "12/200 מקומות תפוסים"
+        # Strategy 2: text-based seat indicator
         if total == 0:
             try:
                 body_text = await page.inner_text('body')
-                # Pattern: "X מקומות פנויים" or "נותרו X מקומות"
                 remaining_match = re.search(r'נותרו\s+(\d+)\s+מקומות', body_text)
                 if remaining_match:
                     available = int(remaining_match.group(1))
-                    total = available  # we don't know total, at minimum this many exist
-                    sold = 0  # we only know available count
+                    total = available
+                    sold = 0
 
-                # Pattern: "X/Y" seats
                 ratio_match = re.search(r'(\d+)\s*/\s*(\d+)', body_text)
                 if ratio_match:
                     sold = int(ratio_match.group(1))
@@ -183,13 +289,12 @@ class HotCinemaScraper(BaseScraper):
         return total, sold
 
     async def _get_seat_count_for_screening(self, page: Page, screening_url: str) -> tuple[int, int]:
-        """
-        Navigate to a screening's seat selection page and count seats.
-        Returns (total_seats, tickets_sold).
-        """
+        """Navigate to a screening's seat selection page and count seats."""
         try:
-            await page.goto(screening_url, wait_until="networkidle", timeout=30000)
-            await page.wait_for_timeout(3000)  # wait for seat map to render
+            resp = await self._goto_with_stealth(page, screening_url)
+            if resp and resp.status >= 400:
+                return 0, 0
+            await page.wait_for_timeout(3000)
             total, sold = await self._count_seats_on_page(page)
             return total, sold
         except Exception as e:
@@ -211,11 +316,9 @@ class HotCinemaScraper(BaseScraper):
 
         url = f"{BASE_URL}/theater/{branch_id}/{branch_info['slug']}"
         try:
-            resp = await page.goto(url, wait_until="networkidle", timeout=30000)
+            resp = await self._goto_with_stealth(page, url)
             if resp and resp.status >= 400:
-                logger.warning(f"Hot Cinema theater {branch_id} returned HTTP {resp.status}")
                 return movies, screening_infos
-            await page.wait_for_timeout(2000)
 
             # Find movie elements
             movie_elements = await page.query_selector_all(
@@ -225,7 +328,6 @@ class HotCinemaScraper(BaseScraper):
 
             for elem in movie_elements:
                 try:
-                    # Extract movie title
                     title_el = await elem.query_selector(
                         'h2, h3, h4, [class*="title"], [class*="name"], [class*="Title"], [class*="Name"]'
                     )
@@ -235,7 +337,6 @@ class HotCinemaScraper(BaseScraper):
                     if not title or len(title) < 2:
                         continue
 
-                    # Extract poster
                     poster_url = ""
                     img_el = await elem.query_selector('img')
                     if img_el:
@@ -250,7 +351,6 @@ class HotCinemaScraper(BaseScraper):
                     )
                     movies.append(movie)
 
-                    # Extract showtimes with their booking links
                     showtime_elements = await elem.query_selector_all(
                         'a[href*="tickets"], a[href*="booking"], a[href*="order"], '
                         'a[href*="seats"], a[href*="site"], '
@@ -273,7 +373,6 @@ class HotCinemaScraper(BaseScraper):
                             if showtime < datetime.now():
                                 showtime += timedelta(days=1)
 
-                            # Extract format
                             format_text = time_text.upper()
                             parent_text = ""
                             try:
@@ -294,23 +393,19 @@ class HotCinemaScraper(BaseScraper):
                             elif "SCREENX" in combined_text:
                                 screen_format = "ScreenX"
 
-                            # Extract hall info
                             hall = ""
                             hall_attr = await st_el.get_attribute('data-hall')
                             if hall_attr:
                                 hall = hall_attr
 
-                            # Get booking/seat selection URL
                             booking_url = ""
                             href = await st_el.get_attribute('href')
                             if href:
                                 if href.startswith('http'):
                                     booking_url = href
                                 elif href.startswith('/'):
-                                    # Could be on tickets subdomain or main domain
                                     booking_url = f"{TICKETS_URL}{href}" if 'site' in href or 'seats' in href else f"{BASE_URL}{href}"
                             else:
-                                # Maybe it's a button that triggers navigation - get data attributes
                                 data_url = await st_el.get_attribute('data-url') or await st_el.get_attribute('data-href') or ""
                                 if data_url:
                                     booking_url = data_url if data_url.startswith('http') else f"{TICKETS_URL}{data_url}"
@@ -342,8 +437,9 @@ class HotCinemaScraper(BaseScraper):
         """Scrape detailed info from a movie's dedicated page."""
         try:
             url = f"{BASE_URL}{movie_path}" if movie_path.startswith('/') else movie_path
-            await page.goto(url, wait_until="networkidle", timeout=20000)
-            await page.wait_for_timeout(1500)
+            resp = await self._goto_with_stealth(page, url, timeout=20000)
+            if resp and resp.status >= 400:
+                return None
 
             title = ""
             title_el = await page.query_selector('h1, [class*="movieTitle"], [class*="MovieTitle"]')
@@ -403,8 +499,7 @@ class HotCinemaScraper(BaseScraper):
 
             # Also scrape movie detail pages from the homepage
             try:
-                await page.goto(BASE_URL, wait_until="networkidle", timeout=30000)
-                await page.wait_for_timeout(2000)
+                await self._goto_with_stealth(page, BASE_URL)
                 movie_links = await page.query_selector_all('a[href*="/movie/"]')
                 movie_paths = set()
                 for link in movie_links:
@@ -415,7 +510,6 @@ class HotCinemaScraper(BaseScraper):
                     movie = await self._scrape_movie_detail(page, path)
                     if movie and movie.title and movie.title not in all_movies:
                         all_movies[movie.title] = movie
-                    await page.wait_for_timeout(500)
             except Exception as e:
                 logger.warning(f"Hot Cinema homepage scrape failed: {e}")
 
@@ -449,7 +543,7 @@ class HotCinemaScraper(BaseScraper):
                     for btn in date_buttons[1:7]:
                         try:
                             await btn.click()
-                            await page.wait_for_timeout(2000)
+                            await self._human_delay(1.5, 4.0)
                             _, day_infos = await self._scrape_theater_page(page, branch_id, branch_info)
                             screening_infos.extend(day_infos)
                         except Exception:
@@ -457,7 +551,6 @@ class HotCinemaScraper(BaseScraper):
                 except Exception:
                     pass
 
-                # Convert screening_infos to ScrapedScreening (without seat counts for daily)
                 for info in screening_infos:
                     screening = ScrapedScreening(
                         movie_title=info["movie_title"],
@@ -468,13 +561,11 @@ class HotCinemaScraper(BaseScraper):
                         format=info["format"],
                         language="subtitled",
                         ticket_price=39.0,
-                        total_seats=200,  # default, will be updated by ticket scan
+                        total_seats=200,
                         tickets_sold=0,
                     )
                     screening.revenue = 0
                     all_screenings.append(screening)
-
-                await page.wait_for_timeout(1000)
 
             await page.close()
         finally:
@@ -495,20 +586,17 @@ class HotCinemaScraper(BaseScraper):
             page = await self._new_page(browser)
 
             for branch_id, branch_info in HOT_CINEMA_BRANCHES.items():
-                # First get today's screenings with their booking links
                 _, screening_infos = await self._scrape_theater_page(page, branch_id, branch_info)
 
                 for info in screening_infos:
-                    # Skip screenings that already started
                     if info["showtime"] < datetime.now():
                         continue
 
-                    total_seats = 200  # default
+                    total_seats = 200
                     tickets_sold = 0
 
                     booking_url = info.get("booking_url", "")
                     if booking_url:
-                        # Enter the seat selection page and count seats
                         total, sold = await self._get_seat_count_for_screening(page, booking_url)
                         if total > 0:
                             total_seats = total
@@ -519,23 +607,17 @@ class HotCinemaScraper(BaseScraper):
                                 f"{tickets_sold}/{total_seats} seats sold"
                             )
                     else:
-                        # No direct booking URL - try clicking the showtime on the theater page
-                        # to trigger navigation to the booking page
                         try:
-                            await page.goto(
+                            await self._goto_with_stealth(
+                                page,
                                 f"{BASE_URL}/theater/{branch_id}/{branch_info['slug']}",
-                                wait_until="networkidle", timeout=30000,
                             )
-                            await page.wait_for_timeout(2000)
-
-                            # Find and click the specific showtime
                             time_str = info["showtime"].strftime("%H:%M")
                             time_buttons = await page.query_selector_all(
                                 f'text="{time_str}", [class*="time"]:has-text("{time_str}")'
                             )
                             for btn in time_buttons:
                                 try:
-                                    # Click and see if it navigates to a seats page
                                     async with page.expect_navigation(timeout=10000):
                                         await btn.click()
 
@@ -566,10 +648,6 @@ class HotCinemaScraper(BaseScraper):
                     )
                     screening.revenue = screening.tickets_sold * screening.ticket_price
                     all_screenings.append(screening)
-
-                    await page.wait_for_timeout(500)  # rate limiting between screenings
-
-                await page.wait_for_timeout(1000)  # rate limiting between branches
 
             await page.close()
         finally:
