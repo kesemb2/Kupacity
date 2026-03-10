@@ -394,196 +394,209 @@ class HotCinemaScraper(BaseScraper):
                                         movie_title: str) -> list[dict]:
         """Visit a movie detail page and parse its screening table.
 
-        The screening table on hotcinema.co.il/movie/{id}/{slug} shows rows like:
-            HOT CINEMA כפר סבא | כתוביות בעברית | 17:00
-        Each time is a clickable link to the ticket purchase page.
+        Uses network interception to capture API calls the frontend makes,
+        then falls back to HTML parsing within the screening table container.
         """
         screening_infos: list[dict] = []
+        api_calls: list[dict] = []
 
-        try:
-            await self._open_url(page, movie_url)
-
-            # Scroll down to the screening table area
-            await page.evaluate("window.scrollBy(0, 600)")
-            await asyncio.sleep(1)
-
-            # Log a snippet of page text for debugging (first movie only)
-            try:
-                body_text = await page.inner_text("body")
-                if "רכישת כרטיסים" in body_text:
-                    logger.debug(f"[Hot Cinema] '{movie_title}': found 'רכישת כרטיסים' section")
-            except Exception:
-                pass
-
-            # Strategy 1: Find screening rows in the table
-            # Each screening row typically contains: cinema name, language, and showtime links
-            # Look for rows/containers that have time links
-            screening_rows = await page.query_selector_all(
-                'tr, [class*="screening"], [class*="Screening"], '
-                '[class*="showtime"], [class*="Showtime"], '
-                '[class*="row"], [class*="Row"]'
-            )
-
-            # Also try broader approach: find all time-like clickable elements
-            time_links = await page.query_selector_all('a')
-            time_link_data: list[dict] = []
-
-            for link in time_links:
+        async def capture_response(response):
+            url = response.url
+            # Capture any JSON API calls
+            content_type = response.headers.get("content-type", "")
+            if "json" in content_type or any(kw in url.lower() for kw in [
+                "api", "screening", "showtime", "event", "schedule",
+                "film", "movie", "catalog", "programme", "graphql",
+            ]):
                 try:
-                    text = (await link.inner_text()).strip()
-                    time_match = re.match(r"^(\d{1,2}:\d{2})$", text)
-                    if not time_match:
-                        continue
-
-                    href = await link.get_attribute("href") or ""
-                    if not href:
-                        continue
-
-                    # Build full booking URL
-                    if href.startswith("/"):
-                        booking_url = f"{TICKETS_URL}{href}" if "site" in href else f"{BASE_URL}{href}"
-                    elif href.startswith("http"):
-                        booking_url = href
-                    else:
-                        continue
-
-                    # Find the parent row to get cinema name and language
-                    row_info = await page.evaluate("""(el) => {
-                        // Walk up to find the row container
-                        let row = el.parentElement;
-                        for (let i = 0; i < 8 && row; i++) {
-                            const text = row.textContent || '';
-                            if (text.includes('HOT CINEMA') || text.includes('הוט סינמה')) {
-                                return {
-                                    text: row.textContent.trim(),
-                                    html: row.innerHTML.substring(0, 500)
-                                };
-                            }
-                            row = row.parentElement;
-                        }
-                        // Fallback: use closest ancestor with substantial text
-                        row = el.parentElement;
-                        for (let i = 0; i < 5 && row; i++) {
-                            const text = (row.textContent || '').trim();
-                            if (text.length > 20) {
-                                return { text: text, html: '' };
-                            }
-                            row = row.parentElement;
-                        }
-                        return { text: '', html: '' };
-                    }""", link)
-
-                    row_text = row_info.get("text", "") if row_info else ""
-
-                    # Extract cinema name from row text
-                    cinema_name, city = "Hot Cinema", ""
-                    cinema_match = re.search(r"HOT CINEMA\s+(\S+(?:\s+\S+)?)", row_text)
-                    if cinema_match:
-                        cinema_name, city = _resolve_cinema(cinema_match.group(0))
-                    else:
-                        # Try Hebrew name
-                        for city_he, binfo in _CINEMA_NAME_MAP.items():
-                            if city_he in row_text:
-                                cinema_name = binfo["name"]
-                                city = binfo["city"]
-                                break
-
-                    # Extract language
-                    language = "subtitled"
-                    if "מדובב" in row_text:
-                        language = "dubbed"
-                    elif "כתוביות" in row_text:
-                        language = "subtitled"
-                    elif "מקור" in row_text:
-                        language = "original"
-
-                    # Detect format from row text or page-level format tabs
-                    screen_format = "2D"
-                    row_upper = row_text.upper()
-                    if "IMAX" in row_upper:
-                        screen_format = "IMAX"
-                    elif "4DX" in row_upper:
-                        screen_format = "4DX"
-                    elif "תלת מימד" in row_text or "3D" in row_upper:
-                        screen_format = "3D"
-                    elif "SCREENX" in row_upper:
-                        screen_format = "ScreenX"
-                    elif "PREMIUM" in row_upper:
-                        screen_format = "PREMIUM"
-                    elif "ATMOS" in row_upper:
-                        screen_format = "Atmos"
-
-                    # Parse time
-                    hour, minute = map(int, time_match.group(1).split(":"))
-                    showtime = datetime.now().replace(
-                        hour=hour, minute=minute, second=0, microsecond=0,
-                    )
-                    if showtime < datetime.now() - timedelta(hours=1):
-                        showtime += timedelta(days=1)
-
-                    time_link_data.append({
-                        "movie_title": movie_title,
-                        "cinema_name": cinema_name,
-                        "city": city,
-                        "showtime": showtime,
-                        "hall": "",
-                        "format": screen_format,
-                        "language": language,
-                        "booking_url": booking_url,
+                    body = await response.json()
+                    api_calls.append({
+                        "url": url,
+                        "status": response.status,
+                        "body_sample": str(body)[:300],
                     })
                 except Exception:
-                    continue
+                    api_calls.append({"url": url, "status": response.status})
 
-            screening_infos.extend(time_link_data)
+        try:
+            page.on("response", capture_response)
+            await self._open_url(page, movie_url)
 
-            # Strategy 2: If no time links found, try parsing text-based rows
-            if not screening_infos:
-                try:
-                    body_text = await page.inner_text("body")
-                    # Look for patterns like "HOT CINEMA כפר סבא    כתוביות בעברית    17:00"
-                    lines = body_text.split("\n")
-                    current_cinema = ""
-                    for line in lines:
-                        line = line.strip()
-                        if "HOT CINEMA" in line or "הוט סינמה" in line:
-                            cinema_match = re.search(r"HOT CINEMA\s+(\S+(?:\s+\S+)?)", line)
-                            if cinema_match:
-                                current_cinema = cinema_match.group(0)
+            # Scroll to trigger lazy-loaded content
+            await page.evaluate("window.scrollBy(0, 800)")
+            await asyncio.sleep(2)
 
-                        times = re.findall(r"\b(\d{1,2}:\d{2})\b", line)
-                        if times and current_cinema:
-                            cinema_name, city = _resolve_cinema(current_cinema)
-                            for t in times:
-                                hour, minute = map(int, t.split(":"))
-                                if hour > 23 or minute > 59:
-                                    continue
-                                showtime = datetime.now().replace(
-                                    hour=hour, minute=minute, second=0, microsecond=0,
-                                )
-                                if showtime < datetime.now() - timedelta(hours=1):
-                                    showtime += timedelta(days=1)
-                                screening_infos.append({
-                                    "movie_title": movie_title,
-                                    "cinema_name": cinema_name,
-                                    "city": city,
-                                    "showtime": showtime,
-                                    "hall": "",
-                                    "format": "2D",
-                                    "language": "subtitled",
-                                    "booking_url": "",
-                                })
-                except Exception as e:
-                    logger.debug(f"[Hot Cinema] Text-based screening parse failed for '{movie_title}': {e}")
-
-            if screening_infos:
-                logger.info(f"[Hot Cinema] '{movie_title}': {len(screening_infos)} screenings found")
+            # Log all captured API calls
+            if api_calls:
+                for call in api_calls:
+                    logger.info(f"[Hot Cinema] API call: {call['url']} (status={call['status']})")
+                    if "body_sample" in call:
+                        logger.info(f"[Hot Cinema]   body: {call['body_sample']}")
             else:
-                logger.info(f"[Hot Cinema] '{movie_title}': no screenings found")
+                logger.info(f"[Hot Cinema] '{movie_title}': no API calls intercepted")
+
+            # Log the screening section HTML for debugging
+            screening_html = await page.evaluate("""() => {
+                // Find the screening section by looking for "רכישת כרטיסים" heading
+                const allElements = document.querySelectorAll('h1, h2, h3, h4, h5, div, section');
+                for (const el of allElements) {
+                    const text = el.textContent || '';
+                    if (text.includes('רכישת כרטיסים') && text.length < 200) {
+                        // Found the heading - get its parent container
+                        let container = el.parentElement;
+                        for (let i = 0; i < 3 && container; i++) {
+                            if (container.innerHTML.length > 500) {
+                                return container.innerHTML.substring(0, 2000);
+                            }
+                            container = container.parentElement;
+                        }
+                        return el.parentElement ? el.parentElement.innerHTML.substring(0, 2000) : '';
+                    }
+                }
+                return 'SCREENING_SECTION_NOT_FOUND';
+            }""")
+            logger.info(f"[Hot Cinema] '{movie_title}' screening section HTML: {screening_html[:500]}")
+
+            # Find time links ONLY within the screening table area
+            screening_infos = await page.evaluate("""() => {
+                const results = [];
+
+                // Find the screening section
+                const allElements = document.querySelectorAll('h1, h2, h3, h4, h5, div, section');
+                let screeningContainer = null;
+                for (const el of allElements) {
+                    const text = (el.textContent || '').trim();
+                    if (text.startsWith('רכישת כרטיסים') && text.length < 100) {
+                        // Walk up to find a substantial container
+                        screeningContainer = el.parentElement;
+                        for (let i = 0; i < 5 && screeningContainer; i++) {
+                            if (screeningContainer.querySelectorAll('a').length >= 3) break;
+                            screeningContainer = screeningContainer.parentElement;
+                        }
+                        break;
+                    }
+                }
+
+                if (!screeningContainer) return results;
+
+                // Find all links within the screening container that look like times
+                const links = screeningContainer.querySelectorAll('a');
+                for (const link of links) {
+                    const text = (link.textContent || '').trim();
+                    const match = text.match(/^(\d{1,2}):(\d{2})$/);
+                    if (!match) continue;
+
+                    const href = link.getAttribute('href') || '';
+                    if (!href) continue;
+
+                    // Walk up to find the row containing cinema name
+                    let rowText = '';
+                    let row = link.parentElement;
+                    for (let i = 0; i < 8 && row; i++) {
+                        const t = (row.textContent || '').trim();
+                        if (t.includes('HOT CINEMA') || t.includes('הוט סינמה') || t.includes('כתוביות') || t.includes('מדובב')) {
+                            rowText = t;
+                            break;
+                        }
+                        row = row.parentElement;
+                    }
+
+                    results.push({
+                        time: text,
+                        href: href,
+                        rowText: rowText.substring(0, 200),
+                    });
+                }
+
+                return results;
+            }""")
+
+            # Log raw results
+            logger.info(f"[Hot Cinema] '{movie_title}': found {len(screening_infos)} time links in screening section")
+            for si in screening_infos[:3]:
+                logger.info(f"[Hot Cinema]   time={si['time']} href={si['href'][:80]} row={si['rowText'][:80]}")
 
         except Exception as e:
             logger.warning(f"[Hot Cinema] Movie page failed for '{movie_title}': {e}")
+        finally:
+            page.remove_listener("response", capture_response)
 
-        return screening_infos
+        # Convert raw JS results to screening dicts
+        parsed: list[dict] = []
+        for item in screening_infos:
+            try:
+                time_str = item["time"]
+                href = item["href"]
+                row_text = item.get("rowText", "")
+
+                hour, minute = map(int, time_str.split(":"))
+                if hour > 23 or minute > 59:
+                    continue
+
+                showtime = datetime.now().replace(
+                    hour=hour, minute=minute, second=0, microsecond=0,
+                )
+                if showtime < datetime.now() - timedelta(hours=1):
+                    showtime += timedelta(days=1)
+
+                # Build booking URL
+                if href.startswith("http"):
+                    booking_url = href
+                elif href.startswith("/"):
+                    booking_url = f"{TICKETS_URL}{href}" if "site" in href else f"{BASE_URL}{href}"
+                else:
+                    continue
+
+                # Extract cinema name
+                cinema_name, city = "Hot Cinema", ""
+                cinema_match = re.search(r"HOT CINEMA\s+(\S+(?:\s+\S+)?)", row_text)
+                if cinema_match:
+                    cinema_name, city = _resolve_cinema(cinema_match.group(0))
+                else:
+                    for city_he, binfo in _CINEMA_NAME_MAP.items():
+                        if city_he in row_text:
+                            cinema_name = binfo["name"]
+                            city = binfo["city"]
+                            break
+
+                # Language
+                language = "subtitled"
+                if "מדובב" in row_text:
+                    language = "dubbed"
+                elif "מקור" in row_text:
+                    language = "original"
+
+                # Format
+                screen_format = "2D"
+                upper = row_text.upper()
+                if "IMAX" in upper:
+                    screen_format = "IMAX"
+                elif "4DX" in upper:
+                    screen_format = "4DX"
+                elif "תלת מימד" in row_text or "3D" in upper:
+                    screen_format = "3D"
+                elif "SCREENX" in upper:
+                    screen_format = "ScreenX"
+
+                parsed.append({
+                    "movie_title": movie_title,
+                    "cinema_name": cinema_name,
+                    "city": city,
+                    "showtime": showtime,
+                    "hall": "",
+                    "format": screen_format,
+                    "language": language,
+                    "booking_url": booking_url,
+                })
+            except Exception:
+                continue
+
+        if parsed:
+            logger.info(f"[Hot Cinema] '{movie_title}': {len(parsed)} screenings parsed")
+        else:
+            logger.info(f"[Hot Cinema] '{movie_title}': 0 screenings parsed")
+
+        return parsed
 
     async def _scrape_movie_detail(self, page: Page, movie_path: str) -> ScrapedMovie | None:
         try:
