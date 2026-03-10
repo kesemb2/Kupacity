@@ -244,14 +244,18 @@ async def hot_cinema_update_tickets(db: Session):
 def close_expired_screenings(db: Session):
     """Every minute: close screenings that started 10+ minutes ago."""
     cutoff = datetime.utcnow() - timedelta(minutes=10)
-    updated = (
-        db.query(Screening)
-        .filter(
-            Screening.status == "active",
-            Screening.showtime <= cutoff,
+    try:
+        updated = (
+            db.query(Screening)
+            .filter(
+                Screening.status == "active",
+                Screening.showtime <= cutoff,
+            )
+            .update({"status": "closed"}, synchronize_session="fetch")
         )
-        .update({"status": "closed"}, synchronize_session="fetch")
-    )
-    if updated:
-        db.commit()
-        logger.info(f"Closed {updated} expired screenings")
+        if updated:
+            db.commit()
+            logger.info(f"Closed {updated} expired screenings")
+    except Exception:
+        db.rollback()
+        logger.debug("close_expired_screenings skipped - database busy")
