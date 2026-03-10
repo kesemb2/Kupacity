@@ -7,6 +7,7 @@ Hot Cinema schedule:
 - Every 5h:     ticket count updates for active screenings
 - Every 1 min:  close screenings that started 10+ minutes ago
 """
+import json
 import logging
 from datetime import datetime, timedelta
 from sqlalchemy.orm import Session
@@ -104,37 +105,58 @@ def _upsert_screenings(db: Session, chain: CinemaChain, screenings: list[Scraped
 # Hot Cinema specific scheduled tasks
 # ---------------------------------------------------------------------------
 
+def _make_progress_callback(db: Session, log: ScrapeLog):
+    """Create a callback that updates a ScrapeLog's progress field in real-time."""
+    def on_progress(phase: str, current: int, total: int, detail: str = ""):
+        try:
+            log.progress = json.dumps(
+                {"phase": phase, "current": current, "total": total, "detail": detail},
+                ensure_ascii=False,
+            )
+            db.commit()
+        except Exception:
+            db.rollback()
+    return on_progress
+
+
 async def run_initial_scrape(db: Session):
     """Run on startup if DB is empty - scrape movies and screenings from Hot Cinema."""
     scraper = HotCinemaScraper()
     start = datetime.utcnow()
+
+    # Create a "running" log immediately so the UI can show progress
+    log = ScrapeLog(chain_name="Hot Cinema", status="running",
+                    progress=json.dumps({"phase": "מתחיל סריקה", "current": 0, "total": 0, "detail": ""}, ensure_ascii=False))
+    db.add(log)
+    db.commit()
+
+    progress_cb = _make_progress_callback(db, log)
+
     try:
-        movies = await scraper.scrape_movies()
+        movies = await scraper.scrape_movies(on_progress=progress_cb)
         chain = _get_or_create_chain(
             db, scraper.chain_name, scraper.chain_name_he, scraper.base_url
         )
         for sm in movies:
             _get_or_create_movie(db, sm)
 
-        screenings = await scraper.scrape_screenings()
+        screenings = await scraper.scrape_screenings(on_progress=progress_cb)
         _upsert_screenings(db, chain, screenings)
 
         duration = (datetime.utcnow() - start).total_seconds()
-        db.add(ScrapeLog(
-            chain_name="Hot Cinema",
-            status="success",
-            movies_found=len(movies),
-            screenings_found=len(screenings),
-            duration_seconds=duration,
-        ))
+        log.status = "success"
+        log.movies_found = len(movies)
+        log.screenings_found = len(screenings)
+        log.duration_seconds = duration
+        log.progress = None
         db.commit()
         logger.info(f"[Hot Cinema] Initial scrape: {len(movies)} movies, {len(screenings)} screenings")
     except Exception as e:
         duration = (datetime.utcnow() - start).total_seconds()
-        db.add(ScrapeLog(
-            chain_name="Hot Cinema", status="error",
-            error_message=str(e), duration_seconds=duration,
-        ))
+        log.status = "error"
+        log.error_message = str(e)
+        log.duration_seconds = duration
+        log.progress = None
         db.commit()
         logger.error(f"[Hot Cinema] Initial scrape failed: {e}")
     finally:
@@ -145,8 +167,15 @@ async def hot_cinema_weekly_movies(db: Session):
     """Weekly: refresh full movie catalog from Hot Cinema."""
     scraper = HotCinemaScraper()
     start = datetime.utcnow()
+
+    log = ScrapeLog(chain_name="Hot Cinema", status="running",
+                    progress=json.dumps({"phase": "סריקת סרטים שבועית", "current": 0, "total": 0, "detail": ""}, ensure_ascii=False))
+    db.add(log)
+    db.commit()
+    progress_cb = _make_progress_callback(db, log)
+
     try:
-        movies = await scraper.scrape_movies()
+        movies = await scraper.scrape_movies(on_progress=progress_cb)
         chain = _get_or_create_chain(
             db, scraper.chain_name, scraper.chain_name_he, scraper.base_url
         )
@@ -154,21 +183,19 @@ async def hot_cinema_weekly_movies(db: Session):
             _get_or_create_movie(db, sm)
 
         duration = (datetime.utcnow() - start).total_seconds()
-        db.add(ScrapeLog(
-            chain_name="Hot Cinema",
-            status="success",
-            movies_found=len(movies),
-            screenings_found=0,
-            duration_seconds=duration,
-        ))
+        log.status = "success"
+        log.movies_found = len(movies)
+        log.screenings_found = 0
+        log.duration_seconds = duration
+        log.progress = None
         db.commit()
         logger.info(f"[Hot Cinema] Weekly movies refresh: {len(movies)} movies")
     except Exception as e:
         duration = (datetime.utcnow() - start).total_seconds()
-        db.add(ScrapeLog(
-            chain_name="Hot Cinema", status="error",
-            error_message=str(e), duration_seconds=duration,
-        ))
+        log.status = "error"
+        log.error_message = str(e)
+        log.duration_seconds = duration
+        log.progress = None
         db.commit()
         logger.error(f"[Hot Cinema] Weekly movies refresh failed: {e}")
     finally:
@@ -179,29 +206,34 @@ async def hot_cinema_daily_screenings(db: Session):
     """Daily: refresh screening schedule for next 7 days."""
     scraper = HotCinemaScraper()
     start = datetime.utcnow()
+
+    log = ScrapeLog(chain_name="Hot Cinema", status="running",
+                    progress=json.dumps({"phase": "סריקת הקרנות יומית", "current": 0, "total": 0, "detail": ""}, ensure_ascii=False))
+    db.add(log)
+    db.commit()
+    progress_cb = _make_progress_callback(db, log)
+
     try:
-        screenings = await scraper.scrape_screenings()
+        screenings = await scraper.scrape_screenings(on_progress=progress_cb)
         chain = _get_or_create_chain(
             db, scraper.chain_name, scraper.chain_name_he, scraper.base_url
         )
         _upsert_screenings(db, chain, screenings)
 
         duration = (datetime.utcnow() - start).total_seconds()
-        db.add(ScrapeLog(
-            chain_name="Hot Cinema",
-            status="success",
-            movies_found=0,
-            screenings_found=len(screenings),
-            duration_seconds=duration,
-        ))
+        log.status = "success"
+        log.movies_found = 0
+        log.screenings_found = len(screenings)
+        log.duration_seconds = duration
+        log.progress = None
         db.commit()
         logger.info(f"[Hot Cinema] Daily screenings refresh: {len(screenings)} screenings")
     except Exception as e:
         duration = (datetime.utcnow() - start).total_seconds()
-        db.add(ScrapeLog(
-            chain_name="Hot Cinema", status="error",
-            error_message=str(e), duration_seconds=duration,
-        ))
+        log.status = "error"
+        log.error_message = str(e)
+        log.duration_seconds = duration
+        log.progress = None
         db.commit()
         logger.error(f"[Hot Cinema] Daily screenings refresh failed: {e}")
     finally:
@@ -212,29 +244,34 @@ async def hot_cinema_update_tickets(db: Session):
     """Every 5 hours: update ticket counts for today's active screenings."""
     scraper = HotCinemaScraper()
     start = datetime.utcnow()
+
+    log = ScrapeLog(chain_name="Hot Cinema", status="running",
+                    progress=json.dumps({"phase": "עדכון כרטיסים", "current": 0, "total": 0, "detail": ""}, ensure_ascii=False))
+    db.add(log)
+    db.commit()
+    progress_cb = _make_progress_callback(db, log)
+
     try:
-        screenings = await scraper.scrape_ticket_updates()
+        screenings = await scraper.scrape_ticket_updates(on_progress=progress_cb)
         chain = _get_or_create_chain(
             db, scraper.chain_name, scraper.chain_name_he, scraper.base_url
         )
         _upsert_screenings(db, chain, screenings)
 
         duration = (datetime.utcnow() - start).total_seconds()
-        db.add(ScrapeLog(
-            chain_name="Hot Cinema",
-            status="success",
-            movies_found=0,
-            screenings_found=len(screenings),
-            duration_seconds=duration,
-        ))
+        log.status = "success"
+        log.movies_found = 0
+        log.screenings_found = len(screenings)
+        log.duration_seconds = duration
+        log.progress = None
         db.commit()
         logger.info(f"[Hot Cinema] Ticket update: {len(screenings)} screenings refreshed")
     except Exception as e:
         duration = (datetime.utcnow() - start).total_seconds()
-        db.add(ScrapeLog(
-            chain_name="Hot Cinema", status="error",
-            error_message=str(e), duration_seconds=duration,
-        ))
+        log.status = "error"
+        log.error_message = str(e)
+        log.duration_seconds = duration
+        log.progress = None
         db.commit()
         logger.error(f"[Hot Cinema] Ticket update failed: {e}")
     finally:

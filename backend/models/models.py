@@ -93,4 +93,5 @@ class ScrapeLog(Base):
     screenings_found = Column(Integer, default=0)
     error_message = Column(String)
     duration_seconds = Column(Float)
+    progress = Column(String)  # JSON: {"phase":"screenings","current":3,"total":10,"detail":"אווטאר"}
     created_at = Column(DateTime, default=datetime.utcnow)

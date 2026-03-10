@@ -539,7 +539,7 @@ class HotCinemaScraper(BaseScraper):
         Much faster than loading movie pages — uses page.request.get() which
         shares the browser context's cookies and headers.
         """
-        MOVIEEVENTS_URL = f"{TICKETS_URL}/movieevents"
+        MOVIEEVENTS_URL = f"{BASE_URL}/tickets/movieevents"
         all_parsed: list[dict] = []
         today = datetime.now().date()
 
@@ -685,21 +685,28 @@ class HotCinemaScraper(BaseScraper):
         """Navigate from booking URL through ticket selection to seat map.
 
         Flow: booking_url → ticket page (click + for regular) → seat map page
+        Domain: tickets.hotcinema.co.il
         """
         try:
             await self._open_url(page, booking_url)
             await asyncio.sleep(2)
 
+            current_url = page.url
+            logger.info(f"[Hot Cinema] Seat map: loaded {current_url}")
+
             # Check if we're already on a seat map page
-            if "seats" in page.url or "מושבים" in (await page.inner_text("body"))[:200]:
+            body_start = (await page.inner_text("body"))[:300]
+            if "seats" in current_url or "מושבים" in body_start:
+                logger.info("[Hot Cinema] Seat map: already on seat page")
                 return await self._count_seats_on_page(page)
 
             # Look for the + button to add a regular ticket
-            # The ticket page shows rows like: "רגיל  ₪50.50  - 1 +"
             plus_buttons = await page.query_selector_all(
                 'button, [role="button"], [class*="plus"], [class*="Plus"], '
                 '[class*="increase"], [class*="add"]'
             )
+            logger.info(f"[Hot Cinema] Seat map: found {len(plus_buttons)} candidate buttons")
+
             clicked = False
             for btn in plus_buttons:
                 try:
@@ -707,14 +714,13 @@ class HotCinemaScraper(BaseScraper):
                     if text == "+" or text == "＋":
                         await btn.click()
                         clicked = True
-                        logger.debug("[Hot Cinema] Clicked + button for ticket")
+                        logger.info("[Hot Cinema] Seat map: clicked + button")
                         await asyncio.sleep(1)
                         break
                 except Exception:
                     continue
 
             if not clicked:
-                # Try finding + by aria-label or nearby "רגיל" text
                 try:
                     plus_btn = await page.query_selector(
                         '[aria-label*="הוסף"], [aria-label*="plus"], '
@@ -723,12 +729,13 @@ class HotCinemaScraper(BaseScraper):
                     if plus_btn:
                         await plus_btn.click()
                         clicked = True
+                        logger.info("[Hot Cinema] Seat map: clicked + via aria-label")
                         await asyncio.sleep(1)
                 except Exception:
                     pass
 
             if not clicked:
-                logger.debug("[Hot Cinema] Could not find + button, trying to proceed anyway")
+                logger.warning("[Hot Cinema] Seat map: could not find + button")
 
             # Look for "continue" / "המשך" / "מושבים" button
             proceed_selectors = [
@@ -740,28 +747,36 @@ class HotCinemaScraper(BaseScraper):
                 '[class*="next"], [class*="Next"]',
                 '[class*="submit"], [class*="Submit"]',
             ]
+            proceed_clicked = False
             for sel in proceed_selectors:
                 try:
                     btn = await page.query_selector(sel)
                     if btn:
                         await btn.click()
+                        proceed_clicked = True
+                        logger.info(f"[Hot Cinema] Seat map: clicked proceed ({sel})")
                         await asyncio.sleep(3)
                         break
                 except Exception:
                     continue
 
-            # Now we should be on the seat map page
-            return await self._count_seats_on_page(page)
+            if not proceed_clicked:
+                logger.warning("[Hot Cinema] Seat map: could not find proceed button")
+
+            logger.info(f"[Hot Cinema] Seat map: now on {page.url}")
+            total, sold = await self._count_seats_on_page(page)
+            logger.info(f"[Hot Cinema] Seat map: counted {sold}/{total} seats")
+            return total, sold
 
         except Exception as e:
-            logger.debug(f"[Hot Cinema] Seat map navigation failed: {e}")
+            logger.warning(f"[Hot Cinema] Seat map navigation failed: {e}")
             return 0, 0
 
     # ------------------------------------------------------------------
     # Scrape implementations
     # ------------------------------------------------------------------
 
-    async def scrape_movies(self) -> list[ScrapedMovie]:
+    async def scrape_movies(self, on_progress=None) -> list[ScrapedMovie]:
         """Weekly: scrape all movies from all branches + homepage."""
         all_movies: dict[str, ScrapedMovie] = {}
         pw, browser, context = await self._launch_browser()
@@ -769,7 +784,10 @@ class HotCinemaScraper(BaseScraper):
             page = await context.new_page()
 
             # Collect movies from theater pages
-            for branch_id, branch_info in HOT_CINEMA_BRANCHES.items():
+            branch_items = list(HOT_CINEMA_BRANCHES.items())
+            for idx, (branch_id, branch_info) in enumerate(branch_items):
+                if on_progress:
+                    on_progress("סורק סניפים", idx + 1, len(branch_items), branch_info["name"])
                 movies = await self._scrape_theater_page(page, branch_id, branch_info)
                 for m in movies:
                     if m.title and m.title not in all_movies:
@@ -803,8 +821,8 @@ class HotCinemaScraper(BaseScraper):
     # Testing limit — set to None for full scrape
     _TEST_MOVIE_LIMIT = 4
 
-    async def scrape_screenings(self) -> list[ScrapedScreening]:
-        """Daily: fetch screenings via API, then navigate seat maps for occupancy."""
+    async def scrape_screenings(self, on_progress=None) -> list[ScrapedScreening]:
+        """Daily: fetch screenings via API (seat counts deferred to ticket updates)."""
         all_screenings: list[ScrapedScreening] = []
         pw, browser, context = await self._launch_browser()
         try:
@@ -812,7 +830,10 @@ class HotCinemaScraper(BaseScraper):
 
             # Step 1: Collect unique movie URLs from all branches
             movie_urls: dict[str, str] = {}  # title -> URL
-            for branch_id, branch_info in HOT_CINEMA_BRANCHES.items():
+            branch_items = list(HOT_CINEMA_BRANCHES.items())
+            for idx, (branch_id, branch_info) in enumerate(branch_items):
+                if on_progress:
+                    on_progress("סורק סניפים", idx + 1, len(branch_items), branch_info["name"])
                 movies = await self._scrape_theater_page(page, branch_id, branch_info)
                 for m in movies:
                     if m.detail_url and m.title not in movie_urls:
@@ -833,7 +854,9 @@ class HotCinemaScraper(BaseScraper):
 
             # Step 3: Fetch screenings via direct API calls (7 days)
             all_infos: list[dict] = []
-            for title, url, mid in movie_list:
+            for idx, (title, url, mid) in enumerate(movie_list):
+                if on_progress:
+                    on_progress("סורק הקרנות", idx + 1, len(movie_list), title)
                 infos = await self._fetch_screenings_api(page, mid, title, days=7)
                 all_infos.extend(infos)
 
@@ -865,7 +888,7 @@ class HotCinemaScraper(BaseScraper):
         logger.info(f"[Hot Cinema] Daily scrape: {len(all_screenings)} screenings from {len(movie_list)} movies")
         return all_screenings
 
-    async def scrape_ticket_updates(self) -> list[ScrapedScreening]:
+    async def scrape_ticket_updates(self, on_progress=None) -> list[ScrapedScreening]:
         """Every 5 hours: fetch screenings via API, navigate seat maps for occupancy."""
         all_screenings: list[ScrapedScreening] = []
         pw, browser, context = await self._launch_browser()
@@ -874,7 +897,10 @@ class HotCinemaScraper(BaseScraper):
 
             # Collect movie URLs from all branches
             movie_urls: dict[str, str] = {}
-            for branch_id, branch_info in HOT_CINEMA_BRANCHES.items():
+            branch_items = list(HOT_CINEMA_BRANCHES.items())
+            for idx, (branch_id, branch_info) in enumerate(branch_items):
+                if on_progress:
+                    on_progress("סורק סניפים", idx + 1, len(branch_items), branch_info["name"])
                 movies = await self._scrape_theater_page(page, branch_id, branch_info)
                 for m in movies:
                     if m.detail_url and m.title not in movie_urls:
@@ -889,12 +915,15 @@ class HotCinemaScraper(BaseScraper):
 
             logger.info(f"[Hot Cinema] Ticket update: checking {len(movie_list)} movies")
 
+            screening_counter = 0
             for title, url, mid in movie_list:
                 screening_infos = await self._fetch_screenings_api(page, mid, title, days=7)
 
-                for info in screening_infos:
-                    if info["showtime"] < datetime.now():
-                        continue
+                future_infos = [i for i in screening_infos if i["showtime"] >= datetime.now()]
+                for idx, info in enumerate(future_infos):
+                    screening_counter += 1
+                    if on_progress:
+                        on_progress("סורק כיסאות", screening_counter, 0, info["movie_title"])
 
                     total_seats = 200
                     tickets_sold = 0

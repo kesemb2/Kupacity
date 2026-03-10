@@ -352,6 +352,7 @@ def get_scrape_logs(limit: int = Query(default=20), db: Session = Depends(get_db
         .all()
     )
 
+    import json as _json
     return [
         {
             "id": log.id,
@@ -361,6 +362,7 @@ def get_scrape_logs(limit: int = Query(default=20), db: Session = Depends(get_db
             "screenings_found": log.screenings_found,
             "error_message": log.error_message,
             "duration_seconds": log.duration_seconds,
+            "progress": _json.loads(log.progress) if log.progress else None,
             "created_at": log.created_at.isoformat() if log.created_at else None,
         }
         for log in logs
