@@ -22,7 +22,7 @@ function ScrapePage() {
     // Poll faster when a scrape is running
     const interval = setInterval(loadLogs, runningLog ? 3000 : 10000);
     return () => clearInterval(interval);
-  }, [loadLogs, !!runningLog]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [loadLogs, runningLog]);
 
   const handleTrigger = () => {
     setScraping(true);
