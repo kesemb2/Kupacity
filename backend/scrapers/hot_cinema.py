@@ -402,6 +402,13 @@ class HotCinemaScraper(BaseScraper):
 
         async def capture_response(response):
             url = response.url
+            # Filter out third-party calls (ads, analytics, tracking)
+            IGNORED_DOMAINS = [
+                "google", "youtube", "doubleclick", "facebook",
+                "analytics", "gtag", "gstatic",
+            ]
+            if any(domain in url.lower() for domain in IGNORED_DOMAINS):
+                return
             # Capture any JSON API calls
             content_type = response.headers.get("content-type", "")
             if "json" in content_type or any(kw in url.lower() for kw in [
