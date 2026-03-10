@@ -63,6 +63,7 @@ BASE_URL = "https://hotcinema.co.il"
 TICKETS_URL = "https://tickets.hotcinema.co.il"
 
 _DEBUG_SCREENSHOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "debug.png")
+_TICKET_DEBUG_SCREENSHOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "debug_tickets.png")
 
 _BRANCH_KEYWORDS = [
     "מודיעין", "כפר סבא", "פתח תקווה", "רחובות", "חיפה",
@@ -693,6 +694,22 @@ class HotCinemaScraper(BaseScraper):
 
             current_url = page.url
             logger.info(f"[Hot Cinema] Seat map: loaded {current_url}")
+
+            # Save debug screenshot of ticket page
+            try:
+                await page.screenshot(path=_TICKET_DEBUG_SCREENSHOT)
+                logger.info(f"[Hot Cinema] Ticket page screenshot saved → {_TICKET_DEBUG_SCREENSHOT}")
+            except Exception:
+                pass
+
+            # Detect bot-detection error page
+            if "/error" in current_url:
+                try:
+                    body_text = (await page.inner_text("body"))[:500]
+                    logger.warning(f"[Hot Cinema] Ticket page redirected to error: {body_text}")
+                except Exception:
+                    logger.warning("[Hot Cinema] Ticket page redirected to /error (could not read body)")
+                return 0, 0
 
             # Check if we're already on a seat map page
             body_start = (await page.inner_text("body"))[:300]

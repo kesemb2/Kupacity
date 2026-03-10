@@ -166,6 +166,19 @@ def debug_screenshot():
         content={"detail": "No debug screenshot yet. Run a scrape first."},
     )
 
+
+_TICKET_DEBUG_SCREENSHOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "debug_tickets.png")
+
+
+@app.get("/api/debug-screenshot-tickets")
+def debug_screenshot_tickets():
+    if os.path.exists(_TICKET_DEBUG_SCREENSHOT):
+        return FileResponse(_TICKET_DEBUG_SCREENSHOT, media_type="image/png")
+    return JSONResponse(
+        status_code=404,
+        content={"detail": "No ticket debug screenshot yet. Run a scrape with ticket updates first."},
+    )
+
 # Serve frontend build if it exists
 frontend_build = os.path.join(os.path.dirname(__file__), "..", "frontend", "build")
 if os.path.exists(frontend_build):

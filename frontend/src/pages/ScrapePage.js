@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { fetchScrapeLogs, triggerScrape } from '../api/client';
+import { fetchScrapeLogs, triggerScrape, getDebugScreenshotUrl, getDebugScreenshotTicketsUrl } from '../api/client';
 
 function ScrapePage() {
   const [logs, setLogs] = useState([]);
@@ -105,6 +105,26 @@ function ScrapePage() {
           {message}
         </div>
       )}
+
+      {/* Debug Screenshots */}
+      <div style={{
+        display: 'flex',
+        gap: 12,
+        marginBottom: 24,
+      }}>
+        <button
+          onClick={() => window.open(getDebugScreenshotUrl(), '_blank')}
+          style={screenshotBtnStyle}
+        >
+          צילום מסך - אתר ראשי
+        </button>
+        <button
+          onClick={() => window.open(getDebugScreenshotTicketsUrl(), '_blank')}
+          style={screenshotBtnStyle}
+        >
+          צילום מסך - כרטיסים
+        </button>
+      </div>
 
       {/* Live Progress Indicator */}
       {runningLog && runningLog.progress && (
@@ -278,6 +298,19 @@ function ProgressCard({ progress }) {
   );
 }
 
+
+const screenshotBtnStyle = {
+  padding: '10px 20px',
+  borderRadius: 8,
+  border: '1px solid #334155',
+  cursor: 'pointer',
+  fontSize: 14,
+  fontWeight: 600,
+  fontFamily: 'Heebo, sans-serif',
+  background: 'rgba(99,102,241,0.15)',
+  color: '#a5b4fc',
+  transition: 'all 0.2s',
+};
 
 const thStyle = {
   textAlign: 'right',

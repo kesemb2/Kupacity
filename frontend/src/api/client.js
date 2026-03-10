@@ -26,5 +26,6 @@ export const checkHealth = () => api.get('/health', { timeout: 15000 })
   .catch(() => ({ ok: false }));
 
 export const getDebugScreenshotUrl = () => `${API_BASE}/api/debug-screenshot`;
+export const getDebugScreenshotTicketsUrl = () => `${API_BASE}/api/debug-screenshot-tickets`;
 
 export default api;
