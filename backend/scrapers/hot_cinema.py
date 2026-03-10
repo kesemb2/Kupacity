@@ -322,6 +322,14 @@ class HotCinemaScraper(BaseScraper):
 
                     movies.append(ScrapedMovie(title=title, title_he=title, poster_url=poster_url))
 
+                    # Log sample HTML for first movie in each branch
+                    if len(movies) == 1:
+                        try:
+                            html_sample = await elem.evaluate("el => el.innerHTML.substring(0, 800)")
+                            logger.info(f"[Hot Cinema] Branch {branch_id} sample movie HTML: {html_sample}")
+                        except Exception:
+                            pass
+
                     # Find showtime elements
                     showtime_els = await elem.query_selector_all(
                         'a[href*="tickets"], a[href*="booking"], a[href*="order"], '
@@ -330,6 +338,20 @@ class HotCinemaScraper(BaseScraper):
                         '[class*="Showtime"], [class*="Time"], [class*="Screening"], '
                         'button[class*="time"], a[class*="time"]'
                     )
+
+                    # Fallback: search for child elements containing time text
+                    if not showtime_els:
+                        all_children = await elem.query_selector_all("a, button, span, div, li")
+                        for child in all_children:
+                            try:
+                                text = (await child.inner_text()).strip()
+                                if re.search(r"^\d{1,2}:\d{2}$", text) or re.search(r"^\d{1,2}:\d{2}\s", text):
+                                    showtime_els.append(child)
+                            except Exception:
+                                continue
+
+                    if showtime_els and len(movies) <= 3:
+                        logger.info(f"[Hot Cinema] Branch {branch_id} '{title}': {len(showtime_els)} showtime elements")
 
                     for st_el in showtime_els:
                         try:
@@ -414,6 +436,11 @@ class HotCinemaScraper(BaseScraper):
                     continue
         except Exception as e:
             logger.warning(f"Hot Cinema theater {branch_id} page scrape failed: {e}")
+
+        if screening_infos:
+            logger.info(f"[Hot Cinema] Branch {branch_id}: {len(screening_infos)} screenings from {len(movies)} movies")
+        elif movies:
+            logger.info(f"[Hot Cinema] Branch {branch_id}: {len(movies)} movies but 0 screenings")
 
         return movies, screening_infos
 
