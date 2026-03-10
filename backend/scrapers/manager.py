@@ -143,6 +143,10 @@ async def run_initial_scrape(db: Session):
         screenings = await scraper.scrape_screenings(on_progress=progress_cb)
         _upsert_screenings(db, chain, screenings)
 
+        # Run ticket updates to get real seat counts
+        ticket_screenings = await scraper.scrape_ticket_updates(on_progress=progress_cb)
+        _upsert_screenings(db, chain, ticket_screenings)
+
         duration = (datetime.utcnow() - start).total_seconds()
         log.status = "success"
         log.movies_found = len(movies)
