@@ -29,10 +29,10 @@ function ScrapePage() {
     setMessage(null);
     triggerScrape()
       .then((res) => {
-        setMessage(res.message || '\u05e1\u05e8\u05d9\u05e7\u05d4 \u05d4\u05d5\u05e4\u05e2\u05dc\u05d4');
+        setMessage(res.message || 'סריקה הופעלה');
         setTimeout(loadLogs, 2000);
       })
-      .catch(() => setMessage('\u05e9\u05d2\u05d9\u05d0\u05d4 \u05d1\u05d4\u05e4\u05e2\u05dc\u05ea \u05d4\u05e1\u05e8\u05d9\u05e7\u05d4'))
+      .catch(() => setMessage('שגיאה בהפעלת הסריקה'))
       .finally(() => setScraping(false));
   };
 
@@ -44,12 +44,12 @@ function ScrapePage() {
   };
 
   const statusLabel = (status) => {
-    if (status === 'running') return '\u05e8\u05e5...';
+    if (status === 'running') return 'רץ...';
     return status;
   };
 
   if (loading) {
-    return <div style={{ textAlign: 'center', padding: 60, color: '#64748b' }}>\u05d8\u05d5\u05e2\u05df \u05e0\u05ea\u05d5\u05e0\u05d9\u05dd...</div>;
+    return <div style={{ textAlign: 'center', padding: 60, color: '#64748b' }}>טוען נתונים...</div>;
   }
 
   return (
@@ -66,9 +66,9 @@ function ScrapePage() {
         alignItems: 'center',
       }}>
         <div>
-          <h2 style={{ fontSize: 20, fontWeight: 700, marginBottom: 4 }}>\u05d4\u05e4\u05e2\u05dc\u05ea \u05e1\u05e8\u05d9\u05e7\u05d4</h2>
+          <h2 style={{ fontSize: 20, fontWeight: 700, marginBottom: 4 }}>הפעלת סריקה</h2>
           <div style={{ color: '#94a3b8', fontSize: 14 }}>
-            \u05e1\u05d5\u05e8\u05e7 \u05d0\u05ea \u05d0\u05ea\u05e8 \u05d4\u05d5\u05d8 \u05e1\u05d9\u05e0\u05de\u05d0 \u05d5\u05de\u05e2\u05d3\u05db\u05df \u05e1\u05e8\u05d8\u05d9\u05dd, \u05d4\u05e7\u05e8\u05e0\u05d5\u05ea \u05d5\u05db\u05e8\u05d8\u05d9\u05e1\u05d9\u05dd
+            סורק את אתר הוט סינמה ומעדכן סרטים, הקרנות וכרטיסים
           </div>
         </div>
         <button
@@ -88,7 +88,7 @@ function ScrapePage() {
             opacity: (scraping || runningLog) ? 0.7 : 1,
           }}
         >
-          {(scraping || runningLog) ? '\u05e8\u05e5...' : '\u05d4\u05e4\u05e2\u05dc \u05e1\u05e8\u05d9\u05e7\u05d4'}
+          {(scraping || runningLog) ? 'רץ...' : 'הפעל סריקה'}
         </button>
       </div>
 
@@ -119,26 +119,26 @@ function ScrapePage() {
         overflow: 'hidden',
       }}>
         <div style={{ padding: '16px 20px', borderBottom: '1px solid #334155' }}>
-          <h3 style={{ fontSize: 16, fontWeight: 600 }}>\u05dc\u05d5\u05d2\u05d9\u05dd \u05d0\u05d7\u05e8\u05d5\u05e0\u05d9\u05dd</h3>
+          <h3 style={{ fontSize: 16, fontWeight: 600 }}>לוגים אחרונים</h3>
         </div>
         <div style={{ overflowX: 'auto' }}>
           <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 14 }}>
             <thead>
               <tr style={{ borderBottom: '1px solid #334155' }}>
-                <th style={thStyle}>\u05ea\u05d0\u05e8\u05d9\u05da</th>
-                <th style={thStyle}>\u05e8\u05e9\u05ea</th>
-                <th style={thStyle}>\u05e1\u05d8\u05d8\u05d5\u05e1</th>
-                <th style={thStyle}>\u05e1\u05e8\u05d8\u05d9\u05dd</th>
-                <th style={thStyle}>\u05d4\u05e7\u05e8\u05e0\u05d5\u05ea</th>
-                <th style={thStyle}>\u05de\u05e9\u05da (\u05e9\u05e0\u05d9\u05d5\u05ea)</th>
-                <th style={thStyle}>\u05e9\u05d2\u05d9\u05d0\u05d4</th>
+                <th style={thStyle}>תאריך</th>
+                <th style={thStyle}>רשת</th>
+                <th style={thStyle}>סטטוס</th>
+                <th style={thStyle}>סרטים</th>
+                <th style={thStyle}>הקרנות</th>
+                <th style={thStyle}>משך (שניות)</th>
+                <th style={thStyle}>שגיאה</th>
               </tr>
             </thead>
             <tbody>
               {logs.length === 0 ? (
                 <tr>
                   <td colSpan={7} style={{ textAlign: 'center', padding: 32, color: '#64748b' }}>
-                    \u05d0\u05d9\u05df \u05dc\u05d5\u05d2\u05d9\u05dd \u05e2\u05d3\u05d9\u05d9\u05df. \u05d4\u05e4\u05e2\u05dc \u05e1\u05e8\u05d9\u05e7\u05d4 \u05e8\u05d0\u05e9\u05d5\u05e0\u05d4!
+                    אין לוגים עדיין. הפעל סריקה ראשונה!
                   </td>
                 </tr>
               ) : (
@@ -270,7 +270,7 @@ function ProgressCard({ progress }) {
         )}
         {total === 0 && current > 0 && (
           <span style={{ fontSize: 13, color: '#64748b' }}>
-            {current} \u05e2\u05d5\u05d1\u05d3\u05d5
+            {current} עובדו
           </span>
         )}
       </div>

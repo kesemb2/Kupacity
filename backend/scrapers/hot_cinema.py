@@ -688,8 +688,8 @@ class HotCinemaScraper(BaseScraper):
         Domain: tickets.hotcinema.co.il
         """
         try:
-            await self._open_url(page, booking_url)
-            await asyncio.sleep(2)
+            await self._open_url(page, booking_url, wait_for_network=True)
+            await asyncio.sleep(4)  # SPA needs time to render
 
             current_url = page.url
             logger.info(f"[Hot Cinema] Seat map: loaded {current_url}")
@@ -737,24 +737,26 @@ class HotCinemaScraper(BaseScraper):
             if not clicked:
                 logger.warning("[Hot Cinema] Seat map: could not find + button")
 
-            # Look for "continue" / "המשך" / "מושבים" button
-            proceed_selectors = [
-                'button:has-text("המשך")',
-                'button:has-text("מושבים")',
-                'a:has-text("המשך")',
-                'a:has-text("מושבים")',
-                '[class*="continue"], [class*="Continue"]',
-                '[class*="next"], [class*="Next"]',
-                '[class*="submit"], [class*="Submit"]',
+            # Look for "continue" / "המשך" / "מושבים" button using Playwright locators
+            proceed_locators = [
+                page.locator('button', has_text="המשך"),
+                page.locator('button', has_text="מושבים"),
+                page.locator('a', has_text="המשך"),
+                page.locator('a', has_text="מושבים"),
+                page.locator('[class*="continue"], [class*="Continue"]'),
+                page.locator('[class*="next"], [class*="Next"]'),
+                page.locator('[class*="submit"], [class*="Submit"]'),
             ]
             proceed_clicked = False
-            for sel in proceed_selectors:
+            for loc in proceed_locators:
                 try:
-                    btn = await page.query_selector(sel)
-                    if btn:
-                        await btn.click()
+                    count = await loc.count()
+                    if count > 0:
+                        await loc.first.click()
                         proceed_clicked = True
-                        logger.info(f"[Hot Cinema] Seat map: clicked proceed ({sel})")
+                        logger.info(f"[Hot Cinema] Seat map: clicked proceed button")
+                        await asyncio.sleep(2)
+                        await page.wait_for_load_state("networkidle", timeout=10000)
                         await asyncio.sleep(3)
                         break
                 except Exception:
