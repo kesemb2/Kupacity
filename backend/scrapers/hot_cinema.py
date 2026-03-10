@@ -78,6 +78,12 @@ for _bid, _binfo in HOT_CINEMA_BRANCHES.items():
     _CINEMA_NAME_MAP[_binfo["city_he"]] = _binfo
 
 
+def _extract_movie_id(url: str) -> str | None:
+    """Extract numeric movie ID from a Hot Cinema movie URL like /movie/3571/slug."""
+    m = re.search(r'/movie/(\d+)', url)
+    return m.group(1) if m else None
+
+
 def _resolve_cinema(cinema_text: str) -> tuple[str, str]:
     """Map cinema text from screening table (e.g. 'HOT CINEMA כפר סבא') to (name, city)."""
     for city_he, binfo in _CINEMA_NAME_MAP.items():
@@ -526,6 +532,104 @@ class HotCinemaScraper(BaseScraper):
         logger.info(f"[Hot Cinema] '{movie_title}': {len(parsed)} screenings parsed from API")
         return parsed
 
+    async def _fetch_screenings_api(self, page: Page, movie_id: str,
+                                     movie_title: str, days: int = 7) -> list[dict]:
+        """Fetch screening data directly from the movieevents API for the next N days.
+
+        Much faster than loading movie pages — uses page.request.get() which
+        shares the browser context's cookies and headers.
+        """
+        MOVIEEVENTS_URL = f"{BASE_URL}/tickets/movieevents"
+        all_parsed: list[dict] = []
+        today = datetime.now().date()
+
+        for day_offset in range(days):
+            target_date = today + timedelta(days=day_offset)
+            date_str = target_date.strftime("%d/%m/%Y")
+            api_url = f"{MOVIEEVENTS_URL}?movieid={movie_id}&date={date_str}&theatreid=&time=&type=&lang="
+
+            try:
+                resp = await page.request.get(api_url)
+                if resp.status != 200:
+                    logger.debug(f"[Hot Cinema] API {resp.status} for movie {movie_id} date {date_str}")
+                    continue
+
+                theaters = await resp.json()
+                if not isinstance(theaters, list):
+                    continue
+
+                for theater in theaters:
+                    theater_name = theater.get("TheaterName", "")
+                    theater_id = theater.get("TheaterID")
+                    cinema_name, city = _resolve_cinema(f"HOT CINEMA {theater_name}")
+
+                    # Theater-level format flags
+                    is_3d = theater.get("Is3D")
+                    is_atmos_2d = theater.get("IsAtmos2D")
+                    is_atmos_3d = theater.get("IsAtmos3D")
+                    screening_type = theater.get("ScreeningType", "")
+
+                    screen_format = "2D"
+                    upper_type = screening_type.upper()
+                    if "IMAX" in upper_type:
+                        screen_format = "IMAX"
+                    elif "4DX" in upper_type:
+                        screen_format = "4DX"
+                    elif "SCREENX" in upper_type:
+                        screen_format = "ScreenX"
+                    elif is_atmos_3d:
+                        screen_format = "ATMOS 3D"
+                    elif is_atmos_2d:
+                        screen_format = "ATMOS"
+                    elif is_3d:
+                        screen_format = "3D"
+
+                    dubbed_lang = theater.get("DubbedLanguage")
+                    subtitled_lang = theater.get("SubtitledLanguage")
+
+                    for date_entry in theater.get("Dates", []):
+                        try:
+                            raw_date = date_entry.get("FormattedDate") or date_entry.get("Date", "")
+                            if not raw_date or len(raw_date) < 16:
+                                continue
+                            raw_date = raw_date.replace("T", " ")
+                            showtime = datetime.strptime(raw_date[:19], "%Y-%m-%d %H:%M:%S")
+
+                            entry_dubbed = date_entry.get("DubbedLanguage") or dubbed_lang
+                            entry_subtitled = date_entry.get("SubtitledLanguage") or subtitled_lang
+                            language = "dubbed" if entry_dubbed else ("subtitled" if entry_subtitled else "original")
+
+                            entry_format = screen_format
+                            if date_entry.get("IsAtmos3D"):
+                                entry_format = "ATMOS 3D"
+                            elif date_entry.get("IsAtmos2D"):
+                                entry_format = "ATMOS"
+                            elif date_entry.get("Is3D"):
+                                entry_format = "3D"
+
+                            event_id = date_entry.get("EventId", "")
+                            all_parsed.append({
+                                "movie_title": movie_title,
+                                "cinema_name": cinema_name,
+                                "city": city,
+                                "showtime": showtime,
+                                "hall": "",
+                                "format": entry_format,
+                                "language": language,
+                                "booking_url": f"{TICKETS_URL}/site/hotcinema/{theater_id}/{event_id}",
+                            })
+                        except Exception:
+                            continue
+
+            except Exception as e:
+                logger.debug(f"[Hot Cinema] API call failed for movie {movie_id} date {date_str}: {e}")
+                continue
+
+            await asyncio.sleep(0.3)  # Brief pause between date calls
+
+        logger.info(f"[Hot Cinema] '{movie_title}' (id={movie_id}): {len(all_parsed)} screenings from API over {days} days")
+        return all_parsed
+
     async def _scrape_movie_detail(self, page: Page, movie_path: str) -> ScrapedMovie | None:
         try:
             url = f"{BASE_URL}{movie_path}" if movie_path.startswith("/") else movie_path
@@ -696,80 +800,97 @@ class HotCinemaScraper(BaseScraper):
         logger.info(f"[Hot Cinema] Scraped {len(result)} unique movies")
         return result
 
+    # Testing limit — set to None for full scrape
+    _TEST_MOVIE_LIMIT = 4
+
     async def scrape_screenings(self) -> list[ScrapedScreening]:
-        """Daily: visit each movie page and parse the screening table."""
+        """Daily: fetch screenings via API, then navigate seat maps for occupancy."""
         all_screenings: list[ScrapedScreening] = []
         pw, browser, context = await self._launch_browser()
         try:
             page = await context.new_page()
 
-            # Step 1: Collect unique movie URLs (limited to 1 branch for testing)
+            # Step 1: Collect unique movie URLs from all branches
             movie_urls: dict[str, str] = {}  # title -> URL
-            for branch_id, branch_info in list(HOT_CINEMA_BRANCHES.items())[:1]:
+            for branch_id, branch_info in HOT_CINEMA_BRANCHES.items():
                 movies = await self._scrape_theater_page(page, branch_id, branch_info)
                 for m in movies:
                     if m.detail_url and m.title not in movie_urls:
                         movie_urls[m.title] = m.detail_url
 
-            # Also check homepage for additional movie URLs
-            try:
-                await self._open_url(page, BASE_URL)
-                links = await page.query_selector_all('a[href*="/movie/"]')
-                for link in links:
-                    href = await link.get_attribute("href") or ""
-                    if "/movie/" not in href:
-                        continue
-                    full_url = f"{BASE_URL}{href}" if href.startswith("/") else href
-                    # Try to get title
+            logger.info(f"[Hot Cinema] Found {len(movie_urls)} unique movie URLs")
+
+            # Step 2: Extract movie IDs and apply test limit
+            movie_list: list[tuple[str, str, str]] = []  # (title, url, movie_id)
+            for title, url in movie_urls.items():
+                mid = _extract_movie_id(url)
+                if mid:
+                    movie_list.append((title, url, mid))
+
+            if self._TEST_MOVIE_LIMIT:
+                movie_list = movie_list[:self._TEST_MOVIE_LIMIT]
+                logger.info(f"[Hot Cinema] Testing with {len(movie_list)} movies")
+
+            # Step 3: Fetch screenings via direct API calls (7 days)
+            all_infos: list[dict] = []
+            for title, url, mid in movie_list:
+                infos = await self._fetch_screenings_api(page, mid, title, days=7)
+                all_infos.extend(infos)
+
+            logger.info(f"[Hot Cinema] Total screenings from API: {len(all_infos)}")
+
+            # Step 4: For each screening, try to get seat counts
+            for info in all_infos:
+                if info["showtime"] < datetime.now():
+                    continue
+
+                total_seats = 200
+                tickets_sold = 0
+
+                booking_url = info.get("booking_url", "")
+                if booking_url:
                     try:
-                        text = (await link.inner_text()).strip()
-                        if text and len(text) >= 2 and text not in movie_urls:
-                            movie_urls[text] = full_url
-                    except Exception:
-                        continue
-            except Exception:
-                pass
+                        total, sold = await self._navigate_to_seat_map(page, booking_url)
+                        if total > 0:
+                            total_seats = total
+                            tickets_sold = sold
+                            logger.info(
+                                f"  [{info['cinema_name']}] {info['movie_title']} "
+                                f"{info['showtime'].strftime('%d/%m %H:%M')}: "
+                                f"{tickets_sold}/{total_seats} seats"
+                            )
+                    except Exception as e:
+                        logger.debug(f"[Hot Cinema] Seat map failed: {e}")
 
-            logger.info(f"[Hot Cinema] Found {len(movie_urls)} unique movie URLs to check for screenings")
-
-            # Limit to 3 movies for testing
-            _test_items = list(movie_urls.items())[:3]
-            logger.info(f"[Hot Cinema] Testing with {len(_test_items)} movies")
-
-            # Step 2: Visit each movie page to get screenings
-            for title, url in _test_items:
-                screening_infos = await self._scrape_movie_screenings(page, url, title)
-
-                for info in screening_infos:
-                    screening = ScrapedScreening(
-                        movie_title=info["movie_title"],
-                        cinema_name=info["cinema_name"],
-                        city=info["city"],
-                        showtime=info["showtime"],
-                        hall=info["hall"],
-                        format=info["format"],
-                        language=info.get("language", "subtitled"),
-                        ticket_price=39.0,
-                        total_seats=200,
-                        tickets_sold=0,
-                    )
-                    screening.revenue = 0
-                    all_screenings.append(screening)
+                screening = ScrapedScreening(
+                    movie_title=info["movie_title"],
+                    cinema_name=info["cinema_name"],
+                    city=info["city"],
+                    showtime=info["showtime"],
+                    hall=info["hall"],
+                    format=info["format"],
+                    language=info.get("language", "subtitled"),
+                    ticket_price=39.0,
+                    total_seats=total_seats,
+                    tickets_sold=tickets_sold,
+                )
+                screening.revenue = screening.tickets_sold * screening.ticket_price
+                all_screenings.append(screening)
         finally:
             await browser.close()
             await pw.stop()
 
-        logger.info(f"[Hot Cinema] Daily scrape: {len(all_screenings)} screenings from {len(movie_urls)} movies")
+        logger.info(f"[Hot Cinema] Daily scrape: {len(all_screenings)} screenings from {len(movie_list)} movies")
         return all_screenings
 
     async def scrape_ticket_updates(self) -> list[ScrapedScreening]:
-        """Every 5 hours: visit movie pages, then navigate to seat maps to count seats."""
+        """Every 5 hours: fetch screenings via API, navigate seat maps for occupancy."""
         all_screenings: list[ScrapedScreening] = []
         pw, browser, context = await self._launch_browser()
         try:
             page = await context.new_page()
 
-            # Collect movie URLs
+            # Collect movie URLs from all branches
             movie_urls: dict[str, str] = {}
             for branch_id, branch_info in HOT_CINEMA_BRANCHES.items():
                 movies = await self._scrape_theater_page(page, branch_id, branch_info)
@@ -777,10 +898,17 @@ class HotCinemaScraper(BaseScraper):
                     if m.detail_url and m.title not in movie_urls:
                         movie_urls[m.title] = m.detail_url
 
-            logger.info(f"[Hot Cinema] Ticket update: checking {len(movie_urls)} movies")
-
+            # Extract movie IDs
+            movie_list: list[tuple[str, str, str]] = []
             for title, url in movie_urls.items():
-                screening_infos = await self._scrape_movie_screenings(page, url, title)
+                mid = _extract_movie_id(url)
+                if mid:
+                    movie_list.append((title, url, mid))
+
+            logger.info(f"[Hot Cinema] Ticket update: checking {len(movie_list)} movies")
+
+            for title, url, mid in movie_list:
+                screening_infos = await self._fetch_screenings_api(page, mid, title, days=7)
 
                 for info in screening_infos:
                     if info["showtime"] < datetime.now():
@@ -791,15 +919,18 @@ class HotCinemaScraper(BaseScraper):
 
                     booking_url = info.get("booking_url", "")
                     if booking_url:
-                        total, sold = await self._navigate_to_seat_map(page, booking_url)
-                        if total > 0:
-                            total_seats = total
-                            tickets_sold = sold
-                            logger.info(
-                                f"  [{info['cinema_name']}] {info['movie_title']} "
-                                f"{info['showtime'].strftime('%H:%M')}: "
-                                f"{tickets_sold}/{total_seats} seats sold"
-                            )
+                        try:
+                            total, sold = await self._navigate_to_seat_map(page, booking_url)
+                            if total > 0:
+                                total_seats = total
+                                tickets_sold = sold
+                                logger.info(
+                                    f"  [{info['cinema_name']}] {info['movie_title']} "
+                                    f"{info['showtime'].strftime('%d/%m %H:%M')}: "
+                                    f"{tickets_sold}/{total_seats} seats"
+                                )
+                        except Exception as e:
+                            logger.debug(f"[Hot Cinema] Seat map failed: {e}")
 
                     screening = ScrapedScreening(
                         movie_title=info["movie_title"],
