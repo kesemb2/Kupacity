@@ -116,7 +116,8 @@ async def lifespan(app: FastAPI):
             finally:
                 db.close()
 
-        await initial_scrape()
+        import asyncio
+        asyncio.create_task(initial_scrape())
 
     except Exception as e:
         logger.warning(f"Scheduler not started: {e}")
