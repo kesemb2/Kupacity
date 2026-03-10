@@ -703,9 +703,9 @@ class HotCinemaScraper(BaseScraper):
         try:
             page = await context.new_page()
 
-            # Step 1: Collect unique movie URLs from all theater pages
+            # Step 1: Collect unique movie URLs (limited to 1 branch for testing)
             movie_urls: dict[str, str] = {}  # title -> URL
-            for branch_id, branch_info in HOT_CINEMA_BRANCHES.items():
+            for branch_id, branch_info in list(HOT_CINEMA_BRANCHES.items())[:1]:
                 movies = await self._scrape_theater_page(page, branch_id, branch_info)
                 for m in movies:
                     if m.detail_url and m.title not in movie_urls:
@@ -732,8 +732,12 @@ class HotCinemaScraper(BaseScraper):
 
             logger.info(f"[Hot Cinema] Found {len(movie_urls)} unique movie URLs to check for screenings")
 
+            # Limit to 3 movies for testing
+            _test_items = list(movie_urls.items())[:3]
+            logger.info(f"[Hot Cinema] Testing with {len(_test_items)} movies")
+
             # Step 2: Visit each movie page to get screenings
-            for title, url in movie_urls.items():
+            for title, url in _test_items:
                 screening_infos = await self._scrape_movie_screenings(page, url, title)
 
                 for info in screening_infos:
