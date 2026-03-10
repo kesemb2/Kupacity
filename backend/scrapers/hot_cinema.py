@@ -8,11 +8,16 @@ is needed.
 URL patterns:
 - Theater page:  https://hotcinema.co.il/theater/{id}/{slug}
 - Movie page:    https://hotcinema.co.il/movie/{id}/{slug}
-- Seat map:      https://tickets.hotcinema.co.il/site/{siteId}/seats
+- Tickets:       https://tickets.hotcinema.co.il/...
+
+Flow:
+1. Visit theater pages → collect movie URLs (/movie/{id}/{slug})
+2. Visit each movie page → parse screening table (cinema, time, format)
+3. For ticket updates → click showtime → select ticket → seat map → count seats
 
 Schedule:
 - Weekly:  scrape_movies()         - full movie catalog from all theaters
-- Daily:   scrape_screenings()     - screening schedule for next 7 days
+- Daily:   scrape_screenings()     - screening schedule from movie pages
 - 5 hours: scrape_ticket_updates() - enter each screening's seat page
 
 Proxy:
@@ -57,16 +62,30 @@ HOT_CINEMA_BRANCHES = {
 BASE_URL = "https://hotcinema.co.il"
 TICKETS_URL = "https://tickets.hotcinema.co.il"
 
-# Where to save the debug screenshot (relative to the backend dir)
 _DEBUG_SCREENSHOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "debug.png")
 
-# Branch-name keywords used to filter out non-movie elements
 _BRANCH_KEYWORDS = [
     "מודיעין", "כפר סבא", "פתח תקווה", "רחובות", "חיפה",
     "קריון", "כרמיאל", "נהריה", "אשקלון", "אשדוד",
     "modi'in", "kfar saba", "petah tikva", "rehovot",
     "haifa", "kiryon", "karmiel", "nahariya", "ashkelon", "ashdod",
 ]
+
+# Map Hebrew cinema names from screening table back to branch info
+_CINEMA_NAME_MAP: dict[str, dict] = {}
+for _bid, _binfo in HOT_CINEMA_BRANCHES.items():
+    # The screening table shows "HOT CINEMA כפר סבא" etc.
+    _CINEMA_NAME_MAP[_binfo["city_he"]] = _binfo
+
+
+def _resolve_cinema(cinema_text: str) -> tuple[str, str]:
+    """Map cinema text from screening table (e.g. 'HOT CINEMA כפר סבא') to (name, city)."""
+    for city_he, binfo in _CINEMA_NAME_MAP.items():
+        if city_he in cinema_text:
+            return binfo["name"], binfo["city"]
+    # Fallback: use the text as-is
+    clean = cinema_text.replace("HOT CINEMA", "").strip()
+    return f"Hot Cinema {clean}", clean
 
 
 class HotCinemaScraper(BaseScraper):
@@ -89,10 +108,6 @@ class HotCinemaScraper(BaseScraper):
 
     @staticmethod
     async def _launch_browser() -> tuple:
-        """Launch Playwright Chromium with stealth-like settings.
-
-        Returns (playwright_instance, browser, context).
-        """
         pw = await async_playwright().start()
 
         proxy_server = os.environ.get("SCRAPER_PROXY_SERVER")
@@ -121,20 +136,16 @@ class HotCinemaScraper(BaseScraper):
             ),
             locale="he-IL",
             timezone_id="Asia/Jerusalem",
-            # Stealth-ish: hide automation indicators
             java_script_enabled=True,
         )
 
-        # Hide webdriver flag (fallback if playwright-stealth not installed)
         await context.add_init_script("""
             Object.defineProperty(navigator, 'webdriver', { get: () => false });
-            // Hide automation indicators
             Object.defineProperty(navigator, 'languages', { get: () => ['he-IL', 'he', 'en-US', 'en'] });
             Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
             window.chrome = { runtime: {} };
         """)
 
-        # Apply full stealth patches if available
         if stealth_async:
             page = await context.new_page()
             await stealth_async(page)
@@ -169,7 +180,6 @@ class HotCinemaScraper(BaseScraper):
         except Exception as e:
             logger.warning(f"[Hot Cinema] Page load timeout for {url}: {e}")
 
-        # Extra wait for JS rendering
         await asyncio.sleep(2)
 
         if take_debug_screenshot:
@@ -182,7 +192,7 @@ class HotCinemaScraper(BaseScraper):
         await self._simulate_human(page)
 
     # ------------------------------------------------------------------
-    # Seat counting
+    # Seat counting (on seat map page)
     # ------------------------------------------------------------------
 
     async def _count_seats_on_page(self, page: Page) -> tuple[int, int]:
@@ -257,192 +267,323 @@ class HotCinemaScraper(BaseScraper):
 
         return total, sold
 
-    async def _get_seat_count_for_screening(self, page: Page, screening_url: str) -> tuple[int, int]:
-        try:
-            await self._open_url(page, screening_url)
-            await asyncio.sleep(3)
-            return await self._count_seats_on_page(page)
-        except Exception as e:
-            logger.warning(f"Seat count failed for {screening_url}: {e}")
-            return 0, 0
-
     # ------------------------------------------------------------------
-    # Theater page scraping
+    # Theater page scraping - collect movies + their detail URLs
     # ------------------------------------------------------------------
 
     async def _scrape_theater_page(self, page: Page, branch_id: str,
-                                    branch_info: dict) -> tuple[list[ScrapedMovie], list[dict]]:
+                                    branch_info: dict) -> list[ScrapedMovie]:
+        """Visit a theater page and collect movies with their /movie/ URLs."""
         movies: list[ScrapedMovie] = []
-        screening_infos: list[dict] = []
 
         url = f"{BASE_URL}/theater/{branch_id}/{branch_info['slug']}"
         try:
             await self._open_url(page, url, take_debug_screenshot=(branch_id == "1"))
 
-            # Try specific movie selectors first
-            movie_elements = await page.query_selector_all(
-                '[class*="movie"], [class*="Movie"], [class*="film"], [class*="Film"], '
-                '[data-movie], [data-film]'
-            )
-            # Fallback to broader selectors
-            if not movie_elements:
-                movie_elements = await page.query_selector_all(
-                    'article, .card, [class*="item"]'
-                )
+            # Collect all /movie/ links on the page
+            movie_links = await page.query_selector_all('a[href*="/movie/"]')
+            seen_urls: set[str] = set()
 
-            logger.info(f"[Hot Cinema] Branch {branch_id}: found {len(movie_elements)} candidate elements")
-
-            for elem in movie_elements:
+            for link in movie_links:
                 try:
-                    title_el = await elem.query_selector(
+                    href = await link.get_attribute("href") or ""
+                    if "/movie/" not in href:
+                        continue
+
+                    # Normalize URL
+                    if href.startswith("/"):
+                        full_url = f"{BASE_URL}{href}"
+                    elif href.startswith("http"):
+                        full_url = href
+                    else:
+                        continue
+
+                    if full_url in seen_urls:
+                        continue
+                    seen_urls.add(full_url)
+
+                    # Try to get title from the link or its children
+                    title = ""
+                    title_el = await link.query_selector(
                         'h2, h3, h4, [class*="title"], [class*="name"], [class*="Title"], [class*="Name"]'
                     )
-                    if not title_el:
-                        continue
-                    title = (await title_el.inner_text()).strip()
+                    if title_el:
+                        title = (await title_el.inner_text()).strip()
+                    if not title:
+                        title = (await link.inner_text()).strip()
                     if not title or len(title) < 2:
                         continue
 
-                    # Skip branch/cinema elements
-                    elem_text = (await elem.inner_text()).lower()
-                    elem_href = (await elem.get_attribute("href") or "").lower()
-                    is_branch = any(kw in (elem_text + " " + elem_href) for kw in [
-                        "/theater/", "/branch/", "/cinema/", "סניף", "סניפים",
-                    ])
-                    if is_branch or any(kw in title.lower() for kw in _BRANCH_KEYWORDS):
-                        logger.debug(f"Skipping branch element: {title}")
+                    # Skip branch elements
+                    if any(kw in title.lower() for kw in _BRANCH_KEYWORDS):
                         continue
 
                     poster_url = ""
-                    img = await elem.query_selector("img")
+                    img = await link.query_selector("img")
                     if img:
                         poster_url = await img.get_attribute("src") or ""
                         if poster_url and not poster_url.startswith("http"):
                             poster_url = f"{BASE_URL}{poster_url}"
 
-                    movies.append(ScrapedMovie(title=title, title_he=title, poster_url=poster_url))
+                    movies.append(ScrapedMovie(
+                        title=title, title_he=title,
+                        poster_url=poster_url, detail_url=full_url,
+                    ))
+                except Exception:
+                    continue
 
-                    # Log sample HTML for first movie in each branch
-                    if len(movies) == 1:
-                        try:
-                            html_sample = await elem.evaluate("el => el.innerHTML.substring(0, 800)")
-                            logger.info(f"[Hot Cinema] Branch {branch_id} sample movie HTML: {html_sample}")
-                        except Exception:
-                            pass
-
-                    # Find showtime elements
-                    showtime_els = await elem.query_selector_all(
-                        'a[href*="tickets"], a[href*="booking"], a[href*="order"], '
-                        'a[href*="seats"], a[href*="site"], '
-                        '[class*="showtime"], [class*="time"], [class*="screening"], '
-                        '[class*="Showtime"], [class*="Time"], [class*="Screening"], '
-                        'button[class*="time"], a[class*="time"]'
+            # Fallback: broader element search if no /movie/ links found
+            if not movies:
+                movie_elements = await page.query_selector_all(
+                    '[class*="movie"], [class*="Movie"], [class*="film"], [class*="Film"], '
+                    '[data-movie], [data-film]'
+                )
+                if not movie_elements:
+                    movie_elements = await page.query_selector_all(
+                        'article, .card, [class*="item"]'
                     )
 
-                    # Fallback: search for child elements containing time text
-                    if not showtime_els:
-                        all_children = await elem.query_selector_all("a, button, span, div, li")
-                        for child in all_children:
-                            try:
-                                text = (await child.inner_text()).strip()
-                                if re.search(r"^\d{1,2}:\d{2}$", text) or re.search(r"^\d{1,2}:\d{2}\s", text):
-                                    showtime_els.append(child)
-                            except Exception:
-                                continue
-
-                    if showtime_els and len(movies) <= 3:
-                        logger.info(f"[Hot Cinema] Branch {branch_id} '{title}': {len(showtime_els)} showtime elements")
-
-                    for st_el in showtime_els:
-                        try:
-                            time_text = (await st_el.inner_text()).strip()
-                            time_match = re.search(r"(\d{1,2}):(\d{2})", time_text)
-                            if not time_match:
-                                continue
-
-                            hour, minute = int(time_match.group(1)), int(time_match.group(2))
-                            showtime = datetime.now().replace(
-                                hour=hour, minute=minute, second=0, microsecond=0,
-                            )
-                            if showtime < datetime.now():
-                                showtime += timedelta(days=1)
-
-                            # Detect format
-                            format_text = time_text.upper()
-                            parent_text = ""
-                            try:
-                                parent = await page.evaluate(
-                                    """el => {
-                                        const p = el.closest('[class*=format],[class*=Format],[class*=type],[class*=Type]');
-                                        return p ? p.textContent : '';
-                                    }""",
-                                    st_el,
-                                )
-                                parent_text = (parent or "").upper()
-                            except Exception:
-                                pass
-                            combined_text = format_text + " " + parent_text
-
-                            screen_format = "2D"
-                            if "IMAX" in combined_text:
-                                screen_format = "IMAX"
-                            elif "4DX" in combined_text:
-                                screen_format = "4DX"
-                            elif "3D" in combined_text:
-                                screen_format = "3D"
-                            elif "SCREENX" in combined_text:
-                                screen_format = "ScreenX"
-
-                            hall = await st_el.get_attribute("data-hall") or ""
-
-                            # Extract booking URL
-                            booking_url = ""
-                            href = await st_el.get_attribute("href") or ""
-                            if href:
-                                if href.startswith("http"):
-                                    booking_url = href
-                                elif href.startswith("/"):
-                                    booking_url = (
-                                        f"{TICKETS_URL}{href}"
-                                        if "site" in href or "seats" in href
-                                        else f"{BASE_URL}{href}"
-                                    )
-                            else:
-                                data_url = (
-                                    await st_el.get_attribute("data-url")
-                                    or await st_el.get_attribute("data-href")
-                                    or ""
-                                )
-                                if data_url:
-                                    booking_url = (
-                                        data_url if data_url.startswith("http")
-                                        else f"{TICKETS_URL}{data_url}"
-                                    )
-
-                            screening_infos.append({
-                                "movie_title": title,
-                                "cinema_name": branch_info["name"],
-                                "city": branch_info["city"],
-                                "showtime": showtime,
-                                "hall": hall,
-                                "format": screen_format,
-                                "booking_url": booking_url,
-                            })
-                        except Exception as e:
-                            logger.debug(f"Showtime parse error: {e}")
+                for elem in movie_elements:
+                    try:
+                        title_el = await elem.query_selector(
+                            'h2, h3, h4, [class*="title"], [class*="name"], [class*="Title"], [class*="Name"]'
+                        )
+                        if not title_el:
                             continue
-                except Exception as e:
-                    logger.debug(f"Movie element parse error: {e}")
-                    continue
+                        title = (await title_el.inner_text()).strip()
+                        if not title or len(title) < 2:
+                            continue
+                        if any(kw in title.lower() for kw in _BRANCH_KEYWORDS):
+                            continue
+
+                        # Try to find a /movie/ link inside
+                        detail_url = ""
+                        movie_link = await elem.query_selector('a[href*="/movie/"]')
+                        if movie_link:
+                            href = await movie_link.get_attribute("href") or ""
+                            if href.startswith("/"):
+                                detail_url = f"{BASE_URL}{href}"
+                            elif href.startswith("http"):
+                                detail_url = href
+
+                        poster_url = ""
+                        img = await elem.query_selector("img")
+                        if img:
+                            poster_url = await img.get_attribute("src") or ""
+                            if poster_url and not poster_url.startswith("http"):
+                                poster_url = f"{BASE_URL}{poster_url}"
+
+                        movies.append(ScrapedMovie(
+                            title=title, title_he=title,
+                            poster_url=poster_url, detail_url=detail_url,
+                        ))
+                    except Exception:
+                        continue
+
+            logger.info(f"[Hot Cinema] Branch {branch_id}: found {len(movies)} movies")
         except Exception as e:
-            logger.warning(f"Hot Cinema theater {branch_id} page scrape failed: {e}")
+            logger.warning(f"[Hot Cinema] Theater {branch_id} page failed: {e}")
 
-        if screening_infos:
-            logger.info(f"[Hot Cinema] Branch {branch_id}: {len(screening_infos)} screenings from {len(movies)} movies")
-        elif movies:
-            logger.info(f"[Hot Cinema] Branch {branch_id}: {len(movies)} movies but 0 screenings")
+        return movies
 
-        return movies, screening_infos
+    # ------------------------------------------------------------------
+    # Movie page scraping - extract screening table
+    # ------------------------------------------------------------------
+
+    async def _scrape_movie_screenings(self, page: Page, movie_url: str,
+                                        movie_title: str) -> list[dict]:
+        """Visit a movie detail page and parse its screening table.
+
+        The screening table on hotcinema.co.il/movie/{id}/{slug} shows rows like:
+            HOT CINEMA כפר סבא | כתוביות בעברית | 17:00
+        Each time is a clickable link to the ticket purchase page.
+        """
+        screening_infos: list[dict] = []
+
+        try:
+            await self._open_url(page, movie_url)
+
+            # Scroll down to the screening table area
+            await page.evaluate("window.scrollBy(0, 600)")
+            await asyncio.sleep(1)
+
+            # Log a snippet of page text for debugging (first movie only)
+            try:
+                body_text = await page.inner_text("body")
+                if "רכישת כרטיסים" in body_text:
+                    logger.debug(f"[Hot Cinema] '{movie_title}': found 'רכישת כרטיסים' section")
+            except Exception:
+                pass
+
+            # Strategy 1: Find screening rows in the table
+            # Each screening row typically contains: cinema name, language, and showtime links
+            # Look for rows/containers that have time links
+            screening_rows = await page.query_selector_all(
+                'tr, [class*="screening"], [class*="Screening"], '
+                '[class*="showtime"], [class*="Showtime"], '
+                '[class*="row"], [class*="Row"]'
+            )
+
+            # Also try broader approach: find all time-like clickable elements
+            time_links = await page.query_selector_all('a')
+            time_link_data: list[dict] = []
+
+            for link in time_links:
+                try:
+                    text = (await link.inner_text()).strip()
+                    time_match = re.match(r"^(\d{1,2}:\d{2})$", text)
+                    if not time_match:
+                        continue
+
+                    href = await link.get_attribute("href") or ""
+                    if not href:
+                        continue
+
+                    # Build full booking URL
+                    if href.startswith("/"):
+                        booking_url = f"{TICKETS_URL}{href}" if "site" in href else f"{BASE_URL}{href}"
+                    elif href.startswith("http"):
+                        booking_url = href
+                    else:
+                        continue
+
+                    # Find the parent row to get cinema name and language
+                    row_info = await page.evaluate("""(el) => {
+                        // Walk up to find the row container
+                        let row = el.parentElement;
+                        for (let i = 0; i < 8 && row; i++) {
+                            const text = row.textContent || '';
+                            if (text.includes('HOT CINEMA') || text.includes('הוט סינמה')) {
+                                return {
+                                    text: row.textContent.trim(),
+                                    html: row.innerHTML.substring(0, 500)
+                                };
+                            }
+                            row = row.parentElement;
+                        }
+                        // Fallback: use closest ancestor with substantial text
+                        row = el.parentElement;
+                        for (let i = 0; i < 5 && row; i++) {
+                            const text = (row.textContent || '').trim();
+                            if (text.length > 20) {
+                                return { text: text, html: '' };
+                            }
+                            row = row.parentElement;
+                        }
+                        return { text: '', html: '' };
+                    }""", link)
+
+                    row_text = row_info.get("text", "") if row_info else ""
+
+                    # Extract cinema name from row text
+                    cinema_name, city = "Hot Cinema", ""
+                    cinema_match = re.search(r"HOT CINEMA\s+(\S+(?:\s+\S+)?)", row_text)
+                    if cinema_match:
+                        cinema_name, city = _resolve_cinema(cinema_match.group(0))
+                    else:
+                        # Try Hebrew name
+                        for city_he, binfo in _CINEMA_NAME_MAP.items():
+                            if city_he in row_text:
+                                cinema_name = binfo["name"]
+                                city = binfo["city"]
+                                break
+
+                    # Extract language
+                    language = "subtitled"
+                    if "מדובב" in row_text:
+                        language = "dubbed"
+                    elif "כתוביות" in row_text:
+                        language = "subtitled"
+                    elif "מקור" in row_text:
+                        language = "original"
+
+                    # Detect format from row text or page-level format tabs
+                    screen_format = "2D"
+                    row_upper = row_text.upper()
+                    if "IMAX" in row_upper:
+                        screen_format = "IMAX"
+                    elif "4DX" in row_upper:
+                        screen_format = "4DX"
+                    elif "תלת מימד" in row_text or "3D" in row_upper:
+                        screen_format = "3D"
+                    elif "SCREENX" in row_upper:
+                        screen_format = "ScreenX"
+                    elif "PREMIUM" in row_upper:
+                        screen_format = "PREMIUM"
+                    elif "ATMOS" in row_upper:
+                        screen_format = "Atmos"
+
+                    # Parse time
+                    hour, minute = map(int, time_match.group(1).split(":"))
+                    showtime = datetime.now().replace(
+                        hour=hour, minute=minute, second=0, microsecond=0,
+                    )
+                    if showtime < datetime.now() - timedelta(hours=1):
+                        showtime += timedelta(days=1)
+
+                    time_link_data.append({
+                        "movie_title": movie_title,
+                        "cinema_name": cinema_name,
+                        "city": city,
+                        "showtime": showtime,
+                        "hall": "",
+                        "format": screen_format,
+                        "language": language,
+                        "booking_url": booking_url,
+                    })
+                except Exception:
+                    continue
+
+            screening_infos.extend(time_link_data)
+
+            # Strategy 2: If no time links found, try parsing text-based rows
+            if not screening_infos:
+                try:
+                    body_text = await page.inner_text("body")
+                    # Look for patterns like "HOT CINEMA כפר סבא    כתוביות בעברית    17:00"
+                    lines = body_text.split("\n")
+                    current_cinema = ""
+                    for line in lines:
+                        line = line.strip()
+                        if "HOT CINEMA" in line or "הוט סינמה" in line:
+                            cinema_match = re.search(r"HOT CINEMA\s+(\S+(?:\s+\S+)?)", line)
+                            if cinema_match:
+                                current_cinema = cinema_match.group(0)
+
+                        times = re.findall(r"\b(\d{1,2}:\d{2})\b", line)
+                        if times and current_cinema:
+                            cinema_name, city = _resolve_cinema(current_cinema)
+                            for t in times:
+                                hour, minute = map(int, t.split(":"))
+                                if hour > 23 or minute > 59:
+                                    continue
+                                showtime = datetime.now().replace(
+                                    hour=hour, minute=minute, second=0, microsecond=0,
+                                )
+                                if showtime < datetime.now() - timedelta(hours=1):
+                                    showtime += timedelta(days=1)
+                                screening_infos.append({
+                                    "movie_title": movie_title,
+                                    "cinema_name": cinema_name,
+                                    "city": city,
+                                    "showtime": showtime,
+                                    "hall": "",
+                                    "format": "2D",
+                                    "language": "subtitled",
+                                    "booking_url": "",
+                                })
+                except Exception as e:
+                    logger.debug(f"[Hot Cinema] Text-based screening parse failed for '{movie_title}': {e}")
+
+            if screening_infos:
+                logger.info(f"[Hot Cinema] '{movie_title}': {len(screening_infos)} screenings found")
+            else:
+                logger.info(f"[Hot Cinema] '{movie_title}': no screenings found")
+
+        except Exception as e:
+            logger.warning(f"[Hot Cinema] Movie page failed for '{movie_title}': {e}")
+
+        return screening_infos
 
     async def _scrape_movie_detail(self, page: Page, movie_path: str) -> ScrapedMovie | None:
         try:
@@ -484,11 +625,92 @@ class HotCinemaScraper(BaseScraper):
             if title:
                 return ScrapedMovie(
                     title=title, title_he=title, genre=genre,
-                    duration_minutes=duration, poster_url=poster_url, director=director,
+                    duration_minutes=duration, poster_url=poster_url,
+                    director=director, detail_url=url,
                 )
         except Exception as e:
             logger.warning(f"Movie detail scrape failed for {movie_path}: {e}")
         return None
+
+    # ------------------------------------------------------------------
+    # Navigate ticket purchase flow to reach seat map
+    # ------------------------------------------------------------------
+
+    async def _navigate_to_seat_map(self, page: Page, booking_url: str) -> tuple[int, int]:
+        """Navigate from booking URL through ticket selection to seat map.
+
+        Flow: booking_url → ticket page (click + for regular) → seat map page
+        """
+        try:
+            await self._open_url(page, booking_url)
+            await asyncio.sleep(2)
+
+            # Check if we're already on a seat map page
+            if "seats" in page.url or "מושבים" in (await page.inner_text("body"))[:200]:
+                return await self._count_seats_on_page(page)
+
+            # Look for the + button to add a regular ticket
+            # The ticket page shows rows like: "רגיל  ₪50.50  - 1 +"
+            plus_buttons = await page.query_selector_all(
+                'button, [role="button"], [class*="plus"], [class*="Plus"], '
+                '[class*="increase"], [class*="add"]'
+            )
+            clicked = False
+            for btn in plus_buttons:
+                try:
+                    text = (await btn.inner_text()).strip()
+                    if text == "+" or text == "＋":
+                        await btn.click()
+                        clicked = True
+                        logger.debug("[Hot Cinema] Clicked + button for ticket")
+                        await asyncio.sleep(1)
+                        break
+                except Exception:
+                    continue
+
+            if not clicked:
+                # Try finding + by aria-label or nearby "רגיל" text
+                try:
+                    plus_btn = await page.query_selector(
+                        '[aria-label*="הוסף"], [aria-label*="plus"], '
+                        '[aria-label*="increase"]'
+                    )
+                    if plus_btn:
+                        await plus_btn.click()
+                        clicked = True
+                        await asyncio.sleep(1)
+                except Exception:
+                    pass
+
+            if not clicked:
+                logger.debug("[Hot Cinema] Could not find + button, trying to proceed anyway")
+
+            # Look for "continue" / "המשך" / "מושבים" button
+            proceed_selectors = [
+                'button:has-text("המשך")',
+                'button:has-text("מושבים")',
+                'a:has-text("המשך")',
+                'a:has-text("מושבים")',
+                '[class*="continue"], [class*="Continue"]',
+                '[class*="next"], [class*="Next"]',
+                '[class*="submit"], [class*="Submit"]',
+            ]
+            for sel in proceed_selectors:
+                try:
+                    btn = await page.query_selector(sel)
+                    if btn:
+                        await btn.click()
+                        await asyncio.sleep(3)
+                        break
+                except Exception:
+                    continue
+
+            # Now we should be on the seat map page
+            return await self._count_seats_on_page(page)
+
+        except Exception as e:
+            logger.debug(f"[Hot Cinema] Seat map navigation failed: {e}")
+            return 0, 0
 
     # ------------------------------------------------------------------
     # Scrape implementations
@@ -501,13 +723,14 @@ class HotCinemaScraper(BaseScraper):
         try:
             page = await context.new_page()
 
+            # Collect movies from theater pages
             for branch_id, branch_info in HOT_CINEMA_BRANCHES.items():
-                movies, _ = await self._scrape_theater_page(page, branch_id, branch_info)
+                movies = await self._scrape_theater_page(page, branch_id, branch_info)
                 for m in movies:
                     if m.title and m.title not in all_movies:
                         all_movies[m.title] = m
 
-            # Movie detail pages from homepage
+            # Also collect from homepage movie detail pages
             try:
                 await self._open_url(page, BASE_URL)
                 links = await page.query_selector_all('a[href*="/movie/"]')
@@ -521,7 +744,7 @@ class HotCinemaScraper(BaseScraper):
                     if movie and movie.title and movie.title not in all_movies:
                         all_movies[movie.title] = movie
             except Exception as e:
-                logger.warning(f"Hot Cinema homepage scrape failed: {e}")
+                logger.warning(f"[Hot Cinema] Homepage scrape failed: {e}")
         finally:
             await browser.close()
             await pw.stop()
@@ -533,31 +756,44 @@ class HotCinemaScraper(BaseScraper):
         return result
 
     async def scrape_screenings(self) -> list[ScrapedScreening]:
-        """Daily: scrape screenings for next 7 days."""
+        """Daily: visit each movie page and parse the screening table."""
         all_screenings: list[ScrapedScreening] = []
         pw, browser, context = await self._launch_browser()
         try:
             page = await context.new_page()
 
+            # Step 1: Collect unique movie URLs from all theater pages
+            movie_urls: dict[str, str] = {}  # title -> URL
             for branch_id, branch_info in HOT_CINEMA_BRANCHES.items():
-                _, screening_infos = await self._scrape_theater_page(page, branch_id, branch_info)
+                movies = await self._scrape_theater_page(page, branch_id, branch_info)
+                for m in movies:
+                    if m.detail_url and m.title not in movie_urls:
+                        movie_urls[m.title] = m.detail_url
 
-                # Try clicking date buttons for next 7 days
-                try:
-                    date_buttons = await page.query_selector_all(
-                        '[class*="date"], [class*="Date"], [class*="day"], [class*="Day"], '
-                        '[data-date], button[class*="calendar"]'
-                    )
-                    for btn in date_buttons[1:7]:
-                        try:
-                            await btn.click()
-                            await self._human_delay(1.5, 3.0)
-                            _, day_infos = await self._scrape_theater_page(page, branch_id, branch_info)
-                            screening_infos.extend(day_infos)
-                        except Exception:
-                            continue
-                except Exception:
-                    pass
+            # Also check homepage for additional movie URLs
+            try:
+                await self._open_url(page, BASE_URL)
+                links = await page.query_selector_all('a[href*="/movie/"]')
+                for link in links:
+                    href = await link.get_attribute("href") or ""
+                    if "/movie/" not in href:
+                        continue
+                    full_url = f"{BASE_URL}{href}" if href.startswith("/") else href
+                    # Try to get title
+                    try:
+                        text = (await link.inner_text()).strip()
+                        if text and len(text) >= 2 and text not in movie_urls:
+                            movie_urls[text] = full_url
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+
+            logger.info(f"[Hot Cinema] Found {len(movie_urls)} unique movie URLs to check for screenings")
+
+            # Step 2: Visit each movie page to get screenings
+            for title, url in movie_urls.items():
+                screening_infos = await self._scrape_movie_screenings(page, url, title)
 
                 for info in screening_infos:
                     screening = ScrapedScreening(
@@ -567,7 +803,7 @@ class HotCinemaScraper(BaseScraper):
                         showtime=info["showtime"],
                         hall=info["hall"],
                         format=info["format"],
-                        language="subtitled",
+                        language=info.get("language", "subtitled"),
                         ticket_price=39.0,
                         total_seats=200,
                         tickets_sold=0,
@@ -578,18 +814,28 @@ class HotCinemaScraper(BaseScraper):
             await browser.close()
             await pw.stop()
 
-        logger.info(f"[Hot Cinema] Daily scrape: {len(all_screenings)} screenings")
+        logger.info(f"[Hot Cinema] Daily scrape: {len(all_screenings)} screenings from {len(movie_urls)} movies")
         return all_screenings
 
     async def scrape_ticket_updates(self) -> list[ScrapedScreening]:
-        """Every 5 hours: count seats sold for active screenings."""
+        """Every 5 hours: visit movie pages, then navigate to seat maps to count seats."""
         all_screenings: list[ScrapedScreening] = []
         pw, browser, context = await self._launch_browser()
         try:
             page = await context.new_page()
 
+            # Collect movie URLs
+            movie_urls: dict[str, str] = {}
             for branch_id, branch_info in HOT_CINEMA_BRANCHES.items():
-                _, screening_infos = await self._scrape_theater_page(page, branch_id, branch_info)
+                movies = await self._scrape_theater_page(page, branch_id, branch_info)
+                for m in movies:
+                    if m.detail_url and m.title not in movie_urls:
+                        movie_urls[m.title] = m.detail_url
+
+            logger.info(f"[Hot Cinema] Ticket update: checking {len(movie_urls)} movies")
+
+            for title, url in movie_urls.items():
+                screening_infos = await self._scrape_movie_screenings(page, url, title)
 
                 for info in screening_infos:
                     if info["showtime"] < datetime.now():
@@ -600,7 +846,7 @@ class HotCinemaScraper(BaseScraper):
 
                     booking_url = info.get("booking_url", "")
                     if booking_url:
-                        total, sold = await self._get_seat_count_for_screening(page, booking_url)
+                        total, sold = await self._navigate_to_seat_map(page, booking_url)
                         if total > 0:
                             total_seats = total
                             tickets_sold = sold
@@ -609,33 +855,6 @@ class HotCinemaScraper(BaseScraper):
                                 f"{info['showtime'].strftime('%H:%M')}: "
                                 f"{tickets_sold}/{total_seats} seats sold"
                             )
-                    else:
-                        try:
-                            await self._open_url(
-                                page,
-                                f"{BASE_URL}/theater/{branch_id}/{branch_info['slug']}",
-                            )
-                            time_str = info["showtime"].strftime("%H:%M")
-                            time_buttons = await page.query_selector_all('[class*="time"]')
-                            for btn in time_buttons:
-                                btn_text = (await btn.inner_text()).strip()
-                                if time_str not in btn_text:
-                                    continue
-                                try:
-                                    await btn.click()
-                                    await asyncio.sleep(3)
-                                    current_url = page.url
-                                    if any(kw in current_url for kw in ("seats", "ticket", "booking")):
-                                        await asyncio.sleep(3)
-                                        total, sold = await self._count_seats_on_page(page)
-                                        if total > 0:
-                                            total_seats = total
-                                            tickets_sold = sold
-                                    break
-                                except Exception:
-                                    continue
-                        except Exception as e:
-                            logger.debug(f"Click-to-booking failed for {info['movie_title']}: {e}")
 
                     screening = ScrapedScreening(
                         movie_title=info["movie_title"],
@@ -644,7 +863,7 @@ class HotCinemaScraper(BaseScraper):
                         showtime=info["showtime"],
                         hall=info["hall"],
                         format=info["format"],
-                        language="subtitled",
+                        language=info.get("language", "subtitled"),
                         ticket_price=39.0,
                         total_seats=total_seats,
                         tickets_sold=tickets_sold,

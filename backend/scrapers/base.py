@@ -10,7 +10,8 @@ logger = logging.getLogger(__name__)
 class ScrapedMovie:
     def __init__(self, title: str, title_he: str = "", genre: str = "",
                  duration_minutes: int = 0, release_date: str = "",
-                 poster_url: str = "", rating: str = "", director: str = ""):
+                 poster_url: str = "", rating: str = "", director: str = "",
+                 detail_url: str = ""):
         self.title = title
         self.title_he = title_he
         self.genre = genre
@@ -19,6 +20,7 @@ class ScrapedMovie:
         self.poster_url = poster_url
         self.rating = rating
         self.director = director
+        self.detail_url = detail_url
 
 
 class ScrapedScreening:
