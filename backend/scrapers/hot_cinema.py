@@ -539,7 +539,7 @@ class HotCinemaScraper(BaseScraper):
         Much faster than loading movie pages — uses page.request.get() which
         shares the browser context's cookies and headers.
         """
-        MOVIEEVENTS_URL = f"{BASE_URL}/tickets/movieevents"
+        MOVIEEVENTS_URL = f"{TICKETS_URL}/movieevents"
         all_parsed: list[dict] = []
         today = datetime.now().date()
 
@@ -839,28 +839,10 @@ class HotCinemaScraper(BaseScraper):
 
             logger.info(f"[Hot Cinema] Total screenings from API: {len(all_infos)}")
 
-            # Step 4: For each screening, try to get seat counts
+            # Step 4: Build screenings (seat counts deferred to scrape_ticket_updates)
             for info in all_infos:
                 if info["showtime"] < datetime.now():
                     continue
-
-                total_seats = 200
-                tickets_sold = 0
-
-                booking_url = info.get("booking_url", "")
-                if booking_url:
-                    try:
-                        total, sold = await self._navigate_to_seat_map(page, booking_url)
-                        if total > 0:
-                            total_seats = total
-                            tickets_sold = sold
-                            logger.info(
-                                f"  [{info['cinema_name']}] {info['movie_title']} "
-                                f"{info['showtime'].strftime('%d/%m %H:%M')}: "
-                                f"{tickets_sold}/{total_seats} seats"
-                            )
-                    except Exception as e:
-                        logger.debug(f"[Hot Cinema] Seat map failed: {e}")
 
                 screening = ScrapedScreening(
                     movie_title=info["movie_title"],
@@ -871,10 +853,10 @@ class HotCinemaScraper(BaseScraper):
                     format=info["format"],
                     language=info.get("language", "subtitled"),
                     ticket_price=39.0,
-                    total_seats=total_seats,
-                    tickets_sold=tickets_sold,
+                    total_seats=200,
+                    tickets_sold=0,
                 )
-                screening.revenue = screening.tickets_sold * screening.ticket_price
+                screening.revenue = 0
                 all_screenings.append(screening)
         finally:
             await browser.close()
