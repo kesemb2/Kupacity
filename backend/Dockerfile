@@ -18,6 +18,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgtk-3-0 \
     && rm -rf /var/lib/apt/lists/*
 
+# Tell Chromium it's running in a container (no GPU, no /dev/shm issues)
+ENV CHROMIUM_FLAGS="--no-sandbox --disable-dev-shm-usage --disable-gpu"
+
 # ---- Install Python dependencies ----------------------------------------
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt

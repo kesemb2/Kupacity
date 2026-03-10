@@ -109,6 +109,8 @@ class HotCinemaScraper(BaseScraper):
         options = uc.ChromeOptions()
         options.add_argument("--no-sandbox")
         options.add_argument("--disable-setuid-sandbox")
+        options.add_argument("--disable-dev-shm-usage")
+        options.add_argument("--disable-gpu")
         options.add_argument("--disable-infobars")
         options.add_argument("--window-size=1920,1080")
         options.add_argument("--lang=en-US")
@@ -127,11 +129,17 @@ class HotCinemaScraper(BaseScraper):
         # use it explicitly so UC doesn't try to download Google Chrome.
         chromium_path = shutil.which("chromium") or shutil.which("chromium-browser")
 
+        # Use the system-installed chromedriver (from the chromium-driver
+        # package) instead of letting UC download its own — avoids
+        # architecture mismatches on ARM64 / Apple Silicon.
+        system_chromedriver = shutil.which("chromedriver")
+
         driver = uc.Chrome(
             options=options,
             headless=True,
             version_main=chrome_ver,  # None → auto-detect (UC default)
             browser_executable_path=chromium_path,  # works on ARM & AMD64
+            driver_executable_path=system_chromedriver,  # use apt-installed driver
         )
         driver.set_page_load_timeout(30)
         return driver
