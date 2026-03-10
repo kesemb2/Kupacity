@@ -917,6 +917,10 @@ class HotCinemaScraper(BaseScraper):
 
             logger.info(f"[Hot Cinema] Ticket update: checking {len(movie_list)} movies")
 
+            if self._TEST_MOVIE_LIMIT:
+                movie_list = movie_list[:self._TEST_MOVIE_LIMIT]
+                logger.info(f"[Hot Cinema] Ticket update: limited to {len(movie_list)} movies")
+
             screening_counter = 0
             for title, url, mid in movie_list:
                 screening_infos = await self._fetch_screenings_api(page, mid, title, days=7)
