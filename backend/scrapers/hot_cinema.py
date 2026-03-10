@@ -173,10 +173,12 @@ class HotCinemaScraper(BaseScraper):
         except Exception:
             pass
 
-    async def _open_url(self, page: Page, url: str, *, take_debug_screenshot: bool = False):
+    async def _open_url(self, page: Page, url: str, *, take_debug_screenshot: bool = False,
+                        wait_for_network: bool = False):
         await self._human_delay()
         try:
-            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            wait_until = "networkidle" if wait_for_network else "domcontentloaded"
+            await page.goto(url, wait_until=wait_until, timeout=45000)
         except Exception as e:
             logger.warning(f"[Hot Cinema] Page load timeout for {url}: {e}")
 
@@ -392,136 +394,185 @@ class HotCinemaScraper(BaseScraper):
 
     async def _scrape_movie_screenings(self, page: Page, movie_url: str,
                                         movie_title: str) -> list[dict]:
-        """Visit a movie detail page and parse its screening table.
+        """Visit a movie detail page and extract screening data.
 
-        Uses network interception to capture API calls the frontend makes,
-        then falls back to HTML parsing within the screening table container.
+        Tries multiple extraction strategies:
+        1. __NEXT_DATA__ embedded JSON (Next.js SSR)
+        2. Network interception for XHR/fetch API calls
+        3. HTML parsing of the screening section
         """
         screening_infos: list[dict] = []
         api_calls: list[dict] = []
 
         async def capture_response(response):
             url = response.url
-            # Filter out third-party calls (ads, analytics, tracking)
-            IGNORED_DOMAINS = [
-                "google", "youtube", "doubleclick", "facebook",
-                "analytics", "gtag", "gstatic",
-            ]
-            if any(domain in url.lower() for domain in IGNORED_DOMAINS):
+            # Only capture calls to hotcinema.co.il domain
+            if "hotcinema.co.il" not in url:
                 return
-            # Capture any JSON API calls
             content_type = response.headers.get("content-type", "")
-            if "json" in content_type or any(kw in url.lower() for kw in [
-                "api", "screening", "showtime", "event", "schedule",
-                "film", "movie", "catalog", "programme", "graphql",
-            ]):
+            if "json" in content_type or "api" in url.lower():
                 try:
                     body = await response.json()
                     api_calls.append({
                         "url": url,
                         "status": response.status,
-                        "body_sample": str(body)[:300],
+                        "body_sample": str(body)[:500],
                     })
                 except Exception:
                     api_calls.append({"url": url, "status": response.status})
 
         try:
             page.on("response", capture_response)
-            await self._open_url(page, movie_url)
+            await self._open_url(page, movie_url, wait_for_network=True)
 
-            # Scroll to trigger lazy-loaded content
+            # Wait for dynamic content to load
             await page.evaluate("window.scrollBy(0, 800)")
+            await asyncio.sleep(3)
+            await page.evaluate("window.scrollBy(0, 500)")
             await asyncio.sleep(2)
 
-            # Log all captured API calls
+            # Log captured API calls from hotcinema.co.il
             if api_calls:
                 for call in api_calls:
                     logger.info(f"[Hot Cinema] API call: {call['url']} (status={call['status']})")
                     if "body_sample" in call:
                         logger.info(f"[Hot Cinema]   body: {call['body_sample']}")
-            else:
-                logger.info(f"[Hot Cinema] '{movie_title}': no API calls intercepted")
 
-            # Log the screening section HTML for debugging
-            screening_html = await page.evaluate("""() => {
-                // Find the screening section by looking for "רכישת כרטיסים" heading
-                const allElements = document.querySelectorAll('h1, h2, h3, h4, h5, div, section');
-                for (const el of allElements) {
-                    const text = el.textContent || '';
-                    if (text.includes('רכישת כרטיסים') && text.length < 200) {
-                        // Found the heading - get its parent container
-                        let container = el.parentElement;
-                        for (let i = 0; i < 3 && container; i++) {
-                            if (container.innerHTML.length > 500) {
-                                return container.innerHTML.substring(0, 2000);
-                            }
-                            container = container.parentElement;
-                        }
-                        return el.parentElement ? el.parentElement.innerHTML.substring(0, 2000) : '';
+            # Strategy 1: Try __NEXT_DATA__ extraction
+            next_data = await page.evaluate("""() => {
+                const el = document.querySelector('script#__NEXT_DATA__');
+                if (el) return el.textContent;
+                // Try newer Next.js format
+                const scripts = document.querySelectorAll('script');
+                for (const s of scripts) {
+                    const txt = s.textContent || '';
+                    if (txt.includes('self.__next_f.push')) {
+                        return txt.substring(0, 3000);
                     }
                 }
-                return 'SCREENING_SECTION_NOT_FOUND';
+                return null;
             }""")
-            logger.info(f"[Hot Cinema] '{movie_title}' screening section HTML: {screening_html[:500]}")
 
-            # Find time links ONLY within the screening table area
-            screening_infos = await page.evaluate("""() => {
-                const results = [];
+            if next_data:
+                logger.info(f"[Hot Cinema] '{movie_title}': found __NEXT_DATA__ ({len(next_data)} chars)")
+                logger.info(f"[Hot Cinema]   __NEXT_DATA__ sample: {next_data[:800]}")
 
-                // Find the screening section
-                const allElements = document.querySelectorAll('h1, h2, h3, h4, h5, div, section');
-                let screeningContainer = null;
-                for (const el of allElements) {
-                    const text = (el.textContent || '').trim();
-                    if (text.startsWith('רכישת כרטיסים') && text.length < 100) {
-                        // Walk up to find a substantial container
-                        screeningContainer = el.parentElement;
-                        for (let i = 0; i < 5 && screeningContainer; i++) {
-                            if (screeningContainer.querySelectorAll('a').length >= 3) break;
-                            screeningContainer = screeningContainer.parentElement;
+            # Strategy 2: Comprehensive page structure dump for diagnostics
+            page_info = await page.evaluate("""() => {
+                const info = {
+                    title: document.title,
+                    url: window.location.href,
+                    allHeadings: [],
+                    allLinks: [],
+                    timePatterns: [],
+                    bodyTextSample: '',
+                };
+
+                // Collect all headings
+                document.querySelectorAll('h1, h2, h3, h4').forEach(h => {
+                    const t = (h.textContent || '').trim();
+                    if (t.length > 0 && t.length < 200) info.allHeadings.push(t);
+                });
+
+                // Find ALL elements with time-like text (HH:MM)
+                const walker = document.createTreeWalker(
+                    document.body, NodeFilter.SHOW_TEXT, null, false
+                );
+                const timeRegex = /\b(\d{1,2}):(\d{2})\b/g;
+                let node;
+                while (node = walker.nextNode()) {
+                    const text = node.textContent.trim();
+                    const matches = text.match(timeRegex);
+                    if (matches) {
+                        // Get parent element info
+                        const parent = node.parentElement;
+                        const tag = parent ? parent.tagName : 'unknown';
+                        const href = parent ? (parent.getAttribute('href') || parent.closest('a')?.getAttribute('href') || '') : '';
+                        const classes = parent ? (parent.className || '') : '';
+                        for (const m of matches) {
+                            info.timePatterns.push({
+                                time: m,
+                                tag: tag,
+                                href: href.substring(0, 150),
+                                classes: String(classes).substring(0, 100),
+                                context: text.substring(0, 200),
+                            });
                         }
+                    }
+                }
+
+                // Get relevant body text (around screening area)
+                const body = document.body.innerText || '';
+                // Find "רכישת כרטיסים" or "הקרנות" or "הצגות" section
+                for (const keyword of ['רכישת כרטיסים', 'הקרנות', 'לוח הקרנות', 'הצגות', 'שעות הקרנה']) {
+                    const idx = body.indexOf(keyword);
+                    if (idx >= 0) {
+                        info.bodyTextSample = body.substring(Math.max(0, idx - 100), idx + 1500);
                         break;
                     }
                 }
-
-                if (!screeningContainer) return results;
-
-                // Find all links within the screening container that look like times
-                const links = screeningContainer.querySelectorAll('a');
-                for (const link of links) {
-                    const text = (link.textContent || '').trim();
-                    const match = text.match(/^(\d{1,2}):(\d{2})$/);
-                    if (!match) continue;
-
-                    const href = link.getAttribute('href') || '';
-                    if (!href) continue;
-
-                    // Walk up to find the row containing cinema name
-                    let rowText = '';
-                    let row = link.parentElement;
-                    for (let i = 0; i < 8 && row; i++) {
-                        const t = (row.textContent || '').trim();
-                        if (t.includes('HOT CINEMA') || t.includes('הוט סינמה') || t.includes('כתוביות') || t.includes('מדובב')) {
-                            rowText = t;
-                            break;
-                        }
-                        row = row.parentElement;
-                    }
-
-                    results.push({
-                        time: text,
-                        href: href,
-                        rowText: rowText.substring(0, 200),
-                    });
+                if (!info.bodyTextSample) {
+                    // Just get a chunk from the middle of the page
+                    const mid = Math.floor(body.length / 3);
+                    info.bodyTextSample = body.substring(mid, mid + 2000);
                 }
 
-                return results;
+                // Collect links with hrefs containing tickets/booking keywords
+                document.querySelectorAll('a[href]').forEach(a => {
+                    const href = a.getAttribute('href') || '';
+                    const text = (a.textContent || '').trim();
+                    if (href.includes('ticket') || href.includes('booking') ||
+                        href.includes('site') || href.includes('order') ||
+                        /^\d{1,2}:\d{2}$/.test(text)) {
+                        info.allLinks.push({
+                            text: text.substring(0, 50),
+                            href: href.substring(0, 200),
+                        });
+                    }
+                });
+
+                return info;
             }""")
 
-            # Log raw results
-            logger.info(f"[Hot Cinema] '{movie_title}': found {len(screening_infos)} time links in screening section")
-            for si in screening_infos[:3]:
-                logger.info(f"[Hot Cinema]   time={si['time']} href={si['href'][:80]} row={si['rowText'][:80]}")
+            logger.info(f"[Hot Cinema] '{movie_title}' page title: {page_info.get('title', 'N/A')}")
+            logger.info(f"[Hot Cinema] '{movie_title}' headings: {page_info.get('allHeadings', [])}")
+            logger.info(f"[Hot Cinema] '{movie_title}' time patterns found: {len(page_info.get('timePatterns', []))}")
+            for tp in page_info.get('timePatterns', [])[:10]:
+                logger.info(f"[Hot Cinema]   time={tp['time']} tag={tp['tag']} href={tp['href'][:60]} context={tp['context'][:100]}")
+            logger.info(f"[Hot Cinema] '{movie_title}' ticket links: {len(page_info.get('allLinks', []))}")
+            for lk in page_info.get('allLinks', [])[:10]:
+                logger.info(f"[Hot Cinema]   link text='{lk['text']}' href={lk['href'][:80]}")
+            logger.info(f"[Hot Cinema] '{movie_title}' body text sample: {page_info.get('bodyTextSample', '')[:500]}")
+
+            # Strategy 3: Extract screening data from time patterns found on page
+            time_patterns = page_info.get('timePatterns', [])
+            ticket_links = page_info.get('allLinks', [])
+
+            # Use time patterns that have booking hrefs
+            for tp in time_patterns:
+                href = tp.get('href', '')
+                if href and ('ticket' in href or 'site' in href or 'order' in href or 'booking' in href):
+                    screening_infos.append({
+                        'time': tp['time'],
+                        'href': href,
+                        'rowText': tp.get('context', ''),
+                    })
+
+            # If no hrefs on times, try matching times with nearby ticket links
+            if not screening_infos and ticket_links:
+                for lk in ticket_links:
+                    text = lk.get('text', '')
+                    if re.match(r'^\d{1,2}:\d{2}$', text):
+                        screening_infos.append({
+                            'time': text,
+                            'href': lk['href'],
+                            'rowText': '',
+                        })
+
+            # Log results
+            logger.info(f"[Hot Cinema] '{movie_title}': extracted {len(screening_infos)} screenings")
+            for si in screening_infos[:5]:
+                logger.info(f"[Hot Cinema]   time={si['time']} href={si.get('href', '')[:80]}")
 
         except Exception as e:
             logger.warning(f"[Hot Cinema] Movie page failed for '{movie_title}': {e}")
