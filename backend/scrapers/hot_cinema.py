@@ -240,24 +240,30 @@ class HotCinemaScraper(BaseScraper):
                     && c.r > 50 && c.r < 210;
             }
 
-            // Strategy 1: Find SVG rect elements inside the seat plan
+            // Strategy 1: Find SVG seat elements inside the seat plan
             // The seat plan container has class 'seat-plan--inner-view'
+            // Seats can be any SVG shape: path, rect, circle, polygon, use, etc.
             const seatPlan = document.querySelector('.seat-plan--inner-view')
                           || document.querySelector('.seat-plan--inner')
                           || document.querySelector('.seat-plan');
 
-            let svgRects = [];
+            // Get ALL SVG child elements (not just rect - seats are often paths)
+            let svgEls = [];
             if (seatPlan) {
-                svgRects = Array.from(seatPlan.querySelectorAll('svg rect'));
+                svgEls = Array.from(seatPlan.querySelectorAll(
+                    'svg path, svg rect, svg circle, svg polygon, svg use, svg ellipse'
+                ));
             }
-            if (svgRects.length < 5) {
-                // Fallback: all SVG rects on page
-                svgRects = Array.from(document.querySelectorAll('svg rect'));
+            if (svgEls.length < 10) {
+                // Fallback: all SVG shapes on page
+                svgEls = Array.from(document.querySelectorAll(
+                    'svg path, svg rect, svg circle, svg polygon, svg use, svg ellipse'
+                ));
             }
 
-            // Filter to seat-sized rects and get their fill colors
+            // Filter to seat-sized elements with green or gray fill
             const candidates = [];
-            for (const el of svgRects) {
+            for (const el of svgEls) {
                 const bbox = el.getBoundingClientRect();
                 // Seat-sized: 10-60px, roughly square
                 if (bbox.width < 8 || bbox.width > 80 || bbox.height < 8 || bbox.height > 80)
@@ -288,21 +294,52 @@ class HotCinemaScraper(BaseScraper):
             }
 
             if (candidates.length < 5) {
-                // Debug: sample some SVG rects to understand the structure
-                const debugRects = svgRects.slice(0, 10).map(el => {
+                // Debug: sample SVG elements by type to understand the structure
+                const tagCounts = {};
+                for (const el of svgEls) {
+                    const tag = el.tagName;
+                    tagCounts[tag] = (tagCounts[tag] || 0) + 1;
+                }
+
+                // Sample elements with their fills and sizes
+                const debugEls = svgEls.slice(0, 20).map(el => {
                     const bbox = el.getBoundingClientRect();
-                    const fill = el.getAttribute('fill') || window.getComputedStyle(el).fill;
+                    const fillAttr = el.getAttribute('fill');
+                    const computedFill = window.getComputedStyle(el).fill;
                     return {
+                        tag: el.tagName,
                         w: Math.round(bbox.width), h: Math.round(bbox.height),
-                        fill: fill ? fill.substring(0, 30) : 'none',
+                        fillAttr: fillAttr ? fillAttr.substring(0, 30) : null,
+                        computedFill: computedFill ? computedFill.substring(0, 30) : null,
                         cls: (el.getAttribute('class') || '').substring(0, 40),
                         y: Math.round(bbox.top),
                     };
                 });
+
+                // Also sample the green/gray colored ones specifically
+                const coloredEls = svgEls.filter(el => {
+                    const bbox = el.getBoundingClientRect();
+                    if (bbox.width < 5 || bbox.height < 5) return false;
+                    const fill = window.getComputedStyle(el).fill;
+                    return fill && fill !== 'none' && fill !== 'rgb(0, 0, 0)'
+                        && fill !== 'rgb(255, 255, 255)' && fill !== 'rgba(0, 0, 0, 0)';
+                }).slice(0, 15).map(el => {
+                    const bbox = el.getBoundingClientRect();
+                    return {
+                        tag: el.tagName,
+                        w: Math.round(bbox.width), h: Math.round(bbox.height),
+                        fill: window.getComputedStyle(el).fill.substring(0, 40),
+                        cls: (el.getAttribute('class') || '').substring(0, 40),
+                        y: Math.round(bbox.top),
+                    };
+                });
+
                 return {total: 0, sold: 0, error: 'too_few_svg_seats',
-                        svgRectsTotal: svgRects.length,
+                        svgElsTotal: svgEls.length,
+                        tagCounts,
                         candidateCount: candidates.length,
-                        debugRects};
+                        debugEls,
+                        coloredEls};
             }
 
             // Exclude legend: find largest Y gap among candidates
