@@ -8,7 +8,7 @@ is needed.
 URL patterns:
 - Theater page:  https://hotcinema.co.il/theater/{id}/{slug}
 - Movie page:    https://hotcinema.co.il/movie/{id}/{slug}
-- Tickets:       https://tickets.hotcinema.co.il/...
+- Tickets:       https://tickets.hotcinema.co.il/site/{id}
 
 Flow:
 1. Visit theater pages → collect movie URLs (/movie/{id}/{slug})
@@ -524,7 +524,7 @@ class HotCinemaScraper(BaseScraper):
                         "hall": "",
                         "format": entry_format,
                         "language": language,
-                        "booking_url": f"{TICKETS_URL}/site/hotcinema/{theater_id}/{event_id}",
+                        "booking_url": "",
                     })
                 except Exception as e:
                     logger.debug(f"[Hot Cinema] Failed to parse date entry for '{movie_title}': {e}")
@@ -630,7 +630,7 @@ class HotCinemaScraper(BaseScraper):
                                 "hall": "",
                                 "format": entry_format,
                                 "language": language,
-                                "booking_url": f"{TICKETS_URL}/site/hotcinema/{theater_id}/{event_id}",
+                                "booking_url": "",
                             })
                         except Exception:
                             continue
@@ -690,6 +690,140 @@ class HotCinemaScraper(BaseScraper):
         except Exception as e:
             logger.warning(f"Movie detail scrape failed for {movie_path}: {e}")
         return None
+
+    # ------------------------------------------------------------------
+    # Extract booking URLs from movie page DOM
+    # ------------------------------------------------------------------
+
+    async def _extract_booking_urls_from_movie_page(
+        self, page: Page, movie_url: str, movie_title: str
+    ) -> list[dict]:
+        """Navigate to movie page and extract ticket booking URLs from the DOM.
+
+        Returns list of dicts with keys: booking_url, time_text, context_text.
+        The booking URLs point to tickets.hotcinema.co.il/site/{id}.
+        """
+        results: list[dict] = []
+        try:
+            await self._open_url(page, movie_url, wait_for_network=True)
+            await asyncio.sleep(2)
+            # Scroll to trigger dynamic loading of screening section
+            await page.evaluate("window.scrollBy(0, 800)")
+            await asyncio.sleep(2)
+            await page.evaluate("window.scrollBy(0, 500)")
+            await asyncio.sleep(1)
+
+            # Strategy 1: Find <a> links to tickets.hotcinema.co.il
+            ticket_links = await page.query_selector_all(
+                'a[href*="tickets.hotcinema.co.il"]'
+            )
+            for link in ticket_links:
+                try:
+                    href = await link.get_attribute("href") or ""
+                    if not href or "/site/" not in href:
+                        continue
+                    link_text = (await link.inner_text()).strip()
+                    # Get parent context for matching
+                    context_text = ""
+                    try:
+                        parent = await link.evaluate_handle("el => el.closest('[class*=\"screening\"], [class*=\"show\"], [class*=\"time\"], tr, li, [class*=\"event\"]')")
+                        if parent:
+                            context_text = (await parent.inner_text())[:200].strip()
+                    except Exception:
+                        pass
+                    results.append({
+                        "booking_url": href,
+                        "time_text": link_text,
+                        "context_text": context_text,
+                    })
+                except Exception:
+                    continue
+
+            # Strategy 2: Check onclick handlers if no href links found
+            if not results:
+                buttons = await page.query_selector_all(
+                    '[onclick*="tickets"], [data-url*="tickets"], '
+                    '[data-href*="tickets"], [data-booking-url]'
+                )
+                for btn in buttons:
+                    try:
+                        onclick = await btn.get_attribute("onclick") or ""
+                        data_url = (
+                            await btn.get_attribute("data-url")
+                            or await btn.get_attribute("data-href")
+                            or await btn.get_attribute("data-booking-url")
+                            or ""
+                        )
+                        raw = data_url or onclick
+                        match = re.search(
+                            r'https?://tickets\.hotcinema\.co\.il/site/\d+', raw
+                        )
+                        if match:
+                            btn_text = (await btn.inner_text()).strip()
+                            results.append({
+                                "booking_url": match.group(0),
+                                "time_text": btn_text,
+                                "context_text": "",
+                            })
+                    except Exception:
+                        continue
+
+            # Strategy 3: Intercept navigation - click first showtime and capture redirect
+            if not results:
+                showtime_selectors = [
+                    '[class*="showtime"] a, [class*="Showtime"] a',
+                    '[class*="screening"] a, [class*="Screening"] a',
+                    '[class*="time-slot"] a, [class*="TimeSlot"] a',
+                    '[class*="hour"] a, [class*="Hour"] a',
+                ]
+                for sel in showtime_selectors:
+                    links = await page.query_selector_all(sel)
+                    for link in links:
+                        try:
+                            href = await link.get_attribute("href") or ""
+                            if "tickets" in href or "/site/" in href:
+                                results.append({
+                                    "booking_url": href,
+                                    "time_text": (await link.inner_text()).strip(),
+                                    "context_text": "",
+                                })
+                        except Exception:
+                            continue
+                    if results:
+                        break
+
+            # Log what we found for debugging
+            if results:
+                logger.info(
+                    f"[Hot Cinema] '{movie_title}': found {len(results)} booking URLs on movie page"
+                )
+                for r in results[:3]:
+                    logger.warning(
+                        f"[Hot Cinema] Booking URL from page: {r['booking_url']} "
+                        f"(text: {r['time_text'][:50]})"
+                    )
+            else:
+                # Dump page info for debugging
+                all_links = await page.query_selector_all("a[href]")
+                hrefs = []
+                for a in all_links[:30]:
+                    try:
+                        h = await a.get_attribute("href") or ""
+                        if h and "hotcinema" in h:
+                            hrefs.append(h)
+                    except Exception:
+                        continue
+                logger.warning(
+                    f"[Hot Cinema] '{movie_title}': no booking URLs found. "
+                    f"Links with 'hotcinema': {hrefs[:10]}"
+                )
+
+        except Exception as e:
+            logger.warning(
+                f"[Hot Cinema] Failed to extract booking URLs from {movie_url}: {e}"
+            )
+
+        return results
 
     # ------------------------------------------------------------------
     # Navigate ticket purchase flow to reach seat map
@@ -955,8 +1089,34 @@ class HotCinemaScraper(BaseScraper):
             screening_counter = 0
             for title, url, mid in movie_list:
                 screening_infos = await self._fetch_screenings_api(page, mid, title, days=7)
-
                 future_infos = [i for i in screening_infos if i["showtime"] >= datetime.now()]
+
+                if not future_infos:
+                    continue
+
+                # Extract booking URLs from the movie page DOM
+                booking_links = await self._extract_booking_urls_from_movie_page(
+                    page, url, title
+                )
+
+                # Try to match booking URLs to screenings by time text
+                # Build a pool of unmatched booking URLs
+                available_urls = [b["booking_url"] for b in booking_links]
+                matched_urls: dict[int, str] = {}  # idx -> booking_url
+
+                for idx, info in enumerate(future_infos):
+                    time_str = info["showtime"].strftime("%H:%M")
+                    for bl in booking_links:
+                        if time_str in bl.get("time_text", "") or time_str in bl.get("context_text", ""):
+                            if bl["booking_url"] not in matched_urls.values():
+                                matched_urls[idx] = bl["booking_url"]
+                                break
+
+                # If no matching by time, assign sequentially
+                if not matched_urls and available_urls:
+                    for idx in range(min(len(future_infos), len(available_urls))):
+                        matched_urls[idx] = available_urls[idx]
+
                 for idx, info in enumerate(future_infos):
                     screening_counter += 1
                     if on_progress:
@@ -965,7 +1125,7 @@ class HotCinemaScraper(BaseScraper):
                     total_seats = 200
                     tickets_sold = 0
 
-                    booking_url = info.get("booking_url", "")
+                    booking_url = matched_urls.get(idx, "")
                     if booking_url:
                         try:
                             total, sold = await self._navigate_to_seat_map(page, booking_url)
