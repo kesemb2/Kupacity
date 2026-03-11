@@ -1360,7 +1360,7 @@ class HotCinemaScraper(BaseScraper):
         return result
 
     # Testing limit — set to None for full scrape
-    _TEST_MOVIE_LIMIT = None
+    _TEST_MOVIE_LIMIT = 10
 
     async def scrape_screenings(self, on_progress=None) -> list[ScrapedScreening]:
         """Daily: fetch screenings via API (seat counts deferred to ticket updates)."""
