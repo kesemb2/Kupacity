@@ -1,0 +1,29 @@
+services:
+  # Backend API (FastAPI)
+  - type: web
+    name: cinema-api
+    runtime: docker
+    rootDir: backend
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: PORT
+        value: "8000"
+      # Optional: residential proxy for SeleniumBase UC mode scraping
+      # Uncomment and set via Render dashboard → Environment
+      # - key: SCRAPER_PROXY_SERVER
+      #   sync: false           # keep secret, don't sync across services
+      # - key: SCRAPER_PROXY_USERNAME
+      #   sync: false
+      # - key: SCRAPER_PROXY_PASSWORD
+      #   sync: false
+
+  # Frontend Dashboard (React static site)
+  - type: web
+    name: cinema-dashboard
+    runtime: static
+    rootDir: frontend
+    buildCommand: npm install && npm run build
+    staticPublishPath: build
+    envVars:
+      - key: REACT_APP_API_URL
+        value: "https://cinema-back-kjkx.onrender.com"
