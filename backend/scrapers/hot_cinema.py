@@ -281,9 +281,50 @@ class HotCinemaScraper(BaseScraper):
                 f"colors: {seat_data.get('colorSamples', {})}"
             )
         else:
+            # Log DOM info to help diagnose what elements exist on the page
+            dom_info = await page.evaluate("""() => {
+                const url = window.location.href;
+                const allEls = document.querySelectorAll('*');
+                const tagCounts = {};
+                for (const el of allEls) {
+                    tagCounts[el.tagName] = (tagCounts[el.tagName] || 0) + 1;
+                }
+
+                // Look for any seat-like elements by various patterns
+                const seatLike = [];
+                for (const el of allEls) {
+                    const cls = (el.className || '').toString().toLowerCase();
+                    const id = (el.id || '').toLowerCase();
+                    if (cls.includes('seat') || cls.includes('chair') || cls.includes('place')
+                        || cls.includes('מקום') || cls.includes('כיסא')
+                        || id.includes('seat') || id.includes('chair')) {
+                        seatLike.push({
+                            tag: el.tagName,
+                            cls: cls.substring(0, 80),
+                            id: id.substring(0, 40),
+                            children: el.children.length,
+                        });
+                    }
+                }
+
+                // Count SVG elements
+                const svgEls = document.querySelectorAll('svg, svg *');
+
+                // Check for canvas
+                const canvasEls = document.querySelectorAll('canvas');
+
+                return {
+                    url,
+                    totalElements: allEls.length,
+                    svgElements: svgEls.length,
+                    canvasElements: canvasEls.length,
+                    seatLikeElements: seatLike.slice(0, 10),
+                    bodyTextPreview: document.body ? document.body.innerText.substring(0, 300) : '',
+                };
+            }""")
             logger.warning(
-                f"[Hot Cinema] No seat elements found via selectors. "
-                f"seat_data={seat_data}"
+                f"[Hot Cinema] No seat elements found. "
+                f"seat_data={seat_data} dom_info={dom_info}"
             )
 
         # Fallback: look for text-based seat info
@@ -294,10 +335,14 @@ class HotCinemaScraper(BaseScraper):
                 if remaining_match:
                     total = int(remaining_match.group(1))
                     sold = 0
-                ratio_match = re.search(r"(\d+)\s*/\s*(\d+)", body_text)
+                # Look for "X/Y מקומות" or similar seat ratio - must have context
+                # to avoid matching dates like "11/3"
+                ratio_match = re.search(r"(\d+)\s*/\s*(\d+)\s*(?:מקומות|כיסאות|seats)", body_text)
                 if ratio_match:
-                    sold = int(ratio_match.group(1))
-                    total = int(ratio_match.group(2))
+                    s, t = int(ratio_match.group(1)), int(ratio_match.group(2))
+                    if t >= s and t >= 10:  # sanity: total >= sold, reasonable hall size
+                        sold = s
+                        total = t
             except Exception:
                 pass
 
@@ -991,47 +1036,145 @@ class HotCinemaScraper(BaseScraper):
                 await self._open_url(page, booking_url, wait_for_network=True)
                 await asyncio.sleep(4)
 
+            # Log page structure for debugging
+            page_info = await page.evaluate("""() => {
+                const body = document.body;
+                if (!body) return {error: 'no body'};
+
+                // Collect all visible buttons/clickable elements
+                const clickables = [];
+                for (const el of document.querySelectorAll('button, a, [role="button"], input[type="button"], input[type="submit"]')) {
+                    const rect = el.getBoundingClientRect();
+                    if (rect.width > 0 && rect.height > 0) {
+                        clickables.push({
+                            tag: el.tagName,
+                            text: el.textContent.trim().substring(0, 60),
+                            cls: (el.className || '').toString().substring(0, 80),
+                            href: (el.href || '').substring(0, 80),
+                        });
+                    }
+                }
+
+                // Check for any elements containing "+"
+                const plusEls = [];
+                for (const el of document.querySelectorAll('*')) {
+                    if (el.children.length === 0 && el.textContent.trim() === '+') {
+                        const rect = el.getBoundingClientRect();
+                        if (rect.width > 0 && rect.height > 0) {
+                            plusEls.push({
+                                tag: el.tagName,
+                                cls: (el.className || '').toString().substring(0, 80),
+                                parent: el.parentElement ? el.parentElement.tagName + '.' + (el.parentElement.className || '').toString().substring(0, 40) : '',
+                            });
+                        }
+                    }
+                }
+
+                return {
+                    url: window.location.href,
+                    title: document.title,
+                    clickableCount: clickables.length,
+                    clickables: clickables.slice(0, 20),
+                    plusElements: plusEls.slice(0, 5),
+                    bodyText: body.innerText.substring(0, 500),
+                };
+            }""")
+            logger.warning(f"[Hot Cinema] Ticket page structure: {page_info}")
+
             # Click the first "+" button to add a regular ticket
-            # The page has rows: [ticket_type] [price] [+] [0] [-]
+            # Try multiple strategies to find the + button
             plus_clicked = await page.evaluate("""() => {
-                // Find all elements with just "+" text
-                const allEls = document.querySelectorAll('button, a, span, div, [role="button"]');
-                for (const el of allEls) {
-                    const text = el.textContent.trim();
-                    if (text === '+' || text === '＋') {
+                // Strategy 1: leaf elements with just "+" text
+                for (const el of document.querySelectorAll('*')) {
+                    if (el.children.length === 0 && el.textContent.trim() === '+') {
                         const rect = el.getBoundingClientRect();
                         if (rect.width > 0 && rect.height > 0 && rect.width < 200) {
                             el.scrollIntoView({block: 'center'});
                             el.click();
-                            return true;
+                            return 'leaf:' + el.tagName;
                         }
                     }
                 }
+
+                // Strategy 2: buttons/clickables with "+" text (including parent)
+                for (const el of document.querySelectorAll('button, a, span, div, [role="button"], i, svg')) {
+                    const text = el.textContent.trim();
+                    if (text === '+' || text === '＋' || text === '+1') {
+                        const rect = el.getBoundingClientRect();
+                        if (rect.width > 0 && rect.height > 0 && rect.width < 200) {
+                            el.scrollIntoView({block: 'center'});
+                            el.click();
+                            return 'clickable:' + el.tagName;
+                        }
+                    }
+                }
+
+                // Strategy 3: aria-label or title containing "add" or "plus" or "הוסף"
+                for (const el of document.querySelectorAll('[aria-label*="add" i], [aria-label*="plus" i], [aria-label*="הוסף"], [title*="הוסף"]')) {
+                    const rect = el.getBoundingClientRect();
+                    if (rect.width > 0 && rect.height > 0) {
+                        el.scrollIntoView({block: 'center'});
+                        el.click();
+                        return 'aria:' + el.tagName;
+                    }
+                }
+
+                // Strategy 4: class names containing "plus", "add", "increase", "increment"
+                for (const el of document.querySelectorAll('[class*="plus"], [class*="Plus"], [class*="add"], [class*="Add"], [class*="increase"], [class*="increment"], [class*="Increment"]')) {
+                    const rect = el.getBoundingClientRect();
+                    if (rect.width > 0 && rect.height > 0 && rect.width < 200) {
+                        el.scrollIntoView({block: 'center'});
+                        el.click();
+                        return 'class:' + el.tagName + '.' + el.className;
+                    }
+                }
+
                 return false;
             }""")
 
             if plus_clicked:
-                logger.info("[Hot Cinema] Seat map: clicked + button")
-                await asyncio.sleep(1)
+                logger.info(f"[Hot Cinema] Seat map: clicked + button via {plus_clicked}")
+                await asyncio.sleep(2)
             else:
                 logger.warning("[Hot Cinema] Seat map: could not find + button")
 
             # Click "המשך" (continue) button
             proceed_clicked = await page.evaluate("""() => {
-                const allEls = document.querySelectorAll('button, a, [role="button"]');
-                for (const el of allEls) {
+                // Strategy 1: exact text match
+                for (const el of document.querySelectorAll('button, a, [role="button"], input[type="submit"]')) {
                     const text = el.textContent.trim();
-                    if (text === 'המשך' || text.includes('המשך')) {
+                    if (text === 'המשך' || text === 'המשך לבחירת מושבים') {
                         el.scrollIntoView({block: 'center'});
                         el.click();
-                        return true;
+                        return 'exact:' + el.tagName;
                     }
                 }
+
+                // Strategy 2: contains המשך
+                for (const el of document.querySelectorAll('button, a, [role="button"]')) {
+                    const text = el.textContent.trim();
+                    if (text.includes('המשך')) {
+                        el.scrollIntoView({block: 'center'});
+                        el.click();
+                        return 'contains:' + el.tagName;
+                    }
+                }
+
+                // Strategy 3: any "continue" / "next" / "proceed" button
+                for (const el of document.querySelectorAll('button, a, [role="button"]')) {
+                    const text = el.textContent.trim().toLowerCase();
+                    if (text === 'continue' || text === 'next' || text === 'proceed') {
+                        el.scrollIntoView({block: 'center'});
+                        el.click();
+                        return 'en:' + el.tagName;
+                    }
+                }
+
                 return false;
             }""")
 
             if proceed_clicked:
-                logger.info("[Hot Cinema] Seat map: clicked המשך button")
+                logger.info(f"[Hot Cinema] Seat map: clicked המשך button via {proceed_clicked}")
                 await asyncio.sleep(2)
                 try:
                     await page.wait_for_load_state("networkidle", timeout=10000)
