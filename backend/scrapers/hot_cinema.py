@@ -773,42 +773,29 @@ class HotCinemaScraper(BaseScraper):
 
             # Strategy 3: Click showtime <a> elements and intercept popup/navigation
             if not results:
-                # Find <a> tags whose href ends with # and text is a time (HH:MM)
-                # These are the showtime links handled by React/JS click handlers
-                showtime_anchors = await page.evaluate("""() => {
-                    const results = [];
+                # Scroll to top first, then find showtime anchors
+                await page.evaluate("window.scrollTo(0, 0)")
+                await asyncio.sleep(1)
+
+                # Count how many showtime <a> tags exist (href with # and HH:MM text)
+                num_showtimes = await page.evaluate("""() => {
                     const timePattern = /^\\d{2}:\\d{2}$/;
-                    const anchors = document.querySelectorAll('a');
-                    for (const a of anchors) {
-                        const text = a.textContent.trim();
-                        const href = a.href || '';
-                        // Showtime <a> tags have href ending in # and time-like text
-                        if (timePattern.test(text) && href.includes('#')) {
-                            const rect = a.getBoundingClientRect();
-                            if (rect.width > 0 && rect.height > 0) {
-                                results.push({
-                                    text: text,
-                                    href: href,
-                                    index: results.length,
-                                    x: Math.round(rect.x + rect.width / 2),
-                                    y: Math.round(rect.y + rect.height / 2),
-                                });
-                            }
-                        }
-                        if (results.length >= 40) break;
+                    let count = 0;
+                    for (const a of document.querySelectorAll('a')) {
+                        if (timePattern.test(a.textContent.trim()) && (a.href || '').includes('#'))
+                            count++;
                     }
-                    return results;
+                    return count;
                 }""")
 
                 logger.warning(
-                    f"[Hot Cinema] '{movie_title}' showtime <a> elements: "
-                    f"{showtime_anchors[:10]}"
+                    f"[Hot Cinema] '{movie_title}': found {num_showtimes} showtime anchors"
                 )
 
-                # Click each showtime anchor and capture popup/navigation
-                for anchor_info in showtime_anchors[:15]:
-                    time_text = anchor_info["text"]
+                # Click each showtime using JS scrollIntoView + click
+                for i in range(min(num_showtimes, 15)):
                     captured_urls: list[str] = []
+                    intercepted_urls: list[str] = []
 
                     async def on_popup(popup_page):
                         try:
@@ -823,31 +810,42 @@ class HotCinemaScraper(BaseScraper):
                         except Exception:
                             pass
 
-                    intercepted_urls: list[str] = []
-
                     async def intercept_tickets(route):
-                        url = route.request.url
-                        intercepted_urls.append(url)
-                        logger.warning(f"[Hot Cinema] Intercepted: {url}")
+                        intercepted_urls.append(route.request.url)
+                        logger.warning(f"[Hot Cinema] Intercepted: {route.request.url}")
                         await route.abort()
 
                     page.on("popup", on_popup)
                     await page.route("**/tickets.hotcinema.co.il/**", intercept_tickets)
 
-                    try:
-                        # Click by coordinates to avoid matching wrong elements
-                        await page.mouse.click(anchor_info["x"], anchor_info["y"])
-                        await asyncio.sleep(3)
+                    # Use JS to find the i-th showtime anchor, scroll to it, and click
+                    click_result = await page.evaluate(f"""(index) => {{
+                        const timePattern = /^\\d{{2}}:\\d{{2}}$/;
+                        const showtimes = [];
+                        for (const a of document.querySelectorAll('a')) {{
+                            if (timePattern.test(a.textContent.trim()) && (a.href || '').includes('#'))
+                                showtimes.push(a);
+                        }}
+                        if (index >= showtimes.length) return null;
+                        const el = showtimes[index];
+                        el.scrollIntoView({{ block: 'center' }});
+                        const text = el.textContent.trim();
+                        el.click();
+                        return text;
+                    }}""", i)
 
-                        # Check if main page navigated
-                        current_url = page.url
-                        if "tickets.hotcinema.co.il" in current_url:
-                            captured_urls.append(current_url)
+                    if click_result is None:
+                        break
 
-                    except Exception as e:
-                        logger.warning(
-                            f"[Hot Cinema] Click on '{time_text}' failed: {e}"
-                        )
+                    time_text = click_result
+                    logger.info(f"[Hot Cinema] Clicked showtime #{i}: '{time_text}'")
+                    await asyncio.sleep(3)
+
+                    # Check if main page navigated
+                    current_url = page.url
+                    if "tickets.hotcinema.co.il" in current_url:
+                        captured_urls.append(current_url)
+                        logger.warning(f"[Hot Cinema] Page navigated to: {current_url}")
 
                     page.remove_listener("popup", on_popup)
                     await page.unroute("**/tickets.hotcinema.co.il/**")
@@ -874,8 +872,6 @@ class HotCinemaScraper(BaseScraper):
                     # If page navigated away, go back to movie page
                     if "movie/" not in page.url:
                         await self._open_url(page, movie_url, wait_for_network=True)
-                        await asyncio.sleep(2)
-                        await page.evaluate("window.scrollBy(0, 800)")
                         await asyncio.sleep(2)
             # Log results
             if results:
