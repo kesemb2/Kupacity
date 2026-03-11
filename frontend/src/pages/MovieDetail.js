@@ -30,7 +30,7 @@ function MovieDetail({ movieId, onBack }) {
     return <div style={{ textAlign: 'center', padding: 60, color: '#ef4444' }}>סרט לא נמצא</div>;
   }
 
-  const { movie, by_cinema, by_date } = data;
+  const { movie, by_cinema, by_date, screenings } = data;
 
   const totalTickets = by_cinema.reduce((s, c) => s + c.tickets_sold, 0);
   const totalScreenings = by_cinema.reduce((s, c) => s + c.screenings, 0);
@@ -142,6 +142,72 @@ function MovieDetail({ movieId, onBack }) {
       {/* Cinema Table */}
       <h3 style={{ fontSize: 18, fontWeight: 600, marginBottom: 12 }}>פירוט לפי סניפים</h3>
       <DataTable columns={cinemaColumns} data={by_cinema} />
+
+      {/* Individual Screenings Table */}
+      {screenings && screenings.length > 0 && (
+        <>
+          <h3 style={{ fontSize: 18, fontWeight: 600, marginBottom: 12, marginTop: 24 }}>פירוט הקרנות</h3>
+          <DataTable
+            columns={[
+              {
+                header: 'תאריך',
+                render: r => {
+                  if (!r.showtime) return '-';
+                  const d = new Date(r.showtime);
+                  return d.toLocaleDateString('he-IL', { day: '2-digit', month: '2-digit' });
+                },
+                align: 'center',
+              },
+              {
+                header: 'שעה',
+                render: r => {
+                  if (!r.showtime) return '-';
+                  const d = new Date(r.showtime);
+                  return d.toLocaleTimeString('he-IL', { hour: '2-digit', minute: '2-digit' });
+                },
+                align: 'center',
+              },
+              { header: 'סניף', key: 'cinema' },
+              { header: 'עיר', key: 'city' },
+              { header: 'אולם', key: 'hall', align: 'center' },
+              { header: 'פורמט', key: 'format', align: 'center' },
+              {
+                header: 'סה"כ מקומות',
+                render: r => formatNumber(r.total_seats),
+                align: 'center',
+              },
+              {
+                header: 'נמכרו',
+                render: r => (
+                  <span style={{ color: r.tickets_sold > 0 ? '#f59e0b' : '#64748b', fontWeight: 600 }}>
+                    {formatNumber(r.tickets_sold)}
+                  </span>
+                ),
+                align: 'center',
+              },
+              {
+                header: 'תפוסה',
+                render: r => {
+                  const occ = r.occupancy || 0;
+                  const color = occ > 75 ? '#ef4444' : occ > 40 ? '#f59e0b' : '#22c55e';
+                  return (
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 6, justifyContent: 'center' }}>
+                      <div style={{
+                        width: 50, height: 6, background: '#334155', borderRadius: 3, overflow: 'hidden',
+                      }}>
+                        <div style={{ width: `${Math.min(occ, 100)}%`, height: '100%', background: color, borderRadius: 3 }} />
+                      </div>
+                      <span style={{ color, fontSize: 12, fontWeight: 600 }}>{occ}%</span>
+                    </div>
+                  );
+                },
+                align: 'center',
+              },
+            ]}
+            data={screenings}
+          />
+        </>
+      )}
     </div>
   );
 }

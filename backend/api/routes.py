@@ -122,6 +122,15 @@ def get_movie_detail(movie_id: int, db: Session = Depends(get_db)):
         .all()
     )
 
+    # Individual screenings with seat data
+    screenings = (
+        db.query(Screening, Cinema.name, Cinema.city)
+        .join(Cinema, Screening.cinema_id == Cinema.id)
+        .filter(Screening.movie_id == movie_id)
+        .order_by(Screening.showtime)
+        .all()
+    )
+
     return {
         "movie": {
             "id": movie.id,
@@ -145,6 +154,21 @@ def get_movie_detail(movie_id: int, db: Session = Depends(get_db)):
         "by_date": [
             {"date": str(d), "tickets_sold": t, "screenings": s}
             for d, t, s in by_date
+        ],
+        "screenings": [
+            {
+                "id": scr.id,
+                "cinema": cname,
+                "city": ccity,
+                "showtime": scr.showtime.isoformat() if scr.showtime else None,
+                "hall": scr.hall or "",
+                "format": scr.format or "",
+                "total_seats": scr.total_seats or 0,
+                "tickets_sold": scr.tickets_sold or 0,
+                "occupancy": round((scr.tickets_sold or 0) * 100 / scr.total_seats, 1) if scr.total_seats else 0,
+                "status": scr.status or "active",
+            }
+            for scr, cname, ccity in screenings
         ],
     }
 
