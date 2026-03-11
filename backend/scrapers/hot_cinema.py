@@ -211,113 +211,122 @@ class HotCinemaScraper(BaseScraper):
         # Wait a bit for seat map to render (Angular SPA)
         await asyncio.sleep(2)
 
-        # Hot Cinema seat map: colored rectangles in a grid layout
-        # Green = available (זמין), Gray = sold (הוזמן), Orange = your selection
-        # There's a legend at the bottom with sample squares - exclude those.
-        # Strategy: find all small, similarly-sized elements with green or gray
-        # background colors that sit above the legend area.
+        # Hot Cinema seat map uses SVG elements for seats.
+        # Green fill = available (זמין), Gray fill = sold (הוזמן)
+        # Legend at bottom has sample squares that should be excluded.
+        # The seat plan lives inside .seat-plan--inner-view > svg
         seat_data = await page.evaluate("""() => {
-            // Helper: parse rgb/rgba string to {r,g,b,a}
+            // Helper: parse color string (rgb, rgba, hex, or named) to {r,g,b}
             function parseColor(c) {
-                if (!c) return null;
-                let m = c.match(/rgba?\\((\\d+),\\s*(\\d+),\\s*(\\d+)(?:,\\s*([\\d.]+))?\\)/);
-                if (!m) return null;
-                return {
-                    r: parseInt(m[1]), g: parseInt(m[2]), b: parseInt(m[3]),
-                    a: m[4] !== undefined ? parseFloat(m[4]) : 1
-                };
+                if (!c || c === 'none' || c === 'transparent') return null;
+                // rgb/rgba
+                let m = c.match(/rgba?\\((\\d+),\\s*(\\d+),\\s*(\\d+)/);
+                if (m) return {r: parseInt(m[1]), g: parseInt(m[2]), b: parseInt(m[3])};
+                // hex
+                m = c.match(/^#([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})/i);
+                if (m) return {r: parseInt(m[1],16), g: parseInt(m[2],16), b: parseInt(m[3],16)};
+                // Short hex
+                m = c.match(/^#([0-9a-f])([0-9a-f])([0-9a-f])$/i);
+                if (m) return {r: parseInt(m[1]+m[1],16), g: parseInt(m[2]+m[2],16), b: parseInt(m[3]+m[3],16)};
+                return null;
             }
 
             function isGreenish(c) {
-                // Green seats: high G, lower R and B
-                return c && c.a > 0.5 && c.g > 100 && c.g > c.r * 1.3 && c.g > c.b * 1.3;
+                return c && c.g > 80 && c.g > c.r * 1.2 && c.g > c.b * 1.2;
             }
 
             function isGrayish(c) {
-                // Gray/dark seats (sold): similar R/G/B, not too bright
-                return c && c.a > 0.5
-                    && Math.abs(c.r - c.g) < 40 && Math.abs(c.g - c.b) < 40
-                    && c.r > 50 && c.r < 200;
+                return c && Math.abs(c.r - c.g) < 40 && Math.abs(c.g - c.b) < 40
+                    && c.r > 50 && c.r < 210;
             }
 
-            // Scan ALL leaf-ish elements for seat-sized colored rectangles
+            // Strategy 1: Find SVG rect elements inside the seat plan
+            // The seat plan container has class 'seat-plan--inner-view'
+            const seatPlan = document.querySelector('.seat-plan--inner-view')
+                          || document.querySelector('.seat-plan--inner')
+                          || document.querySelector('.seat-plan');
+
+            let svgRects = [];
+            if (seatPlan) {
+                svgRects = Array.from(seatPlan.querySelectorAll('svg rect'));
+            }
+            if (svgRects.length < 5) {
+                // Fallback: all SVG rects on page
+                svgRects = Array.from(document.querySelectorAll('svg rect'));
+            }
+
+            // Filter to seat-sized rects and get their fill colors
             const candidates = [];
-            const allEls = document.querySelectorAll('div, span, td, li, a, button, rect, circle');
-            for (const el of allEls) {
-                const rect = el.getBoundingClientRect();
-                // Seat-sized: roughly square-ish, between 15px and 80px
-                if (rect.width < 15 || rect.width > 80 || rect.height < 15 || rect.height > 80)
+            for (const el of svgRects) {
+                const bbox = el.getBoundingClientRect();
+                // Seat-sized: 10-60px, roughly square
+                if (bbox.width < 8 || bbox.width > 80 || bbox.height < 8 || bbox.height > 80)
                     continue;
-                // Aspect ratio roughly square (0.5 to 2.0)
-                const aspect = rect.width / rect.height;
-                if (aspect < 0.4 || aspect > 2.5)
+                const aspect = bbox.width / bbox.height;
+                if (aspect < 0.3 || aspect > 3.0)
                     continue;
 
-                const style = window.getComputedStyle(el);
-                const bg = parseColor(style.backgroundColor);
-                if (!bg || bg.a < 0.5) continue;
+                // Get fill color: try attribute first, then computed style
+                let fillStr = el.getAttribute('fill');
+                if (!fillStr || fillStr === 'none') {
+                    const style = window.getComputedStyle(el);
+                    fillStr = style.fill;
+                }
+                const color = parseColor(fillStr);
+                if (!color) continue;
 
-                // Must be green or gray (not white, not transparent)
-                if (!isGreenish(bg) && !isGrayish(bg)) continue;
+                // Only keep green or gray seats (skip white, black, transparent)
+                if (!isGreenish(color) && !isGrayish(color)) continue;
 
                 candidates.push({
-                    el,
-                    rect,
-                    bg,
-                    isGreen: isGreenish(bg),
-                    isGray: isGrayish(bg),
-                    cls: (el.className || '').toString(),
+                    rect: bbox,
+                    color,
+                    fillStr,
+                    isGreen: isGreenish(color),
+                    isGray: isGrayish(color),
                 });
             }
 
-            if (candidates.length < 5)
-                return {total: candidates.length, sold: 0, error: 'too_few_candidates',
-                        count: candidates.length,
-                        sample: candidates.slice(0, 3).map(c => ({
-                            tag: c.el.tagName,
-                            cls: c.cls.substring(0, 60),
-                            w: Math.round(c.rect.width),
-                            h: Math.round(c.rect.height),
-                            y: Math.round(c.rect.top),
-                            bg: `rgb(${c.bg.r},${c.bg.g},${c.bg.b})`,
-                        }))};
+            if (candidates.length < 5) {
+                // Debug: sample some SVG rects to understand the structure
+                const debugRects = svgRects.slice(0, 10).map(el => {
+                    const bbox = el.getBoundingClientRect();
+                    const fill = el.getAttribute('fill') || window.getComputedStyle(el).fill;
+                    return {
+                        w: Math.round(bbox.width), h: Math.round(bbox.height),
+                        fill: fill ? fill.substring(0, 30) : 'none',
+                        cls: (el.getAttribute('class') || '').substring(0, 40),
+                        y: Math.round(bbox.top),
+                    };
+                });
+                return {total: 0, sold: 0, error: 'too_few_svg_seats',
+                        svgRectsTotal: svgRects.length,
+                        candidateCount: candidates.length,
+                        debugRects};
+            }
 
-            // Find the main seat area: most candidates should be above the legend
-            // Sort by Y position, find the gap between seat area and legend
+            // Exclude legend: find largest Y gap among candidates
             const ys = candidates.map(c => c.rect.top).sort((a, b) => a - b);
-            // Use the cluster: seats are typically in a tight vertical range
-            // Legend items are at the very bottom, separated by a gap
-            // Find largest gap in Y positions
             let maxGap = 0, gapY = Infinity;
             for (let i = 1; i < ys.length; i++) {
                 const gap = ys[i] - ys[i - 1];
-                if (gap > maxGap) {
-                    maxGap = gap;
-                    gapY = ys[i];
-                }
+                if (gap > maxGap) { maxGap = gap; gapY = ys[i]; }
             }
-
-            // If there's a significant gap (>50px), exclude elements below it
-            // This removes legend items
             const cutoffY = maxGap > 50 ? gapY : Infinity;
 
-            let totalCount = 0;
-            let soldCount = 0;
+            let totalCount = 0, soldCount = 0;
             const colorSamples = {};
 
             for (const c of candidates) {
-                if (c.rect.top >= cutoffY) continue;  // skip legend
-
+                if (c.rect.top >= cutoffY) continue;
                 totalCount++;
-                const colorKey = `rgb(${c.bg.r},${c.bg.g},${c.bg.b})`;
-                colorSamples[colorKey] = (colorSamples[colorKey] || 0) + 1;
-
+                const key = c.fillStr || `rgb(${c.color.r},${c.color.g},${c.color.b})`;
+                colorSamples[key] = (colorSamples[key] || 0) + 1;
                 if (c.isGray) soldCount++;
             }
 
             return {
-                total: totalCount,
-                sold: soldCount,
+                total: totalCount, sold: soldCount,
                 colorSamples,
                 candidatesTotal: candidates.length,
                 cutoffY: cutoffY === Infinity ? 'none' : Math.round(cutoffY),
