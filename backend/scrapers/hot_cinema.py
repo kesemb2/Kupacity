@@ -562,15 +562,15 @@ class HotCinemaScraper(BaseScraper):
                 # Log first theater's raw keys to discover URL fields
                 if theaters and day_offset == 0:
                     first = theaters[0]
-                    logger.info(f"[Hot Cinema] API theater keys: {list(first.keys())}")
+                    logger.warning(f"[Hot Cinema] API theater keys: {list(first.keys())}")
                     if first.get("Dates"):
                         first_date = first["Dates"][0]
-                        logger.info(f"[Hot Cinema] API date entry keys: {list(first_date.keys())}")
-                        logger.info(f"[Hot Cinema] API sample: TheaterID={first.get('TheaterID')}, "
-                                    f"EventId={first_date.get('EventId')}, "
-                                    f"Url={first_date.get('Url', 'N/A')}, "
-                                    f"BookingUrl={first_date.get('BookingUrl', 'N/A')}, "
-                                    f"Link={first_date.get('Link', 'N/A')}")
+                        logger.warning(f"[Hot Cinema] API date entry keys: {list(first_date.keys())}")
+                        logger.warning(f"[Hot Cinema] API sample: TheaterID={first.get('TheaterID')}, "
+                                       f"EventId={first_date.get('EventId')}, "
+                                       f"Url={first_date.get('Url', 'N/A')}, "
+                                       f"BookingUrl={first_date.get('BookingUrl', 'N/A')}, "
+                                       f"Link={first_date.get('Link', 'N/A')}")
 
                 for theater in theaters:
                     theater_name = theater.get("TheaterName", "")
@@ -702,11 +702,12 @@ class HotCinemaScraper(BaseScraper):
         Domain: tickets.hotcinema.co.il
         """
         try:
+            logger.warning(f"[Hot Cinema] Seat map: navigating to {booking_url}")
             await self._open_url(page, booking_url, wait_for_network=True)
             await asyncio.sleep(4)  # SPA needs time to render
 
             current_url = page.url
-            logger.info(f"[Hot Cinema] Seat map: loaded {current_url}")
+            logger.warning(f"[Hot Cinema] Seat map: loaded {current_url}")
 
             # Save debug screenshot of ticket page
             try:
