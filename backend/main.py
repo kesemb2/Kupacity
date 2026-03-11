@@ -17,6 +17,21 @@ from api.routes import router
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+
+# ---------------------------------------------------------------------------
+# Silence noisy polling endpoints in uvicorn access log
+# ---------------------------------------------------------------------------
+class _QuietPollFilter(logging.Filter):
+    """Drop access-log lines for high-frequency polling endpoints."""
+    _NOISY = ("/api/scrape-logs",)
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = record.getMessage()
+        return not any(ep in msg for ep in self._NOISY)
+
+
+logging.getLogger("uvicorn.access").addFilter(_QuietPollFilter())
+
 # Scraper proxy – set these env vars on your hosting provider (e.g. Render)
 # to route SeleniumBase UC mode traffic through a residential/rotating proxy:
 #   SCRAPER_PROXY_SERVER   = "http://proxy-host:port"
