@@ -211,23 +211,17 @@ class HotCinemaScraper(BaseScraper):
         # Wait a bit for seat map to render (Angular SPA)
         await asyncio.sleep(2)
 
-        # Hot Cinema seat map uses SVG elements for seats.
-        # Green fill = available (זמין), Gray fill = sold (הוזמן)
-        # Legend at bottom has sample squares that should be excluded.
-        # The seat plan lives inside .seat-plan--inner-view > svg
+        # Hot Cinema seat map: colored squares inside .seat-plan--inner-view
+        # Green = available (זמין), Gray = sold (הוזמן)
+        # Seats may be ANY element type (Angular custom elements, divs, SVG, etc.)
+        # We scan ALL descendants and check both backgroundColor AND fill.
         seat_data = await page.evaluate("""() => {
-            // Helper: parse color string (rgb, rgba, hex, or named) to {r,g,b}
             function parseColor(c) {
-                if (!c || c === 'none' || c === 'transparent') return null;
-                // rgb/rgba
+                if (!c || c === 'none' || c === 'transparent' || c === 'rgba(0, 0, 0, 0)') return null;
                 let m = c.match(/rgba?\\((\\d+),\\s*(\\d+),\\s*(\\d+)/);
                 if (m) return {r: parseInt(m[1]), g: parseInt(m[2]), b: parseInt(m[3])};
-                // hex
                 m = c.match(/^#([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})/i);
                 if (m) return {r: parseInt(m[1],16), g: parseInt(m[2],16), b: parseInt(m[3],16)};
-                // Short hex
-                m = c.match(/^#([0-9a-f])([0-9a-f])([0-9a-f])$/i);
-                if (m) return {r: parseInt(m[1]+m[1],16), g: parseInt(m[2]+m[2],16), b: parseInt(m[3]+m[3],16)};
                 return null;
             }
 
@@ -240,109 +234,114 @@ class HotCinemaScraper(BaseScraper):
                     && c.r > 50 && c.r < 210;
             }
 
-            // Strategy 1: Find SVG seat elements inside the seat plan
-            // The seat plan container has class 'seat-plan--inner-view'
-            // Seats can be any SVG shape: path, rect, circle, polygon, use, etc.
+            // Get the seat plan container
             const seatPlan = document.querySelector('.seat-plan--inner-view')
                           || document.querySelector('.seat-plan--inner')
                           || document.querySelector('.seat-plan');
 
-            // Get ALL SVG child elements (not just rect - seats are often paths)
-            let svgEls = [];
-            if (seatPlan) {
-                svgEls = Array.from(seatPlan.querySelectorAll(
-                    'svg path, svg rect, svg circle, svg polygon, svg use, svg ellipse'
-                ));
-            }
-            if (svgEls.length < 10) {
-                // Fallback: all SVG shapes on page
-                svgEls = Array.from(document.querySelectorAll(
-                    'svg path, svg rect, svg circle, svg polygon, svg use, svg ellipse'
-                ));
+            if (!seatPlan) {
+                return {total: 0, sold: 0, error: 'no_seat_plan_container'};
             }
 
-            // Filter to seat-sized elements with green or gray fill
+            // Scan ALL descendants - not just SVG shapes
+            const allEls = seatPlan.querySelectorAll('*');
+
             const candidates = [];
-            for (const el of svgEls) {
+            const tagCounts = {};
+
+            for (const el of allEls) {
+                const tag = el.tagName;
+                tagCounts[tag] = (tagCounts[tag] || 0) + 1;
+
                 const bbox = el.getBoundingClientRect();
                 // Seat-sized: 10-60px, roughly square
-                if (bbox.width < 8 || bbox.width > 80 || bbox.height < 8 || bbox.height > 80)
+                if (bbox.width < 10 || bbox.width > 70 || bbox.height < 10 || bbox.height > 70)
                     continue;
                 const aspect = bbox.width / bbox.height;
-                if (aspect < 0.3 || aspect > 3.0)
+                if (aspect < 0.4 || aspect > 2.5)
                     continue;
 
-                // Get fill color: try attribute first, then computed style
-                let fillStr = el.getAttribute('fill');
-                if (!fillStr || fillStr === 'none') {
-                    const style = window.getComputedStyle(el);
-                    fillStr = style.fill;
-                }
-                const color = parseColor(fillStr);
-                if (!color) continue;
+                // Check ALL possible color sources
+                const style = window.getComputedStyle(el);
+                let color = null;
+                let colorSource = '';
 
-                // Only keep green or gray seats (skip white, black, transparent)
-                if (!isGreenish(color) && !isGrayish(color)) continue;
+                // 1. CSS background-color (HTML elements)
+                const bg = parseColor(style.backgroundColor);
+                if (bg && (isGreenish(bg) || isGrayish(bg))) {
+                    color = bg;
+                    colorSource = 'bg:' + style.backgroundColor;
+                }
+
+                // 2. SVG fill (computed)
+                if (!color) {
+                    const fill = parseColor(style.fill);
+                    if (fill && (isGreenish(fill) || isGrayish(fill))) {
+                        color = fill;
+                        colorSource = 'fill:' + style.fill;
+                    }
+                }
+
+                // 3. fill attribute directly
+                if (!color) {
+                    const fillAttr = parseColor(el.getAttribute('fill'));
+                    if (fillAttr && (isGreenish(fillAttr) || isGrayish(fillAttr))) {
+                        color = fillAttr;
+                        colorSource = 'attr:' + el.getAttribute('fill');
+                    }
+                }
+
+                // 4. Check class names for status
+                const cls = (el.className || el.getAttribute('class') || '').toString().toLowerCase();
+                const hasAvailableClass = cls.includes('available') || cls.includes('free') || cls.includes('open');
+                const hasSoldClass = cls.includes('sold') || cls.includes('occupied') || cls.includes('taken')
+                    || cls.includes('reserved') || cls.includes('booked') || cls.includes('unavailable');
+
+                if (!color && !hasAvailableClass && !hasSoldClass) continue;
 
                 candidates.push({
                     rect: bbox,
                     color,
-                    fillStr,
-                    isGreen: isGreenish(color),
-                    isGray: isGrayish(color),
+                    colorSource,
+                    isGreen: color ? isGreenish(color) : hasAvailableClass,
+                    isGray: color ? isGrayish(color) : hasSoldClass,
+                    tag,
+                    cls: cls.substring(0, 40),
                 });
             }
 
             if (candidates.length < 5) {
-                // Debug: sample SVG elements by type to understand the structure
-                const tagCounts = {};
-                for (const el of svgEls) {
-                    const tag = el.tagName;
-                    tagCounts[tag] = (tagCounts[tag] || 0) + 1;
-                }
-
-                // Sample elements with their fills and sizes
-                const debugEls = svgEls.slice(0, 20).map(el => {
-                    const bbox = el.getBoundingClientRect();
-                    const fillAttr = el.getAttribute('fill');
-                    const computedFill = window.getComputedStyle(el).fill;
-                    return {
-                        tag: el.tagName,
-                        w: Math.round(bbox.width), h: Math.round(bbox.height),
-                        fillAttr: fillAttr ? fillAttr.substring(0, 30) : null,
-                        computedFill: computedFill ? computedFill.substring(0, 30) : null,
-                        cls: (el.getAttribute('class') || '').substring(0, 40),
-                        y: Math.round(bbox.top),
-                    };
-                });
-
-                // Also sample the green/gray colored ones specifically
-                const coloredEls = svgEls.filter(el => {
-                    const bbox = el.getBoundingClientRect();
-                    if (bbox.width < 5 || bbox.height < 5) return false;
-                    const fill = window.getComputedStyle(el).fill;
-                    return fill && fill !== 'none' && fill !== 'rgb(0, 0, 0)'
-                        && fill !== 'rgb(255, 255, 255)' && fill !== 'rgba(0, 0, 0, 0)';
-                }).slice(0, 15).map(el => {
-                    const bbox = el.getBoundingClientRect();
-                    return {
-                        tag: el.tagName,
-                        w: Math.round(bbox.width), h: Math.round(bbox.height),
-                        fill: window.getComputedStyle(el).fill.substring(0, 40),
-                        cls: (el.getAttribute('class') || '').substring(0, 40),
-                        y: Math.round(bbox.top),
-                    };
-                });
-
-                return {total: 0, sold: 0, error: 'too_few_svg_seats',
-                        svgElsTotal: svgEls.length,
+                // Debug: show what's inside the seat plan
+                return {total: 0, sold: 0, error: 'too_few_seats',
+                        allElsCount: allEls.length,
                         tagCounts,
                         candidateCount: candidates.length,
-                        debugEls,
-                        coloredEls};
+                        candidateSample: candidates.slice(0, 5).map(c => ({
+                            tag: c.tag, cls: c.cls,
+                            w: Math.round(c.rect.width), h: Math.round(c.rect.height),
+                            colorSource: c.colorSource, y: Math.round(c.rect.top),
+                        })),
+                        // Sample ALL seat-sized elements regardless of color
+                        seatSized: Array.from(allEls).filter(el => {
+                            const b = el.getBoundingClientRect();
+                            return b.width >= 10 && b.width <= 70 && b.height >= 10 && b.height <= 70
+                                && b.width / b.height > 0.4 && b.width / b.height < 2.5;
+                        }).slice(0, 15).map(el => {
+                            const b = el.getBoundingClientRect();
+                            const s = window.getComputedStyle(el);
+                            return {
+                                tag: el.tagName,
+                                w: Math.round(b.width), h: Math.round(b.height),
+                                bg: s.backgroundColor ? s.backgroundColor.substring(0, 40) : 'none',
+                                fill: s.fill ? s.fill.substring(0, 40) : 'none',
+                                cls: (el.className || el.getAttribute('class') || '').toString().substring(0, 50),
+                                y: Math.round(b.top),
+                            };
+                        }),
+                };
             }
 
-            // Exclude legend: find largest Y gap among candidates
+            // Exclude legend: find largest Y gap
             const ys = candidates.map(c => c.rect.top).sort((a, b) => a - b);
             let maxGap = 0, gapY = Infinity;
             for (let i = 1; i < ys.length; i++) {
@@ -353,18 +352,20 @@ class HotCinemaScraper(BaseScraper):
 
             let totalCount = 0, soldCount = 0;
             const colorSamples = {};
+            const tagSamples = {};
 
             for (const c of candidates) {
                 if (c.rect.top >= cutoffY) continue;
                 totalCount++;
-                const key = c.fillStr || `rgb(${c.color.r},${c.color.g},${c.color.b})`;
+                const key = c.colorSource || 'class-only';
                 colorSamples[key] = (colorSamples[key] || 0) + 1;
+                tagSamples[c.tag] = (tagSamples[c.tag] || 0) + 1;
                 if (c.isGray) soldCount++;
             }
 
             return {
                 total: totalCount, sold: soldCount,
-                colorSamples,
+                colorSamples, tagSamples,
                 candidatesTotal: candidates.length,
                 cutoffY: cutoffY === Infinity ? 'none' : Math.round(cutoffY),
                 maxGap: Math.round(maxGap),
