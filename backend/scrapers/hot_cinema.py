@@ -698,10 +698,13 @@ class HotCinemaScraper(BaseScraper):
     async def _extract_booking_urls_from_movie_page(
         self, page: Page, movie_url: str, movie_title: str
     ) -> list[dict]:
-        """Navigate to movie page and extract ticket booking URLs from the DOM.
+        """Navigate to movie page and extract ticket booking URLs.
+
+        The Hot Cinema movie page uses JavaScript click handlers (not <a> hrefs)
+        to open ticket pages. We click showtime elements and intercept the
+        resulting navigation/popup to discover the correct booking URLs.
 
         Returns list of dicts with keys: booking_url, time_text, context_text.
-        The booking URLs point to tickets.hotcinema.co.il/site/{id}.
         """
         results: list[dict] = []
         try:
@@ -713,6 +716,14 @@ class HotCinemaScraper(BaseScraper):
             await page.evaluate("window.scrollBy(0, 500)")
             await asyncio.sleep(1)
 
+            # Debug: dump page structure for showtime elements
+            page_text = await page.inner_text("body")
+            # Find time patterns (HH:MM) on the page
+            time_matches = re.findall(r'\b\d{2}:\d{2}\b', page_text)
+            logger.warning(
+                f"[Hot Cinema] '{movie_title}' page times found: {time_matches[:20]}"
+            )
+
             # Strategy 1: Find <a> links to tickets.hotcinema.co.il
             ticket_links = await page.query_selector_all(
                 'a[href*="tickets.hotcinema.co.il"]'
@@ -723,23 +734,15 @@ class HotCinemaScraper(BaseScraper):
                     if not href or "/site/" not in href:
                         continue
                     link_text = (await link.inner_text()).strip()
-                    # Get parent context for matching
-                    context_text = ""
-                    try:
-                        parent = await link.evaluate_handle("el => el.closest('[class*=\"screening\"], [class*=\"show\"], [class*=\"time\"], tr, li, [class*=\"event\"]')")
-                        if parent:
-                            context_text = (await parent.inner_text())[:200].strip()
-                    except Exception:
-                        pass
                     results.append({
                         "booking_url": href,
                         "time_text": link_text,
-                        "context_text": context_text,
+                        "context_text": "",
                     })
                 except Exception:
                     continue
 
-            # Strategy 2: Check onclick handlers if no href links found
+            # Strategy 2: Check onclick / data attributes
             if not results:
                 buttons = await page.query_selector_all(
                     '[onclick*="tickets"], [data-url*="tickets"], '
@@ -768,54 +771,199 @@ class HotCinemaScraper(BaseScraper):
                     except Exception:
                         continue
 
-            # Strategy 3: Intercept navigation - click first showtime and capture redirect
+            # Strategy 3: Click showtime elements and intercept popup/navigation
             if not results:
-                showtime_selectors = [
-                    '[class*="showtime"] a, [class*="Showtime"] a',
-                    '[class*="screening"] a, [class*="Screening"] a',
-                    '[class*="time-slot"] a, [class*="TimeSlot"] a',
-                    '[class*="hour"] a, [class*="Hour"] a',
-                ]
-                for sel in showtime_selectors:
-                    links = await page.query_selector_all(sel)
-                    for link in links:
-                        try:
-                            href = await link.get_attribute("href") or ""
-                            if "tickets" in href or "/site/" in href:
+                # Find clickable elements that contain time text (HH:MM)
+                clickable_times = await page.evaluate("""() => {
+                    const results = [];
+                    const timePattern = /^\\d{2}:\\d{2}$/;
+                    // Check all elements for time-like text
+                    const allElements = document.querySelectorAll(
+                        'button, a, [role="button"], [class*="time"], [class*="hour"], ' +
+                        '[class*="show"], [class*="screening"], [class*="slot"], ' +
+                        'span, div'
+                    );
+                    for (const el of allElements) {
+                        const text = el.textContent.trim();
+                        if (timePattern.test(text) || (text.length <= 10 && /\\d{2}:\\d{2}/.test(text))) {
+                            const rect = el.getBoundingClientRect();
+                            if (rect.width > 0 && rect.height > 0) {
+                                results.push({
+                                    text: text,
+                                    tag: el.tagName,
+                                    classes: el.className,
+                                    hasClick: typeof el.onclick === 'function' || el.hasAttribute('onclick'),
+                                    href: el.href || el.getAttribute('href') || '',
+                                });
+                            }
+                        }
+                        if (results.length >= 30) break;
+                    }
+                    return results;
+                }""")
+
+                logger.warning(
+                    f"[Hot Cinema] '{movie_title}' clickable time elements: "
+                    f"{clickable_times[:10]}"
+                )
+
+                if clickable_times:
+                    # Try clicking the first showtime and capture where it navigates
+                    first_time = clickable_times[0]
+                    time_text = first_time["text"]
+
+                    # Set up popup handler to capture new windows
+                    captured_urls: list[str] = []
+
+                    def on_popup(popup_page):
+                        captured_urls.append(popup_page.url)
+                        logger.warning(
+                            f"[Hot Cinema] Popup captured: {popup_page.url}"
+                        )
+
+                    page.on("popup", on_popup)
+
+                    # Also intercept requests to tickets domain
+                    intercepted_urls: list[str] = []
+
+                    async def intercept_tickets(route):
+                        url = route.request.url
+                        intercepted_urls.append(url)
+                        logger.warning(
+                            f"[Hot Cinema] Intercepted ticket request: {url}"
+                        )
+                        await route.abort()
+
+                    await page.route("**/tickets.hotcinema.co.il/**", intercept_tickets)
+
+                    # Click the first time element
+                    try:
+                        if first_time.get("classes"):
+                            class_parts = first_time["classes"].split()
+                            selector = f'.{class_parts[0]}' if class_parts else first_time["tag"]
+                        else:
+                            selector = first_time["tag"]
+
+                        # Use text-based locator for precision
+                        locator = page.locator(f'text="{time_text}"').first
+                        await locator.click(timeout=5000)
+                        await asyncio.sleep(3)
+
+                        # Check for navigation
+                        current_url = page.url
+                        if "tickets.hotcinema.co.il" in current_url:
+                            captured_urls.append(current_url)
+                            logger.warning(
+                                f"[Hot Cinema] Page navigated to: {current_url}"
+                            )
+
+                    except Exception as e:
+                        logger.warning(
+                            f"[Hot Cinema] Click on showtime '{time_text}' failed: {e}"
+                        )
+
+                    # Clean up handlers
+                    page.remove_listener("popup", on_popup)
+                    await page.unroute("**/tickets.hotcinema.co.il/**")
+
+                    # Process captured URLs
+                    all_captured = captured_urls + intercepted_urls
+                    for url in all_captured:
+                        if "tickets.hotcinema.co.il" in url:
+                            # Extract the base booking URL pattern
+                            match = re.search(
+                                r'(https?://tickets\.hotcinema\.co\.il/site/\d+)', url
+                            )
+                            if match:
                                 results.append({
-                                    "booking_url": href,
-                                    "time_text": (await link.inner_text()).strip(),
+                                    "booking_url": match.group(1),
+                                    "time_text": time_text,
                                     "context_text": "",
                                 })
-                        except Exception:
-                            continue
-                    if results:
-                        break
+                                logger.warning(
+                                    f"[Hot Cinema] Discovered booking URL via click: "
+                                    f"{match.group(1)}"
+                                )
 
-            # Log what we found for debugging
+                    # If we found the URL pattern from one click, try to find
+                    # remaining URLs by clicking more showtimes
+                    if results and len(clickable_times) > 1:
+                        logger.info(
+                            f"[Hot Cinema] Found URL pattern, clicking remaining "
+                            f"{min(len(clickable_times) - 1, 10)} showtimes"
+                        )
+                        # Navigate back to movie page for remaining clicks
+                        await self._open_url(page, movie_url, wait_for_network=True)
+                        await asyncio.sleep(2)
+                        await page.evaluate("window.scrollBy(0, 800)")
+                        await asyncio.sleep(2)
+
+                        for ct in clickable_times[1:11]:  # Limit to 10 more
+                            try:
+                                popup_urls: list[str] = []
+
+                                def on_popup2(p):
+                                    popup_urls.append(p.url)
+
+                                page.on("popup", on_popup2)
+                                await page.route(
+                                    "**/tickets.hotcinema.co.il/**",
+                                    intercept_tickets,
+                                )
+
+                                loc = page.locator(
+                                    f'text="{ct["text"]}"'
+                                ).first
+                                await loc.click(timeout=3000)
+                                await asyncio.sleep(2)
+
+                                cur = page.url
+                                if "tickets.hotcinema.co.il" in cur:
+                                    popup_urls.append(cur)
+
+                                page.remove_listener("popup", on_popup2)
+                                await page.unroute(
+                                    "**/tickets.hotcinema.co.il/**"
+                                )
+
+                                for u in popup_urls + intercepted_urls:
+                                    m = re.search(
+                                        r'(https?://tickets\.hotcinema\.co\.il/site/\d+)',
+                                        u,
+                                    )
+                                    if m and not any(
+                                        r["booking_url"] == m.group(1)
+                                        for r in results
+                                    ):
+                                        results.append({
+                                            "booking_url": m.group(1),
+                                            "time_text": ct["text"],
+                                            "context_text": "",
+                                        })
+                                intercepted_urls.clear()
+                            except Exception:
+                                continue
+
+            # Log results
             if results:
                 logger.info(
-                    f"[Hot Cinema] '{movie_title}': found {len(results)} booking URLs on movie page"
+                    f"[Hot Cinema] '{movie_title}': found {len(results)} booking URLs"
                 )
-                for r in results[:3]:
+                for r in results[:5]:
                     logger.warning(
-                        f"[Hot Cinema] Booking URL from page: {r['booking_url']} "
-                        f"(text: {r['time_text'][:50]})"
+                        f"[Hot Cinema] Booking URL: {r['booking_url']} "
+                        f"(time: {r['time_text']})"
                     )
             else:
-                # Dump page info for debugging
-                all_links = await page.query_selector_all("a[href]")
-                hrefs = []
-                for a in all_links[:30]:
-                    try:
-                        h = await a.get_attribute("href") or ""
-                        if h and "hotcinema" in h:
-                            hrefs.append(h)
-                    except Exception:
-                        continue
+                # Dump all links for debugging
+                all_hrefs = await page.evaluate("""() => {
+                    return Array.from(document.querySelectorAll('a[href]'))
+                        .slice(0, 20)
+                        .map(a => ({href: a.href, text: a.textContent.trim().substring(0, 50)}));
+                }""")
                 logger.warning(
                     f"[Hot Cinema] '{movie_title}': no booking URLs found. "
-                    f"Links with 'hotcinema': {hrefs[:10]}"
+                    f"All page links: {all_hrefs}"
                 )
 
         except Exception as e:
