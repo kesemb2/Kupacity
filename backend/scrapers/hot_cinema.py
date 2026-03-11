@@ -310,6 +310,20 @@ class HotCinemaScraper(BaseScraper):
                 });
             }
 
+            // Deduplicate: multiple elements at same position (e.g. <g> + child <rect>)
+            // Keep only one candidate per grid cell (round to 5px)
+            const seen = new Set();
+            const deduped = [];
+            for (const c of candidates) {
+                const key = Math.round(c.rect.left / 5) + ',' + Math.round(c.rect.top / 5);
+                if (!seen.has(key)) {
+                    seen.add(key);
+                    deduped.push(c);
+                }
+            }
+            candidates.length = 0;
+            candidates.push(...deduped);
+
             if (candidates.length < 5) {
                 // Debug: show what's inside the seat plan
                 return {total: 0, sold: 0, error: 'too_few_seats',
@@ -802,6 +816,8 @@ class HotCinemaScraper(BaseScraper):
                                 "format": entry_format,
                                 "language": language,
                                 "booking_url": "",
+                                "theater_id": theater_id,
+                                "event_id": event_id,
                             })
                         except Exception:
                             continue
@@ -1444,6 +1460,9 @@ class HotCinemaScraper(BaseScraper):
                 movie_list = movie_list[:self._TEST_MOVIE_LIMIT]
                 logger.info(f"[Hot Cinema] Ticket update: limited to {len(movie_list)} movies")
 
+            # TheaterID → siteId mapping (discovered from booking URLs)
+            theater_to_site: dict[str, str] = {}
+
             screening_counter = 0
             for title, url, mid in movie_list:
                 screening_infos = await self._fetch_screenings_api(page, mid, title, days=7)
@@ -1452,29 +1471,47 @@ class HotCinemaScraper(BaseScraper):
                 if not future_infos:
                     continue
 
-                # Extract booking URLs from the movie page DOM
-                booking_links = await self._extract_booking_urls_from_movie_page(
-                    page, url, title
-                )
+                # Discover booking URLs from movie page to learn TheaterID→siteId mapping
+                # Only needed if we have theaters we haven't mapped yet
+                unmapped_theaters = {
+                    str(i.get("theater_id", ""))
+                    for i in future_infos
+                    if str(i.get("theater_id", "")) and str(i.get("theater_id", "")) not in theater_to_site
+                }
 
-                # Try to match booking URLs to screenings by time text
-                # Build a pool of unmatched booking URLs
-                available_urls = [b["booking_url"] for b in booking_links]
-                matched_urls: dict[int, str] = {}  # idx -> booking_url
+                if unmapped_theaters:
+                    booking_links = await self._extract_booking_urls_from_movie_page(
+                        page, url, title
+                    )
 
-                for idx, info in enumerate(future_infos):
-                    time_str = info["showtime"].strftime("%H:%M")
+                    # Extract siteId from discovered booking URLs and correlate with screenings
                     for bl in booking_links:
-                        if time_str in bl.get("time_text", "") or time_str in bl.get("context_text", ""):
-                            if bl["booking_url"] not in matched_urls.values():
-                                matched_urls[idx] = bl["booking_url"]
-                                break
+                        burl = bl["booking_url"]
+                        # URL pattern: /site/{siteId}?code={siteId}-{eventId}&...
+                        site_match = re.search(r'/site/(\d+)', burl)
+                        code_match = re.search(r'code=(\d+)-(\d+)', burl)
+                        if not site_match:
+                            continue
+                        site_id = site_match.group(1)
+                        event_id_from_url = code_match.group(2) if code_match else ""
 
-                # If no matching by time, assign sequentially
-                if not matched_urls and available_urls:
-                    for idx in range(min(len(future_infos), len(available_urls))):
-                        matched_urls[idx] = available_urls[idx]
+                        # Match this event_id to a screening to find the TheaterID
+                        if event_id_from_url:
+                            for info in future_infos:
+                                if str(info.get("event_id", "")) == event_id_from_url:
+                                    tid = str(info.get("theater_id", ""))
+                                    if tid and tid not in theater_to_site:
+                                        theater_to_site[tid] = site_id
+                                        logger.info(
+                                            f"[Hot Cinema] Mapped TheaterID={tid} → siteId={site_id}"
+                                        )
+                                    break
 
+                    logger.info(
+                        f"[Hot Cinema] TheaterID→siteId mapping so far: {theater_to_site}"
+                    )
+
+                # Now construct booking URLs for ALL screenings using the mapping
                 for idx, info in enumerate(future_infos):
                     screening_counter += 1
                     if on_progress:
@@ -1483,7 +1520,19 @@ class HotCinemaScraper(BaseScraper):
                     total_seats = 200
                     tickets_sold = 0
 
-                    booking_url = matched_urls.get(idx, "")
+                    # Construct booking URL from TheaterID→siteId mapping + EventId
+                    tid = str(info.get("theater_id", ""))
+                    eid = str(info.get("event_id", ""))
+                    site_id = theater_to_site.get(tid, "")
+
+                    booking_url = ""
+                    if site_id and eid:
+                        booking_url = (
+                            f"https://tickets.hotcinema.co.il/site/{site_id}"
+                            f"?code={site_id}-{eid}"
+                            f"&saleChannelCode=WEB&languageid=he_IL"
+                        )
+
                     if booking_url:
                         try:
                             total, sold = await self._navigate_to_seat_map(page, booking_url)
@@ -1497,6 +1546,11 @@ class HotCinemaScraper(BaseScraper):
                                 )
                         except Exception as e:
                             logger.debug(f"[Hot Cinema] Seat map failed: {e}")
+                    else:
+                        logger.debug(
+                            f"[Hot Cinema] No booking URL for TheaterID={tid} EventId={eid} "
+                            f"(siteId mapping: {'found' if site_id else 'missing'})"
+                        )
 
                     screening = ScrapedScreening(
                         movie_title=info["movie_title"],
