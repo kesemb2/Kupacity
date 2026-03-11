@@ -1360,7 +1360,7 @@ class HotCinemaScraper(BaseScraper):
         return result
 
     # Testing limit — set to None for full scrape
-    _TEST_MOVIE_LIMIT = 4
+    _TEST_MOVIE_LIMIT = None
 
     async def scrape_screenings(self, on_progress=None) -> list[ScrapedScreening]:
         """Daily: fetch screenings via API (seat counts deferred to ticket updates)."""
@@ -1417,7 +1417,7 @@ class HotCinemaScraper(BaseScraper):
                     format=info["format"],
                     language=info.get("language", "subtitled"),
                     ticket_price=39.0,
-                    total_seats=200,
+                    total_seats=0,
                     tickets_sold=0,
                 )
                 screening.revenue = 0
@@ -1517,7 +1517,7 @@ class HotCinemaScraper(BaseScraper):
                     if on_progress:
                         on_progress("סורק כיסאות", screening_counter, 0, info["movie_title"])
 
-                    total_seats = 200
+                    total_seats = 0
                     tickets_sold = 0
 
                     # Construct booking URL from TheaterID→siteId mapping + EventId

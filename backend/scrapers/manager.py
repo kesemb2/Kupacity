@@ -82,8 +82,11 @@ def _upsert_screenings(db: Session, chain: CinemaChain, screenings: list[Scraped
         ).first()
 
         if existing:
-            existing.tickets_sold = ss.tickets_sold
-            existing.total_seats = ss.total_seats or existing.total_seats
+            # Only update seat data if the new scrape has real data
+            # (total_seats > 0 means seat map was successfully read)
+            if ss.total_seats > 0:
+                existing.tickets_sold = ss.tickets_sold
+                existing.total_seats = ss.total_seats
             existing.scraped_at = datetime.utcnow()
         else:
             screening = Screening(

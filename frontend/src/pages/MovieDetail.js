@@ -173,21 +173,28 @@ function MovieDetail({ movieId, onBack }) {
               { header: 'פורמט', key: 'format', align: 'center' },
               {
                 header: 'סה"כ מקומות',
-                render: r => formatNumber(r.total_seats),
+                render: r => r.total_seats > 0
+                  ? formatNumber(r.total_seats)
+                  : <span style={{ color: '#64748b' }}>—</span>,
                 align: 'center',
               },
               {
                 header: 'נמכרו',
-                render: r => (
-                  <span style={{ color: r.tickets_sold > 0 ? '#f59e0b' : '#64748b', fontWeight: 600 }}>
-                    {formatNumber(r.tickets_sold)}
-                  </span>
-                ),
+                render: r => r.total_seats > 0
+                  ? (
+                    <span style={{ color: r.tickets_sold > 0 ? '#f59e0b' : '#64748b', fontWeight: 600 }}>
+                      {formatNumber(r.tickets_sold)}
+                    </span>
+                  )
+                  : <span style={{ color: '#64748b' }}>—</span>,
                 align: 'center',
               },
               {
                 header: 'תפוסה',
                 render: r => {
+                  if (!r.total_seats || r.total_seats === 0) {
+                    return <span style={{ color: '#64748b', fontSize: 12 }}>—</span>;
+                  }
                   const occ = r.occupancy || 0;
                   const color = occ > 75 ? '#ef4444' : occ > 40 ? '#f59e0b' : '#22c55e';
                   return (
