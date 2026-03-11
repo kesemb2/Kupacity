@@ -208,58 +208,85 @@ class HotCinemaScraper(BaseScraper):
         total = 0
         sold = 0
 
-        seat_selectors = [
-            'svg [class*="seat"], svg [data-seat], svg rect[class], svg circle[class]',
-            '[class*="seat"]:not([class*="seatmap"]):not([class*="seating"]):not([class*="seats-"]), '
-            '[data-seat-id], [data-seat], [class*="Seat"]:not([class*="Seatmap"])',
-            '.seat, .chair, [role="button"][class*="seat"]',
-        ]
+        # Strategy 1: Use JS to analyze seat elements by background color
+        # Hot Cinema seat map uses colored squares: green=available, gray=sold
+        seat_data = await page.evaluate("""() => {
+            // Look for seat-like elements (small colored squares/rectangles)
+            const selectors = [
+                'svg [class*="seat"], svg [data-seat], svg rect, svg circle',
+                '[class*="seat"]:not([class*="seatmap"]):not([class*="seating"])',
+                '[data-seat-id], [data-seat], [class*="Seat"]:not([class*="Seatmap"])',
+                '.seat, .chair',
+            ];
 
-        for selector in seat_selectors:
-            try:
-                seats = await page.query_selector_all(selector)
-                if len(seats) < 5:
-                    continue
+            let seatElements = [];
+            for (const sel of selectors) {
+                const els = document.querySelectorAll(sel);
+                if (els.length >= 5) {
+                    seatElements = Array.from(els);
+                    break;
+                }
+            }
 
-                total = len(seats)
-                for seat in seats:
-                    classes = (await seat.get_attribute("class") or "").lower()
-                    data_status = (await seat.get_attribute("data-status") or "").lower()
-                    aria_disabled = (await seat.get_attribute("aria-disabled") or "").lower()
-                    style = (await seat.get_attribute("style") or "").lower()
+            if (seatElements.length === 0) return null;
 
-                    is_sold = any([
-                        "sold" in classes,
-                        "occupied" in classes,
-                        "taken" in classes,
-                        "unavailable" in classes,
-                        "reserved" in classes,
-                        "disabled" in classes,
-                        "booked" in classes,
-                        "תפוס" in classes,
-                        data_status in ("sold", "occupied", "taken", "unavailable", "reserved", "booked"),
-                        aria_disabled == "true",
-                        "pointer-events: none" in style and "opacity" in style,
-                    ])
+            let total = 0;
+            let soldCount = 0;
+            const colorSamples = {};
 
-                    fill = (await seat.get_attribute("fill") or "").lower()
-                    if fill and not is_sold:
-                        sold_colors = [
-                            "#ccc", "#ddd", "#999", "#888", "#666", "gray", "grey",
-                            "#ff0000", "red", "#c0c0c0", "#808080",
-                        ]
-                        if any(c in fill for c in sold_colors):
-                            is_sold = True
+            for (const el of seatElements) {
+                const style = window.getComputedStyle(el);
+                const bg = style.backgroundColor || '';
+                const fill = el.getAttribute('fill') || '';
+                const cls = (el.className || '').toString().toLowerCase();
+                const status = (el.getAttribute('data-status') || '').toLowerCase();
+                const color = bg || fill;
 
-                    if is_sold:
-                        sold += 1
+                // Track color distribution
+                if (color) {
+                    colorSamples[color] = (colorSamples[color] || 0) + 1;
+                }
 
-                if total > 0:
-                    break
-            except Exception as e:
-                logger.debug(f"Seat selector '{selector}' failed: {e}")
-                continue
+                total++;
 
+                // Check if sold by class/status
+                const soldKeywords = ['sold', 'occupied', 'taken', 'unavailable',
+                                      'reserved', 'disabled', 'booked'];
+                let isSold = soldKeywords.some(k => cls.includes(k) || status.includes(k));
+
+                // Check by computed color (gray shades = sold)
+                if (!isSold && bg) {
+                    // Parse rgb values
+                    const rgb = bg.match(/rgb\\((\\d+),\\s*(\\d+),\\s*(\\d+)\\)/);
+                    if (rgb) {
+                        const r = parseInt(rgb[1]), g = parseInt(rgb[2]), b = parseInt(rgb[3]);
+                        // Gray: similar R/G/B values, not too bright, not too dark
+                        const isGray = Math.abs(r - g) < 30 && Math.abs(g - b) < 30
+                                       && r > 80 && r < 200;
+                        if (isGray) isSold = true;
+                    }
+                }
+
+                if (isSold) soldCount++;
+            }
+
+            return {total, sold: soldCount, colorSamples, selectorUsed: true};
+        }""")
+
+        if seat_data and seat_data.get("total", 0) >= 5:
+            total = seat_data["total"]
+            sold = seat_data["sold"]
+            logger.info(
+                f"[Hot Cinema] Seats: {sold}/{total} "
+                f"colors: {seat_data.get('colorSamples', {})}"
+            )
+        else:
+            logger.warning(
+                f"[Hot Cinema] No seat elements found via selectors. "
+                f"seat_data={seat_data}"
+            )
+
+        # Fallback: look for text-based seat info
         if total == 0:
             try:
                 body_text = await page.inner_text("body")
@@ -850,22 +877,20 @@ class HotCinemaScraper(BaseScraper):
                     page.remove_listener("popup", on_popup)
                     await page.unroute("**/tickets.hotcinema.co.il/**")
 
-                    # Collect any discovered booking URLs
+                    # Collect any discovered booking URLs (use full URL with query params)
                     for url in captured_urls + intercepted_urls:
-                        if "tickets.hotcinema.co.il" in url:
-                            match = re.search(
-                                r'(https?://tickets\.hotcinema\.co\.il/site/\d+)', url
-                            )
-                            if match and not any(
-                                r["booking_url"] == match.group(1) for r in results
-                            ):
+                        if "tickets.hotcinema.co.il/site/" in url:
+                            # Skip static assets (js, css, fonts)
+                            if any(ext in url for ext in ['.js', '.css', '.woff', '.ttf', '.png', '.jpg']):
+                                continue
+                            if not any(r["booking_url"] == url for r in results):
                                 results.append({
-                                    "booking_url": match.group(1),
+                                    "booking_url": url,
                                     "time_text": time_text,
                                     "context_text": "",
                                 })
                                 logger.warning(
-                                    f"[Hot Cinema] Discovered: {match.group(1)} "
+                                    f"[Hot Cinema] Discovered: {url} "
                                     f"(time: {time_text})"
                                 )
 
@@ -909,8 +934,9 @@ class HotCinemaScraper(BaseScraper):
     async def _navigate_to_seat_map(self, page: Page, booking_url: str) -> tuple[int, int]:
         """Navigate from booking URL through ticket selection to seat map.
 
-        Flow: booking_url → ticket page (click + for regular) → seat map page
-        Domain: tickets.hotcinema.co.il
+        Flow: booking_url → ticket page → click + → click המשך → seat map
+        URL pattern: tickets.hotcinema.co.il/site/{id}?code={id}-{EventId}&...
+        Seat map: tickets.hotcinema.co.il/site/{id}/seats
         """
         try:
             logger.warning(f"[Hot Cinema] Seat map: navigating to {booking_url}")
@@ -920,94 +946,107 @@ class HotCinemaScraper(BaseScraper):
             current_url = page.url
             logger.warning(f"[Hot Cinema] Seat map: loaded {current_url}")
 
-            # Save debug screenshot of ticket page
+            # Save debug screenshot
             try:
                 await page.screenshot(path=_TICKET_DEBUG_SCREENSHOT)
                 logger.info(f"[Hot Cinema] Ticket page screenshot saved → {_TICKET_DEBUG_SCREENSHOT}")
             except Exception:
                 pass
 
-            # Detect bot-detection error page
+            # Detect error page
             if "/error" in current_url:
                 try:
                     body_text = (await page.inner_text("body"))[:500]
-                    logger.warning(f"[Hot Cinema] Ticket page redirected to error: {body_text}")
+                    logger.warning(f"[Hot Cinema] Ticket page error: {body_text}")
                 except Exception:
-                    logger.warning("[Hot Cinema] Ticket page redirected to /error (could not read body)")
+                    pass
                 return 0, 0
 
-            # Check if we're already on a seat map page
-            body_start = (await page.inner_text("body"))[:300]
-            if "seats" in current_url or "מושבים" in body_start:
+            # Check if already on seat map
+            if "/seats" in current_url:
                 logger.info("[Hot Cinema] Seat map: already on seat page")
                 return await self._count_seats_on_page(page)
 
-            # Look for the + button to add a regular ticket
-            plus_buttons = await page.query_selector_all(
-                'button, [role="button"], [class*="plus"], [class*="Plus"], '
-                '[class*="increase"], [class*="add"]'
-            )
-            logger.info(f"[Hot Cinema] Seat map: found {len(plus_buttons)} candidate buttons")
+            # Shortcut: try navigating directly to /seats
+            # Extract base site URL (e.g., /site/1183)
+            site_match = re.search(r'(https?://tickets\.hotcinema\.co\.il/site/\d+)', current_url)
+            if site_match:
+                seats_url = f"{site_match.group(1)}/seats"
+                logger.info(f"[Hot Cinema] Seat map: trying shortcut to {seats_url}")
+                await page.goto(seats_url, wait_until="networkidle", timeout=15000)
+                await asyncio.sleep(3)
 
-            clicked = False
-            for btn in plus_buttons:
-                try:
-                    text = (await btn.inner_text()).strip()
-                    if text == "+" or text == "＋":
-                        await btn.click()
-                        clicked = True
-                        logger.info("[Hot Cinema] Seat map: clicked + button")
-                        await asyncio.sleep(1)
-                        break
-                except Exception:
-                    continue
+                if "/seats" in page.url:
+                    logger.info(f"[Hot Cinema] Seat map: shortcut worked → {page.url}")
+                    try:
+                        await page.screenshot(path=_TICKET_DEBUG_SCREENSHOT)
+                    except Exception:
+                        pass
+                    total, sold = await self._count_seats_on_page(page)
+                    logger.info(f"[Hot Cinema] Seat map: counted {sold}/{total} seats")
+                    return total, sold
 
-            if not clicked:
-                try:
-                    plus_btn = await page.query_selector(
-                        '[aria-label*="הוסף"], [aria-label*="plus"], '
-                        '[aria-label*="increase"]'
-                    )
-                    if plus_btn:
-                        await plus_btn.click()
-                        clicked = True
-                        logger.info("[Hot Cinema] Seat map: clicked + via aria-label")
-                        await asyncio.sleep(1)
-                except Exception:
-                    pass
+                # Shortcut didn't work, go back to ticket page
+                logger.info("[Hot Cinema] Seat map: shortcut failed, going through ticket flow")
+                await self._open_url(page, booking_url, wait_for_network=True)
+                await asyncio.sleep(4)
 
-            if not clicked:
+            # Click the first "+" button to add a regular ticket
+            # The page has rows: [ticket_type] [price] [+] [0] [-]
+            plus_clicked = await page.evaluate("""() => {
+                // Find all elements with just "+" text
+                const allEls = document.querySelectorAll('button, a, span, div, [role="button"]');
+                for (const el of allEls) {
+                    const text = el.textContent.trim();
+                    if (text === '+' || text === '＋') {
+                        const rect = el.getBoundingClientRect();
+                        if (rect.width > 0 && rect.height > 0 && rect.width < 200) {
+                            el.scrollIntoView({block: 'center'});
+                            el.click();
+                            return true;
+                        }
+                    }
+                }
+                return false;
+            }""")
+
+            if plus_clicked:
+                logger.info("[Hot Cinema] Seat map: clicked + button")
+                await asyncio.sleep(1)
+            else:
                 logger.warning("[Hot Cinema] Seat map: could not find + button")
 
-            # Look for "continue" / "המשך" / "מושבים" button using Playwright locators
-            proceed_locators = [
-                page.locator('button', has_text="המשך"),
-                page.locator('button', has_text="מושבים"),
-                page.locator('a', has_text="המשך"),
-                page.locator('a', has_text="מושבים"),
-                page.locator('[class*="continue"], [class*="Continue"]'),
-                page.locator('[class*="next"], [class*="Next"]'),
-                page.locator('[class*="submit"], [class*="Submit"]'),
-            ]
-            proceed_clicked = False
-            for loc in proceed_locators:
-                try:
-                    count = await loc.count()
-                    if count > 0:
-                        await loc.first.click()
-                        proceed_clicked = True
-                        logger.info(f"[Hot Cinema] Seat map: clicked proceed button")
-                        await asyncio.sleep(2)
-                        await page.wait_for_load_state("networkidle", timeout=10000)
-                        await asyncio.sleep(3)
-                        break
-                except Exception:
-                    continue
+            # Click "המשך" (continue) button
+            proceed_clicked = await page.evaluate("""() => {
+                const allEls = document.querySelectorAll('button, a, [role="button"]');
+                for (const el of allEls) {
+                    const text = el.textContent.trim();
+                    if (text === 'המשך' || text.includes('המשך')) {
+                        el.scrollIntoView({block: 'center'});
+                        el.click();
+                        return true;
+                    }
+                }
+                return false;
+            }""")
 
-            if not proceed_clicked:
-                logger.warning("[Hot Cinema] Seat map: could not find proceed button")
+            if proceed_clicked:
+                logger.info("[Hot Cinema] Seat map: clicked המשך button")
+                await asyncio.sleep(2)
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=10000)
+                except Exception:
+                    pass
+                await asyncio.sleep(3)
+            else:
+                logger.warning("[Hot Cinema] Seat map: could not find המשך button")
 
             logger.info(f"[Hot Cinema] Seat map: now on {page.url}")
+            try:
+                await page.screenshot(path=_TICKET_DEBUG_SCREENSHOT)
+            except Exception:
+                pass
+
             total, sold = await self._count_seats_on_page(page)
             logger.info(f"[Hot Cinema] Seat map: counted {sold}/{total} seats")
             return total, sold
