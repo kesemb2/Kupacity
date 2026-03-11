@@ -559,6 +559,19 @@ class HotCinemaScraper(BaseScraper):
                 if not isinstance(theaters, list):
                     continue
 
+                # Log first theater's raw keys to discover URL fields
+                if theaters and day_offset == 0:
+                    first = theaters[0]
+                    logger.info(f"[Hot Cinema] API theater keys: {list(first.keys())}")
+                    if first.get("Dates"):
+                        first_date = first["Dates"][0]
+                        logger.info(f"[Hot Cinema] API date entry keys: {list(first_date.keys())}")
+                        logger.info(f"[Hot Cinema] API sample: TheaterID={first.get('TheaterID')}, "
+                                    f"EventId={first_date.get('EventId')}, "
+                                    f"Url={first_date.get('Url', 'N/A')}, "
+                                    f"BookingUrl={first_date.get('BookingUrl', 'N/A')}, "
+                                    f"Link={first_date.get('Link', 'N/A')}")
+
                 for theater in theaters:
                     theater_name = theater.get("TheaterName", "")
                     theater_id = theater.get("TheaterID")
