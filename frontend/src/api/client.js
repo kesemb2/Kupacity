@@ -28,4 +28,8 @@ export const checkHealth = () => api.get('/health', { timeout: 15000 })
 export const getDebugScreenshotUrl = () => `${API_BASE}/api/debug-screenshot`;
 export const getDebugScreenshotTicketsUrl = () => `${API_BASE}/api/debug-screenshot-tickets`;
 
+export const fetchDebugScreenshots = () => api.get('/debug-screenshots').then(r => r.data);
+export const getDebugScreenshotFileUrl = (filename) => `${API_BASE}/api/debug-screenshots/${filename}`;
+export const clearDebugScreenshots = () => api.delete('/debug-screenshots').then(r => r.data);
+
 export default api;

@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { fetchScrapeLogs, triggerScrape, getDebugScreenshotUrl, getDebugScreenshotTicketsUrl } from '../api/client';
+import { fetchScrapeLogs, triggerScrape, getDebugScreenshotUrl, getDebugScreenshotTicketsUrl, fetchDebugScreenshots, getDebugScreenshotFileUrl, clearDebugScreenshots } from '../api/client';
 
 function ScrapePage() {
   const [logs, setLogs] = useState([]);
@@ -107,24 +107,7 @@ function ScrapePage() {
       )}
 
       {/* Debug Screenshots */}
-      <div style={{
-        display: 'flex',
-        gap: 12,
-        marginBottom: 24,
-      }}>
-        <button
-          onClick={() => window.open(getDebugScreenshotUrl(), '_blank')}
-          style={screenshotBtnStyle}
-        >
-          צילום מסך - אתר ראשי
-        </button>
-        <button
-          onClick={() => window.open(getDebugScreenshotTicketsUrl(), '_blank')}
-          style={screenshotBtnStyle}
-        >
-          צילום מסך - כרטיסים
-        </button>
-      </div>
+      <DebugScreenshotsGallery />
 
       {/* Live Progress Indicator */}
       {runningLog && runningLog.progress && (
@@ -218,6 +201,159 @@ function ScrapePage() {
           100% { background-position: 40px 0; }
         }
       `}</style>
+    </div>
+  );
+}
+
+
+const STEP_LABELS = {
+  step1: 'דף הזמנה',
+  step2: 'אחרי לחיצה על +',
+  step3: 'אחרי המשך',
+  step4: 'מפת כיסאות',
+  step5: 'כיסאות מסומנים',
+};
+
+function getStepLabel(filename) {
+  for (const [key, label] of Object.entries(STEP_LABELS)) {
+    if (filename.startsWith(key)) return label;
+  }
+  return filename;
+}
+
+function DebugScreenshotsGallery() {
+  const [expanded, setExpanded] = useState(false);
+  const [screenshots, setScreenshots] = useState([]);
+  const [loading, setLoading] = useState(false);
+
+  const loadScreenshots = useCallback(() => {
+    setLoading(true);
+    fetchDebugScreenshots()
+      .then(setScreenshots)
+      .catch(() => setScreenshots([]))
+      .finally(() => setLoading(false));
+  }, []);
+
+  useEffect(() => {
+    if (expanded) loadScreenshots();
+  }, [expanded, loadScreenshots]);
+
+  const handleClear = () => {
+    if (!window.confirm('למחוק את כל הסקרינשוטים?')) return;
+    clearDebugScreenshots()
+      .then(() => setScreenshots([]))
+      .catch(() => {});
+  };
+
+  return (
+    <div style={{
+      background: '#1e293b',
+      borderRadius: 12,
+      border: '1px solid #334155',
+      marginBottom: 24,
+      overflow: 'hidden',
+    }}>
+      <div
+        onClick={() => setExpanded(!expanded)}
+        style={{
+          padding: '14px 20px',
+          display: 'flex',
+          justifyContent: 'space-between',
+          alignItems: 'center',
+          cursor: 'pointer',
+          userSelect: 'none',
+        }}
+      >
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+          <span style={{ fontSize: 16, fontWeight: 600 }}>
+            סקרינשוטים Debug
+          </span>
+          {screenshots.length > 0 && (
+            <span style={{
+              background: '#3b82f622',
+              color: '#60a5fa',
+              padding: '2px 8px',
+              borderRadius: 10,
+              fontSize: 12,
+              fontWeight: 600,
+            }}>
+              {screenshots.length}
+            </span>
+          )}
+        </div>
+        <span style={{ color: '#64748b', fontSize: 18 }}>
+          {expanded ? '\u25B2' : '\u25BC'}
+        </span>
+      </div>
+
+      {expanded && (
+        <div style={{ padding: '0 20px 16px' }}>
+          {/* Quick access buttons */}
+          <div style={{ display: 'flex', gap: 8, marginBottom: 16, flexWrap: 'wrap' }}>
+            <button
+              onClick={() => window.open(getDebugScreenshotUrl(), '_blank')}
+              style={screenshotBtnStyle}
+            >
+              אתר ראשי
+            </button>
+            <button
+              onClick={() => window.open(getDebugScreenshotTicketsUrl(), '_blank')}
+              style={screenshotBtnStyle}
+            >
+              כרטיסים (אחרון)
+            </button>
+            <button onClick={loadScreenshots} style={screenshotBtnStyle}>
+              {loading ? '...' : 'רענן'}
+            </button>
+            {screenshots.length > 0 && (
+              <button onClick={handleClear} style={{
+                ...screenshotBtnStyle,
+                background: 'rgba(239,68,68,0.15)',
+                color: '#fca5a5',
+                borderColor: '#7f1d1d',
+              }}>
+                נקה הכל
+              </button>
+            )}
+          </div>
+
+          {/* Screenshots list */}
+          {screenshots.length === 0 ? (
+            <div style={{ color: '#64748b', fontSize: 14, textAlign: 'center', padding: 16 }}>
+              {loading ? 'טוען...' : 'אין סקרינשוטים. הרץ סריקה עם ticket updates.'}
+            </div>
+          ) : (
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(280px, 1fr))', gap: 10 }}>
+              {screenshots.map((s) => (
+                <div
+                  key={s.filename}
+                  onClick={() => window.open(getDebugScreenshotFileUrl(s.filename), '_blank')}
+                  style={{
+                    background: '#0f172a',
+                    borderRadius: 8,
+                    padding: '10px 14px',
+                    cursor: 'pointer',
+                    border: '1px solid #1e293b',
+                    transition: 'border-color 0.2s',
+                  }}
+                  onMouseEnter={(e) => e.currentTarget.style.borderColor = '#3b82f6'}
+                  onMouseLeave={(e) => e.currentTarget.style.borderColor = '#1e293b'}
+                >
+                  <div style={{ fontSize: 13, fontWeight: 600, color: '#e2e8f0', marginBottom: 4 }}>
+                    {getStepLabel(s.filename)}
+                  </div>
+                  <div style={{ fontSize: 11, color: '#64748b', wordBreak: 'break-all' }}>
+                    {s.filename}
+                  </div>
+                  <div style={{ fontSize: 11, color: '#475569', marginTop: 4 }}>
+                    {s.size_kb} KB · {new Date(s.created_at * 1000).toLocaleTimeString('he-IL')}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 }

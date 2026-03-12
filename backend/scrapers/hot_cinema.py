@@ -64,6 +64,24 @@ TICKETS_URL = "https://tickets.hotcinema.co.il"
 
 _DEBUG_SCREENSHOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "debug.png")
 _TICKET_DEBUG_SCREENSHOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "debug_tickets.png")
+_DEBUG_SCREENSHOTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "debug_screenshots")
+
+
+def _debug_screenshot_path(step: str, movie_title: str = "", screening_time: str = "") -> str:
+    """Generate a unique debug screenshot path."""
+    os.makedirs(_DEBUG_SCREENSHOTS_DIR, exist_ok=True)
+    ts = datetime.now().strftime("%H%M%S")
+    # Sanitize movie title for filename
+    safe_title = re.sub(r'[^\w\u0590-\u05FF -]', '', movie_title)[:30].strip().replace(' ', '_')
+    safe_time = screening_time.replace(':', '').replace(' ', '_')[:10]
+    parts = [step]
+    if safe_title:
+        parts.append(safe_title)
+    if safe_time:
+        parts.append(safe_time)
+    parts.append(ts)
+    filename = "_".join(parts) + ".png"
+    return os.path.join(_DEBUG_SCREENSHOTS_DIR, filename)
 
 _BRANCH_KEYWORDS = [
     "מודיעין", "כפר סבא", "פתח תקווה", "רחובות", "חיפה",
@@ -204,18 +222,17 @@ class HotCinemaScraper(BaseScraper):
     # Seat counting (on seat map page)
     # ------------------------------------------------------------------
 
-    async def _count_seats_on_page(self, page: Page) -> tuple[int, int]:
+    async def _count_seats_on_page(self, page: Page,
+                                    movie_title: str = "", screening_time: str = "") -> tuple[int, int]:
         total = 0
         sold = 0
 
         # Wait a bit for seat map to render (Angular SPA)
         await asyncio.sleep(2)
 
-        # Hot Cinema seat map: colored squares inside .seat-plan--inner-view
-        # Green = available (זמין), Gray = sold (הוזמן)
-        # Seats may be ANY element type (Angular custom elements, divs, SVG, etc.)
-        # We scan ALL descendants and check both backgroundColor AND fill.
+        # Run BOTH detection methods in parallel inside one page.evaluate
         seat_data = await page.evaluate("""() => {
+            // ===== UTILITY FUNCTIONS =====
             function parseColor(c) {
                 if (!c || c === 'none' || c === 'transparent' || c === 'rgba(0, 0, 0, 0)') return null;
                 let m = c.match(/rgba?\\((\\d+),\\s*(\\d+),\\s*(\\d+)/);
@@ -234,19 +251,26 @@ class HotCinemaScraper(BaseScraper):
                     && c.r > 50 && c.r < 210;
             }
 
-            // Get the seat plan container
+            function colorToStr(c) {
+                return c ? `rgb(${c.r},${c.g},${c.b})` : 'none';
+            }
+
+            // ===== FIND SEAT CONTAINER =====
             const seatPlan = document.querySelector('.seat-plan--inner-view')
                           || document.querySelector('.seat-plan--inner')
                           || document.querySelector('.seat-plan');
 
             if (!seatPlan) {
-                return {total: 0, sold: 0, error: 'no_seat_plan_container'};
+                return {total: 0, sold: 0, error: 'no_seat_plan_container',
+                        containerHTML: document.body ? document.body.innerHTML.substring(0, 3000) : ''};
             }
 
-            // Scan ALL descendants - not just SVG shapes
             const allEls = seatPlan.querySelectorAll('*');
 
-            const candidates = [];
+            // ===== METHOD A: COLOR-BASED DETECTION =====
+            const colorCandidates = [];
+            const seatSizedAll = []; // ALL seat-sized elements (for debug)
+            const allUniqueColors = {};
             const tagCounts = {};
 
             for (const el of allEls) {
@@ -254,35 +278,58 @@ class HotCinemaScraper(BaseScraper):
                 tagCounts[tag] = (tagCounts[tag] || 0) + 1;
 
                 const bbox = el.getBoundingClientRect();
-                // Seat-sized: 10-60px, roughly square
                 if (bbox.width < 10 || bbox.width > 70 || bbox.height < 10 || bbox.height > 70)
                     continue;
                 const aspect = bbox.width / bbox.height;
                 if (aspect < 0.4 || aspect > 2.5)
                     continue;
 
-                // Check ALL possible color sources
+                // This is a seat-sized element
                 const style = window.getComputedStyle(el);
+                const cls = (el.className || el.getAttribute('class') || '').toString().toLowerCase();
+                const bgRaw = style.backgroundColor;
+                const fillRaw = style.fill;
+
+                // Track ALL unique colors for debug
+                const bgParsed = parseColor(bgRaw);
+                if (bgParsed) {
+                    const key = `bg:${colorToStr(bgParsed)}`;
+                    allUniqueColors[key] = (allUniqueColors[key] || 0) + 1;
+                }
+                const fillParsed = parseColor(fillRaw);
+                if (fillParsed) {
+                    const key = `fill:${colorToStr(fillParsed)}`;
+                    allUniqueColors[key] = (allUniqueColors[key] || 0) + 1;
+                }
+
+                // Save ALL seat-sized for debug (limited)
+                if (seatSizedAll.length < 30) {
+                    seatSizedAll.push({
+                        tag, cls: cls.substring(0, 60),
+                        w: Math.round(bbox.width), h: Math.round(bbox.height),
+                        x: Math.round(bbox.left), y: Math.round(bbox.top),
+                        bg: bgRaw ? bgRaw.substring(0, 40) : 'none',
+                        fill: fillRaw ? fillRaw.substring(0, 40) : 'none',
+                        fillAttr: (el.getAttribute('fill') || '').substring(0, 30),
+                    });
+                }
+
+                // Check color sources
                 let color = null;
                 let colorSource = '';
 
-                // 1. CSS background-color (HTML elements)
-                const bg = parseColor(style.backgroundColor);
+                const bg = parseColor(bgRaw);
                 if (bg && (isGreenish(bg) || isGrayish(bg))) {
                     color = bg;
-                    colorSource = 'bg:' + style.backgroundColor;
+                    colorSource = 'bg:' + bgRaw;
                 }
-
-                // 2. SVG fill (computed)
                 if (!color) {
-                    const fill = parseColor(style.fill);
+                    const fill = parseColor(fillRaw);
                     if (fill && (isGreenish(fill) || isGrayish(fill))) {
                         color = fill;
-                        colorSource = 'fill:' + style.fill;
+                        colorSource = 'fill:' + fillRaw;
                     }
                 }
-
-                // 3. fill attribute directly
                 if (!color) {
                     const fillAttr = parseColor(el.getAttribute('fill'));
                     if (fillAttr && (isGreenish(fillAttr) || isGrayish(fillAttr))) {
@@ -291,72 +338,35 @@ class HotCinemaScraper(BaseScraper):
                     }
                 }
 
-                // 4. Check class names for status
-                const cls = (el.className || el.getAttribute('class') || '').toString().toLowerCase();
                 const hasAvailableClass = cls.includes('available') || cls.includes('free') || cls.includes('open');
                 const hasSoldClass = cls.includes('sold') || cls.includes('occupied') || cls.includes('taken')
                     || cls.includes('reserved') || cls.includes('booked') || cls.includes('unavailable');
 
                 if (!color && !hasAvailableClass && !hasSoldClass) continue;
 
-                candidates.push({
-                    rect: bbox,
-                    color,
-                    colorSource,
+                colorCandidates.push({
+                    rect: {left: bbox.left, top: bbox.top, width: bbox.width, height: bbox.height},
+                    color, colorSource,
                     isGreen: color ? isGreenish(color) : hasAvailableClass,
                     isGray: color ? isGrayish(color) : hasSoldClass,
-                    tag,
-                    cls: cls.substring(0, 40),
+                    tag, cls: cls.substring(0, 40),
                 });
             }
 
-            // Deduplicate: multiple elements at same position (e.g. <g> + child <rect>)
-            // Keep only one candidate per grid cell (round to 5px)
+            // Deduplicate color candidates
+            const beforeDedup = colorCandidates.length;
             const seen = new Set();
-            const deduped = [];
-            for (const c of candidates) {
+            const dedupedColor = [];
+            for (const c of colorCandidates) {
                 const key = Math.round(c.rect.left / 5) + ',' + Math.round(c.rect.top / 5);
                 if (!seen.has(key)) {
                     seen.add(key);
-                    deduped.push(c);
+                    dedupedColor.push(c);
                 }
             }
-            candidates.length = 0;
-            candidates.push(...deduped);
 
-            if (candidates.length < 5) {
-                // Debug: show what's inside the seat plan
-                return {total: 0, sold: 0, error: 'too_few_seats',
-                        allElsCount: allEls.length,
-                        tagCounts,
-                        candidateCount: candidates.length,
-                        candidateSample: candidates.slice(0, 5).map(c => ({
-                            tag: c.tag, cls: c.cls,
-                            w: Math.round(c.rect.width), h: Math.round(c.rect.height),
-                            colorSource: c.colorSource, y: Math.round(c.rect.top),
-                        })),
-                        // Sample ALL seat-sized elements regardless of color
-                        seatSized: Array.from(allEls).filter(el => {
-                            const b = el.getBoundingClientRect();
-                            return b.width >= 10 && b.width <= 70 && b.height >= 10 && b.height <= 70
-                                && b.width / b.height > 0.4 && b.width / b.height < 2.5;
-                        }).slice(0, 15).map(el => {
-                            const b = el.getBoundingClientRect();
-                            const s = window.getComputedStyle(el);
-                            return {
-                                tag: el.tagName,
-                                w: Math.round(b.width), h: Math.round(b.height),
-                                bg: s.backgroundColor ? s.backgroundColor.substring(0, 40) : 'none',
-                                fill: s.fill ? s.fill.substring(0, 40) : 'none',
-                                cls: (el.className || el.getAttribute('class') || '').toString().substring(0, 50),
-                                y: Math.round(b.top),
-                            };
-                        }),
-                };
-            }
-
-            // Exclude legend: find largest Y gap
-            const ys = candidates.map(c => c.rect.top).sort((a, b) => a - b);
+            // Legend exclusion
+            const ys = dedupedColor.map(c => c.rect.top).sort((a, b) => a - b);
             let maxGap = 0, gapY = Infinity;
             for (let i = 1; i < ys.length; i++) {
                 const gap = ys[i] - ys[i - 1];
@@ -364,81 +374,237 @@ class HotCinemaScraper(BaseScraper):
             }
             const cutoffY = maxGap > 50 ? gapY : Infinity;
 
-            let totalCount = 0, soldCount = 0;
+            let colorTotal = 0, colorSold = 0;
+            let cutByLegend = 0;
             const colorSamples = {};
-            const tagSamples = {};
+            const colorSampleSeats = [];
+            const colorExcludedSample = [];
 
-            for (const c of candidates) {
-                if (c.rect.top >= cutoffY) continue;
-                totalCount++;
+            for (const c of dedupedColor) {
+                if (c.rect.top >= cutoffY) {
+                    cutByLegend++;
+                    if (colorExcludedSample.length < 5) {
+                        colorExcludedSample.push({
+                            tag: c.tag, cls: c.cls, y: Math.round(c.rect.top),
+                            reason: 'legend_cutoff', colorSource: c.colorSource,
+                        });
+                    }
+                    continue;
+                }
+                colorTotal++;
                 const key = c.colorSource || 'class-only';
                 colorSamples[key] = (colorSamples[key] || 0) + 1;
-                tagSamples[c.tag] = (tagSamples[c.tag] || 0) + 1;
-                if (c.isGray) soldCount++;
+                if (c.isGray) colorSold++;
+                if (colorSampleSeats.length < 10) {
+                    colorSampleSeats.push({
+                        tag: c.tag, cls: c.cls,
+                        w: Math.round(c.rect.width), h: Math.round(c.rect.height),
+                        x: Math.round(c.rect.left), y: Math.round(c.rect.top),
+                        colorSource: c.colorSource,
+                        isGreen: c.isGreen, isGray: c.isGray,
+                    });
+                }
             }
 
+            // ===== METHOD B: CLASS/ATTRIBUTE-BASED DETECTION =====
+            // Look for elements with "seat" in class/tag and status indicators
+            let classTotal = 0, classSold = 0;
+            const classSampleSeats = [];
+            const classStatusCounts = {};
+
+            // Search entire document (not just seatPlan) for seat elements
+            const allPageEls = document.querySelectorAll('*');
+            for (const el of allPageEls) {
+                const tag = el.tagName.toLowerCase();
+                const cls = (el.className || el.getAttribute('class') || '').toString().toLowerCase();
+                const id = (el.id || '').toLowerCase();
+
+                // Must have "seat" in class, tag, or id
+                const isSeatElement = cls.includes('seat') || tag.includes('seat') || id.includes('seat');
+                if (!isSeatElement) continue;
+
+                // Check for status indicators
+                const isAvailable = cls.includes('available') || cls.includes('free') || cls.includes('open')
+                    || el.getAttribute('data-status') === 'available'
+                    || el.getAttribute('data-available') === 'true'
+                    || el.getAttribute('data-seat-status') === 'available';
+
+                const isSold = cls.includes('sold') || cls.includes('occupied') || cls.includes('taken')
+                    || cls.includes('reserved') || cls.includes('booked') || cls.includes('unavailable')
+                    || cls.includes('disabled')
+                    || el.getAttribute('data-status') === 'sold'
+                    || el.getAttribute('data-status') === 'occupied'
+                    || el.getAttribute('data-available') === 'false'
+                    || el.getAttribute('data-seat-status') === 'sold'
+                    || el.getAttribute('data-seat-status') === 'occupied';
+
+                if (!isAvailable && !isSold) {
+                    // Track non-status seat elements for debug
+                    const statusKey = 'unknown:' + cls.substring(0, 30);
+                    classStatusCounts[statusKey] = (classStatusCounts[statusKey] || 0) + 1;
+                    continue;
+                }
+
+                classTotal++;
+                if (isSold) classSold++;
+
+                const statusKey = isSold ? 'sold' : 'available';
+                classStatusCounts[statusKey] = (classStatusCounts[statusKey] || 0) + 1;
+
+                if (classSampleSeats.length < 10) {
+                    const bbox = el.getBoundingClientRect();
+                    classSampleSeats.push({
+                        tag: el.tagName, cls: cls.substring(0, 60),
+                        id: id.substring(0, 30),
+                        w: Math.round(bbox.width), h: Math.round(bbox.height),
+                        x: Math.round(bbox.left), y: Math.round(bbox.top),
+                        status: statusKey,
+                        dataAttrs: {
+                            status: el.getAttribute('data-status'),
+                            seatStatus: el.getAttribute('data-seat-status'),
+                            available: el.getAttribute('data-available'),
+                            seatId: el.getAttribute('data-seat-id'),
+                        },
+                    });
+                }
+            }
+
+            // ===== ANNOTATE SEATS FOR SCREENSHOT =====
+            // Add colored borders to detected seats so screenshot shows what was found
+            const annotations = [];
+            for (const c of dedupedColor) {
+                const borderColor = c.rect.top >= cutoffY ? '#0088ff' // blue = legend
+                    : c.isGreen ? '#00ff00' // green = available
+                    : c.isGray ? '#ff0000' // red = sold
+                    : '#ff8800'; // orange = unknown
+                annotations.push({
+                    left: c.rect.left, top: c.rect.top,
+                    width: c.rect.width, height: c.rect.height,
+                    borderColor,
+                });
+            }
+
+            // Create overlay divs for annotation
+            for (const a of annotations) {
+                const div = document.createElement('div');
+                div.style.cssText = `position:fixed;left:${a.left}px;top:${a.top}px;`
+                    + `width:${a.width}px;height:${a.height}px;`
+                    + `border:2px solid ${a.borderColor};`
+                    + `pointer-events:none;z-index:99999;box-sizing:border-box;`;
+                div.className = '_seat_debug_overlay';
+                document.body.appendChild(div);
+            }
+
+            // Get seat container innerHTML for debug (truncated)
+            const seatContainerHTML = seatPlan.innerHTML.substring(0, 3000);
+
             return {
-                total: totalCount, sold: soldCount,
-                colorSamples, tagSamples,
-                candidatesTotal: candidates.length,
-                cutoffY: cutoffY === Infinity ? 'none' : Math.round(cutoffY),
-                maxGap: Math.round(maxGap),
+                // Method A results (color-based)
+                colorMethod: {
+                    total: colorTotal, sold: colorSold,
+                    seatSizedTotal: seatSizedAll.length,
+                    beforeDedup, afterDedup: dedupedColor.length,
+                    cutByLegend,
+                    cutoffY: cutoffY === Infinity ? 'none' : Math.round(cutoffY),
+                    maxGap: Math.round(maxGap),
+                    colorSamples,
+                    sampleSeats: colorSampleSeats,
+                    excludedSample: colorExcludedSample,
+                },
+                // Method B results (class/attribute-based)
+                classMethod: {
+                    total: classTotal, sold: classSold,
+                    statusCounts: classStatusCounts,
+                    sampleSeats: classSampleSeats,
+                },
+                // Debug info
+                debug: {
+                    allElsCount: allEls.length,
+                    tagCounts,
+                    allUniqueColors,
+                    seatSizedAll,
+                    seatContainerHTML,
+                    annotationsCount: annotations.length,
+                },
             };
         }""")
 
-        if seat_data and seat_data.get("total", 0) >= 10:
-            total = seat_data["total"]
-            sold = seat_data["sold"]
-            logger.info(
-                f"[Hot Cinema] Seats: {sold}/{total} "
-                f"colors: {seat_data.get('colorSamples', {})}"
-            )
-        else:
-            # Log DOM info to help diagnose what elements exist on the page
-            dom_info = await page.evaluate("""() => {
-                const url = window.location.href;
-                const allEls = document.querySelectorAll('*');
-                const tagCounts = {};
-                for (const el of allEls) {
-                    tagCounts[el.tagName] = (tagCounts[el.tagName] || 0) + 1;
-                }
+        # Take annotated screenshot (step 5) - overlays are now on the page
+        try:
+            await page.screenshot(path=_debug_screenshot_path("step5_annotated", movie_title, screening_time))
+            logger.info("[Hot Cinema] Step 5 screenshot saved (annotated seats)")
+        except Exception:
+            pass
 
-                // Look for any seat-like elements by various patterns
-                const seatLike = [];
-                for (const el of allEls) {
-                    const cls = (el.className || '').toString().toLowerCase();
-                    const id = (el.id || '').toLowerCase();
-                    if (cls.includes('seat') || cls.includes('chair') || cls.includes('place')
-                        || cls.includes('מקום') || cls.includes('כיסא')
-                        || id.includes('seat') || id.includes('chair')) {
-                        seatLike.push({
-                            tag: el.tagName,
-                            cls: cls.substring(0, 80),
-                            id: id.substring(0, 40),
-                            children: el.children.length,
-                        });
-                    }
-                }
-
-                // Count SVG elements
-                const svgEls = document.querySelectorAll('svg, svg *');
-
-                // Check for canvas
-                const canvasEls = document.querySelectorAll('canvas');
-
-                return {
-                    url,
-                    totalElements: allEls.length,
-                    svgElements: svgEls.length,
-                    canvasElements: canvasEls.length,
-                    seatLikeElements: seatLike.slice(0, 10),
-                    bodyTextPreview: document.body ? document.body.innerText.substring(0, 300) : '',
-                };
+        # Clean up overlay divs
+        try:
+            await page.evaluate("""() => {
+                document.querySelectorAll('._seat_debug_overlay').forEach(el => el.remove());
             }""")
+        except Exception:
+            pass
+
+        if seat_data:
+            color = seat_data.get("colorMethod", {})
+            cls = seat_data.get("classMethod", {})
+            debug = seat_data.get("debug", {})
+
+            # Log both methods side by side
             logger.warning(
-                f"[Hot Cinema] No seat elements found. "
-                f"seat_data={seat_data} dom_info={dom_info}"
+                f"[Hot Cinema] Seats COLOR method: {color.get('total', 0)} total, "
+                f"{color.get('sold', 0)} sold | "
+                f"seatSized={color.get('seatSizedTotal', '?')}, "
+                f"beforeDedup={color.get('beforeDedup', '?')}, "
+                f"afterDedup={color.get('afterDedup', '?')}, "
+                f"cutByLegend={color.get('cutByLegend', '?')}, "
+                f"cutoffY={color.get('cutoffY', '?')}"
             )
+            logger.warning(
+                f"[Hot Cinema] Seats CLASS method: {cls.get('total', 0)} total, "
+                f"{cls.get('sold', 0)} sold | "
+                f"statusCounts={cls.get('statusCounts', {})}"
+            )
+            logger.warning(
+                f"[Hot Cinema] All unique colors in seat-sized elements: "
+                f"{debug.get('allUniqueColors', {})}"
+            )
+            logger.warning(
+                f"[Hot Cinema] Color method samples: {color.get('sampleSeats', [])[:5]}"
+            )
+            logger.warning(
+                f"[Hot Cinema] Class method samples: {cls.get('sampleSeats', [])[:5]}"
+            )
+            if color.get('excludedSample'):
+                logger.warning(
+                    f"[Hot Cinema] Excluded by legend: {color.get('excludedSample')}"
+                )
+            logger.info(
+                f"[Hot Cinema] Seat-sized elements (all): {debug.get('seatSizedAll', [])[:10]}"
+            )
+
+            # Use the method with higher total count
+            color_total = color.get("total", 0)
+            class_total = cls.get("total", 0)
+
+            if color_total >= 10 or class_total >= 10:
+                if class_total > color_total:
+                    total = class_total
+                    sold = cls.get("sold", 0)
+                    logger.info(f"[Hot Cinema] Using CLASS method: {sold}/{total}")
+                else:
+                    total = color_total
+                    sold = color.get("sold", 0)
+                    logger.info(f"[Hot Cinema] Using COLOR method: {sold}/{total}")
+            else:
+                logger.warning(
+                    f"[Hot Cinema] Both methods found too few seats. "
+                    f"color={color_total}, class={class_total}. "
+                    f"seat_data error={seat_data.get('error', 'none')}"
+                )
+                # Log container HTML for debugging
+                html = debug.get("seatContainerHTML", "")
+                if html:
+                    logger.warning(f"[Hot Cinema] Seat container HTML (first 1000): {html[:1000]}")
 
         # Fallback: look for text-based seat info
         if total == 0:
@@ -448,12 +614,10 @@ class HotCinemaScraper(BaseScraper):
                 if remaining_match:
                     total = int(remaining_match.group(1))
                     sold = 0
-                # Look for "X/Y מקומות" or similar seat ratio - must have context
-                # to avoid matching dates like "11/3"
                 ratio_match = re.search(r"(\d+)\s*/\s*(\d+)\s*(?:מקומות|כיסאות|seats)", body_text)
                 if ratio_match:
                     s, t = int(ratio_match.group(1)), int(ratio_match.group(2))
-                    if t >= s and t >= 10:  # sanity: total >= sold, reasonable hall size
+                    if t >= s and t >= 10:
                         sold = s
                         total = t
             except Exception:
@@ -1091,7 +1255,8 @@ class HotCinemaScraper(BaseScraper):
     # Navigate ticket purchase flow to reach seat map
     # ------------------------------------------------------------------
 
-    async def _navigate_to_seat_map(self, page: Page, booking_url: str) -> tuple[int, int]:
+    async def _navigate_to_seat_map(self, page: Page, booking_url: str,
+                                    movie_title: str = "", screening_time: str = "") -> tuple[int, int]:
         """Navigate from booking URL through ticket selection to seat map.
 
         Flow: booking_url → ticket page → click + → click המשך → seat map
@@ -1106,10 +1271,11 @@ class HotCinemaScraper(BaseScraper):
             current_url = page.url
             logger.warning(f"[Hot Cinema] Seat map: loaded {current_url}")
 
-            # Save debug screenshot
+            # Save debug screenshots - step 1: booking page
             try:
                 await page.screenshot(path=_TICKET_DEBUG_SCREENSHOT)
-                logger.info(f"[Hot Cinema] Ticket page screenshot saved → {_TICKET_DEBUG_SCREENSHOT}")
+                await page.screenshot(path=_debug_screenshot_path("step1_booking", movie_title, screening_time))
+                logger.info(f"[Hot Cinema] Step 1 screenshot saved (booking page)")
             except Exception:
                 pass
 
@@ -1125,7 +1291,7 @@ class HotCinemaScraper(BaseScraper):
             # Check if already on seat map
             if "/seats" in current_url:
                 logger.info("[Hot Cinema] Seat map: already on seat page")
-                return await self._count_seats_on_page(page)
+                return await self._count_seats_on_page(page, movie_title=movie_title, screening_time=screening_time)
 
             # Shortcut: try navigating directly to /seats
             # Extract base site URL (e.g., /site/1183)
@@ -1140,9 +1306,10 @@ class HotCinemaScraper(BaseScraper):
                     logger.info(f"[Hot Cinema] Seat map: shortcut worked → {page.url}")
                     try:
                         await page.screenshot(path=_TICKET_DEBUG_SCREENSHOT)
+                        await page.screenshot(path=_debug_screenshot_path("step4_seat_map_shortcut", movie_title, screening_time))
                     except Exception:
                         pass
-                    total, sold = await self._count_seats_on_page(page)
+                    total, sold = await self._count_seats_on_page(page, movie_title=movie_title, screening_time=screening_time)
                     logger.info(f"[Hot Cinema] Seat map: counted {sold}/{total} seats")
                     return total, sold
 
@@ -1250,6 +1417,12 @@ class HotCinemaScraper(BaseScraper):
             if plus_clicked:
                 logger.info(f"[Hot Cinema] Seat map: clicked + button via {plus_clicked}")
                 await asyncio.sleep(2)
+                # Step 2 screenshot: after clicking +
+                try:
+                    await page.screenshot(path=_debug_screenshot_path("step2_plus_click", movie_title, screening_time))
+                    logger.info("[Hot Cinema] Step 2 screenshot saved (after + click)")
+                except Exception:
+                    pass
             else:
                 logger.warning("[Hot Cinema] Seat map: could not find + button")
 
@@ -1296,16 +1469,25 @@ class HotCinemaScraper(BaseScraper):
                 except Exception:
                     pass
                 await asyncio.sleep(3)
+                # Step 3 screenshot: after clicking המשך
+                try:
+                    await page.screenshot(path=_debug_screenshot_path("step3_continue", movie_title, screening_time))
+                    logger.info("[Hot Cinema] Step 3 screenshot saved (after continue)")
+                except Exception:
+                    pass
             else:
                 logger.warning("[Hot Cinema] Seat map: could not find המשך button")
 
             logger.info(f"[Hot Cinema] Seat map: now on {page.url}")
+            # Step 4 screenshot: seat map page
             try:
                 await page.screenshot(path=_TICKET_DEBUG_SCREENSHOT)
+                await page.screenshot(path=_debug_screenshot_path("step4_seat_map", movie_title, screening_time))
+                logger.info("[Hot Cinema] Step 4 screenshot saved (seat map page)")
             except Exception:
                 pass
 
-            total, sold = await self._count_seats_on_page(page)
+            total, sold = await self._count_seats_on_page(page, movie_title=movie_title, screening_time=screening_time)
             logger.info(f"[Hot Cinema] Seat map: counted {sold}/{total} seats")
             return total, sold
 
@@ -1360,7 +1542,7 @@ class HotCinemaScraper(BaseScraper):
         return result
 
     # Testing limit — set to None for full scrape
-    _TEST_MOVIE_LIMIT = 10
+    _TEST_MOVIE_LIMIT = 5
 
     async def scrape_screenings(self, on_progress=None) -> list[ScrapedScreening]:
         """Daily: fetch screenings via API (seat counts deferred to ticket updates)."""
@@ -1535,7 +1717,11 @@ class HotCinemaScraper(BaseScraper):
 
                     if booking_url:
                         try:
-                            total, sold = await self._navigate_to_seat_map(page, booking_url)
+                            total, sold = await self._navigate_to_seat_map(
+                                page, booking_url,
+                                movie_title=info["movie_title"],
+                                screening_time=info["showtime"].strftime("%H%M"),
+                            )
                             if total > 0:
                                 total_seats = total
                                 tickets_sold = sold

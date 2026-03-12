@@ -194,6 +194,52 @@ def debug_screenshot_tickets():
         content={"detail": "No ticket debug screenshot yet. Run a scrape with ticket updates first."},
     )
 
+# Debug screenshots gallery
+_DEBUG_SCREENSHOTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "debug_screenshots")
+
+
+@app.get("/api/debug-screenshots")
+def list_debug_screenshots():
+    """List all debug screenshots with metadata."""
+    os.makedirs(_DEBUG_SCREENSHOTS_DIR, exist_ok=True)
+    files = []
+    for f in sorted(os.listdir(_DEBUG_SCREENSHOTS_DIR), reverse=True):
+        if not f.endswith(".png"):
+            continue
+        path = os.path.join(_DEBUG_SCREENSHOTS_DIR, f)
+        stat = os.stat(path)
+        files.append({
+            "filename": f,
+            "size_kb": round(stat.st_size / 1024, 1),
+            "created_at": stat.st_mtime,
+        })
+    return files
+
+
+@app.get("/api/debug-screenshots/{filename}")
+def get_debug_screenshot(filename: str):
+    """Serve a specific debug screenshot."""
+    # Prevent path traversal
+    if "/" in filename or "\\" in filename or ".." in filename:
+        return JSONResponse(status_code=400, content={"detail": "Invalid filename"})
+    path = os.path.join(_DEBUG_SCREENSHOTS_DIR, filename)
+    if os.path.exists(path):
+        return FileResponse(path, media_type="image/png")
+    return JSONResponse(status_code=404, content={"detail": "Screenshot not found"})
+
+
+@app.delete("/api/debug-screenshots")
+def clear_debug_screenshots():
+    """Delete all debug screenshots."""
+    os.makedirs(_DEBUG_SCREENSHOTS_DIR, exist_ok=True)
+    count = 0
+    for f in os.listdir(_DEBUG_SCREENSHOTS_DIR):
+        if f.endswith(".png"):
+            os.remove(os.path.join(_DEBUG_SCREENSHOTS_DIR, f))
+            count += 1
+    return {"deleted": count}
+
+
 # Serve frontend build if it exists
 frontend_build = os.path.join(os.path.dirname(__file__), "..", "frontend", "build")
 if os.path.exists(frontend_build):
