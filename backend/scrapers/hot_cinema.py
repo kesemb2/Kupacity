@@ -246,9 +246,11 @@ class HotCinemaScraper(BaseScraper):
                 return c && c.g > 80 && c.g > c.r * 1.2 && c.g > c.b * 1.2;
             }
 
-            function isGrayish(c) {
-                return c && Math.abs(c.r - c.g) < 40 && Math.abs(c.g - c.b) < 40
-                    && c.r > 50 && c.r < 210;
+            function isSignificantColor(c) {
+                // Not transparent/black/white - i.e. a real visible color
+                if (!c) return false;
+                const sum = c.r + c.g + c.b;
+                return sum > 60 && sum < 700 && (c.r > 30 || c.g > 30 || c.b > 30);
             }
 
             function colorToStr(c) {
@@ -314,25 +316,25 @@ class HotCinemaScraper(BaseScraper):
                     });
                 }
 
-                // Check color sources
+                // Check color sources - accept ANY significant color (not just green/gray)
                 let color = null;
                 let colorSource = '';
 
                 const bg = parseColor(bgRaw);
-                if (bg && (isGreenish(bg) || isGrayish(bg))) {
+                if (bg && isSignificantColor(bg)) {
                     color = bg;
                     colorSource = 'bg:' + bgRaw;
                 }
                 if (!color) {
                     const fill = parseColor(fillRaw);
-                    if (fill && (isGreenish(fill) || isGrayish(fill))) {
+                    if (fill && isSignificantColor(fill)) {
                         color = fill;
                         colorSource = 'fill:' + fillRaw;
                     }
                 }
                 if (!color) {
                     const fillAttr = parseColor(el.getAttribute('fill'));
-                    if (fillAttr && (isGreenish(fillAttr) || isGrayish(fillAttr))) {
+                    if (fillAttr && isSignificantColor(fillAttr)) {
                         color = fillAttr;
                         colorSource = 'attr:' + el.getAttribute('fill');
                     }
@@ -344,11 +346,14 @@ class HotCinemaScraper(BaseScraper):
 
                 if (!color && !hasAvailableClass && !hasSoldClass) continue;
 
+                // Key logic: green = available, everything else = sold
+                const green = color ? isGreenish(color) : hasAvailableClass;
+
                 colorCandidates.push({
                     rect: {left: bbox.left, top: bbox.top, width: bbox.width, height: bbox.height},
                     color, colorSource,
-                    isGreen: color ? isGreenish(color) : hasAvailableClass,
-                    isGray: color ? isGrayish(color) : hasSoldClass,
+                    isGreen: green,
+                    isGray: !green,  // anything not green is sold
                     tag, cls: cls.substring(0, 40),
                 });
             }
