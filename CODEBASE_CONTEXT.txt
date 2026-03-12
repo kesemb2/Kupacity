@@ -1,0 +1,531 @@
+================================================================================
+  CINEMA DASHBOARD - COMPLETE CODEBASE DOCUMENTATION
+  Israeli Cinema Box Office Analytics Platform
+================================================================================
+
+PROJECT OVERVIEW
+================
+A full-stack web application that scrapes ticket/screening data from Israeli
+cinema chains (primarily Hot Cinema) and presents analytics through an
+interactive dashboard. Built with Python/FastAPI backend and React frontend.
+
+Tech Stack:
+- Backend:  Python 3, FastAPI 0.115.6, SQLAlchemy 2.0.36, SQLite (aiosqlite)
+- Scraping: Playwright (with stealth plugin), httpx, BeautifulSoup4
+- Scheduling: APScheduler 3.11.0
+- Frontend: React 18.3.1, Recharts 2.15.0, Axios 1.7.9
+- Deploy:   Docker Compose (backend:8000, frontend:3000→80)
+- Hosting:  Render (backend fallback URL: cinema-back-kjkx.onrender.com)
+
+================================================================================
+FILE STRUCTURE
+================================================================================
+
+cinema/
+├── docker-compose.yml          # Backend (8000) + Frontend (3000→80)
+├── CODEBASE_CONTEXT.txt        # This file
+│
+├── backend/
+│   ├── Dockerfile
+│   ├── requirements.txt        # Python dependencies
+│   ├── main.py                 # FastAPI app, lifespan, scheduler setup
+│   ├── database.py             # SQLAlchemy engine, session factory, SQLite
+│   ├── seed_data.py            # Seeds Hot Cinema chain + 10 branches
+│   │
+│   ├── models/
+│   │   └── models.py           # 5 ORM models: CinemaChain, Cinema, Movie,
+│   │                           #   Screening, ScrapeLog
+│   │
+│   ├── api/
+│   │   └── routes.py           # All REST API endpoints (/api/*)
+│   │
+│   └── scrapers/
+│       ├── base.py             # BaseScraper ABC + ScrapedMovie/ScrapedScreening
+│       ├── hot_cinema.py       # Hot Cinema scraper (Playwright, 1574 lines)
+│       ├── cinema_city.py      # Cinema City / Yes Planet scraper (REST API)
+│       ├── lev_cinema.py       # Lev Cinema scraper (HTML parsing)
+│       ├── globus_max.py       # Globus Max scraper (REST API)
+│       └── manager.py          # Orchestrates scraping, DB upserts, scheduling
+│
+└── frontend/
+    ├── Dockerfile
+    ├── package.json            # React 18, Recharts, Axios
+    └── src/
+        ├── index.js
+        ├── index.css           # Global styles, dark theme, Heebo Hebrew font
+        ├── App.js              # Main app - navigation, health check, layout
+        │
+        ├── api/
+        │   └── client.js       # Axios client + all API call functions
+        │
+        ├── pages/
+        │   ├── Dashboard.js    # 4 stat cards, 4 charts (line + bar)
+        │   ├── MoviesPage.js   # Movie list with search, sort, occupancy bars
+        │   ├── MovieDetail.js  # Single movie: charts + screening table
+        │   ├── CinemasPage.js  # Cinema branches list with stats
+        │   ├── CitiesPage.js   # Cities analytics: bar chart + table
+        │   └── ScrapePage.js   # Trigger scrape, progress bar, logs table
+        │
+        └── components/
+            ├── StatCard.js     # Metric card (title, value, icon, color)
+            ├── ChartCard.js    # Chart wrapper with title
+            └── DataTable.js    # Generic table with column config, row click
+
+================================================================================
+DATABASE SCHEMA (SQLite - cinema.db)
+================================================================================
+Engine: SQLite with WAL mode, check_same_thread=False, timeout=30s
+
+--- TABLE: cinema_chains ---
+  id          INTEGER  PK, auto-increment
+  name        STRING   UNIQUE, NOT NULL  (e.g. "Hot Cinema")
+  name_he     STRING   (e.g. "הוט סינמה")
+  website     STRING   (e.g. "https://hotcinema.co.il")
+  logo_url    STRING
+  created_at  DATETIME default=utcnow
+  → relationship: cinemas (one-to-many → Cinema)
+
+--- TABLE: cinemas ---
+  id          INTEGER  PK, auto-increment
+  chain_id    INTEGER  FK → cinema_chains.id, NOT NULL
+  name        STRING   NOT NULL  (e.g. "Hot Cinema Modi'in")
+  name_he     STRING   (e.g. "הוט סינמה מודיעין")
+  city        STRING   NOT NULL  (e.g. "Modi'in")
+  city_he     STRING   (e.g. "מודיעין")
+  address     STRING
+  halls_count INTEGER  (number of screening halls)
+  created_at  DATETIME default=utcnow
+  → relationships: chain (many-to-one → CinemaChain), screenings (one-to-many)
+
+--- TABLE: movies ---
+  id               INTEGER  PK, auto-increment
+  title            STRING   NOT NULL  (English/original title)
+  title_he         STRING   (Hebrew title)
+  genre            STRING
+  duration_minutes INTEGER
+  release_date     STRING
+  poster_url       STRING
+  rating           STRING
+  director         STRING
+  created_at       DATETIME default=utcnow
+  → relationship: screenings (one-to-many → Screening)
+  → constraint: UNIQUE(title, release_date)
+
+--- TABLE: screenings ---
+  id            INTEGER  PK, auto-increment
+  movie_id      INTEGER  FK → movies.id, NOT NULL
+  cinema_id     INTEGER  FK → cinemas.id, NOT NULL
+  showtime      DATETIME NOT NULL
+  hall          STRING   (hall number/name)
+  format        STRING   ("2D", "3D", "IMAX", "4DX", "ScreenX")
+  language      STRING   ("dubbed", "subtitled", "original")
+  ticket_price  FLOAT
+  tickets_sold  INTEGER  default=0
+  total_seats   INTEGER  (hall capacity)
+  revenue       FLOAT    default=0.0
+  status        STRING   default="active" ("active" or "closed")
+  scraped_at    DATETIME default=utcnow
+  created_at    DATETIME default=utcnow
+  → relationships: movie (→ Movie), cinema (→ Cinema)
+
+--- TABLE: scrape_logs ---
+  id                INTEGER  PK, auto-increment
+  chain_name        STRING   NOT NULL  (e.g. "Hot Cinema")
+  status            STRING   NOT NULL  ("running", "success", "error")
+  movies_found      INTEGER  default=0
+  screenings_found  INTEGER  default=0
+  error_message     STRING
+  duration_seconds  FLOAT
+  progress          STRING   (JSON: {"phase":"...", "current":N, "total":N, "detail":"..."})
+  created_at        DATETIME default=utcnow
+
+================================================================================
+API ENDPOINTS (backend/api/routes.py) - prefix: /api
+================================================================================
+
+DASHBOARD:
+  GET /api/dashboard/summary
+    → { total_movies, total_cinemas, total_screenings, total_tickets_sold,
+        top_movie: { title, title_he, tickets_sold, screenings } }
+
+MOVIES:
+  GET /api/movies
+    → [{ id, title, title_he, genre, duration_minutes, release_date, poster_url,
+         rating, director, screenings_count, total_tickets_sold, avg_occupancy }]
+    Sorted by: tickets_sold DESC
+
+  GET /api/movies/{movie_id}
+    → { movie: {...}, by_cinema: [{cinema, city, screenings, tickets_sold}],
+        by_date: [{date, tickets_sold, screenings}],
+        screenings: [{id, cinema, city, showtime, hall, format, total_seats,
+                      tickets_sold, occupancy, status}] }
+
+CINEMAS:
+  GET /api/cinemas
+    → [{ id, name, name_he, city, city_he, chain, chain_he, halls_count,
+         screenings_count, total_tickets_sold }]
+    Sorted by: total_tickets_sold DESC
+
+CITIES:
+  GET /api/cities
+    → [{ city, city_he, cinemas_count, screenings_count, total_tickets_sold }]
+    Sorted by: total_tickets_sold DESC
+
+ANALYTICS:
+  GET /api/analytics/tickets-by-date?days=14
+    → [{ date, tickets_sold, screenings_count }]
+
+  GET /api/analytics/tickets-by-branch
+    → [{ name, city, tickets_sold, screenings_count }]
+
+  GET /api/analytics/top-movies?limit=10
+    → [{ title, title_he, genre, total_tickets_sold, screenings_count }]
+
+  GET /api/analytics/occupancy-by-format
+    → [{ format, screenings_count, avg_occupancy, total_tickets }]
+
+SCRAPING:
+  POST /api/scrape/trigger
+    → Runs scrape in background via asyncio.create_task
+    → { status: "started", message: "סריקה הופעלה ברקע..." }
+
+  GET /api/scrape-logs?limit=20
+    → [{ id, chain_name, status, movies_found, screenings_found,
+         error_message, duration_seconds, progress, created_at }]
+
+OTHER (defined in main.py):
+  GET /api/health              → { status: "ok", service: "Hot Cinema Dashboard" }
+  GET /                        → { status: "ok", service: "Hot Cinema Dashboard", docs: "/docs" }
+  GET /api/debug-screenshot    → Returns debug.png (last scraper screenshot)
+  GET /api/debug-screenshot-tickets → Returns debug_tickets.png
+
+================================================================================
+SCRAPER ARCHITECTURE (backend/scrapers/)
+================================================================================
+
+--- BASE CLASSES (base.py) ---
+
+ScrapedMovie:
+  fields: title, title_he, genre, duration_minutes, release_date,
+          poster_url, rating, director, detail_url
+
+ScrapedScreening:
+  fields: movie_title, cinema_name, city, showtime, hall, format,
+          language, ticket_price, tickets_sold, total_seats, revenue
+
+BaseScraper (ABC):
+  - Uses httpx.AsyncClient with Chrome UA and Hebrew locale headers
+  - Abstract properties: chain_name, chain_name_he, base_url
+  - Abstract methods: scrape_movies() → list[ScrapedMovie]
+                      scrape_screenings() → list[ScrapedScreening]
+  - run() → executes both scrape methods with timing
+  - close() → closes HTTP client
+
+--- HOT CINEMA SCRAPER (hot_cinema.py) - PRIMARY SCRAPER ---
+
+HotCinemaScraper(BaseScraper) - 1574 lines, Playwright-based
+
+10 Branches:
+  Modi'in, Kfar Saba, Petah Tikva, Rehovot, Haifa,
+  Kiryon, Karmiel, Nahariya, Ashkelon, Ashdod
+
+URLs:
+  - Theater page:  https://hotcinema.co.il/theater/{id}/{slug}
+  - Movie page:    https://hotcinema.co.il/movie/{id}/{slug}
+  - Tickets:       https://tickets.hotcinema.co.il/site/{id}
+
+Key Methods:
+  _launch_browser()         - Playwright chromium with stealth, Hebrew locale
+  _human_delay()            - Random delay 0.5-1.5s (anti-bot)
+  _simulate_human()         - Scroll page up/down simulation
+  _open_url()               - Navigate with wait, optional screenshot
+  _count_seats_on_page()    - JavaScript color parsing of seat map:
+                              green = available, gray = sold
+                              Returns (total_seats, tickets_sold)
+  _scrape_theater_page()    - Collect movie URLs from theater pages
+  _scrape_movie_screenings()- Intercepts movieevents API responses
+                              Parses theater, format, language, time
+  scrape_movies()           - Visit all theater pages → movie catalog
+  scrape_screenings()       - Extract next 7 days of screenings
+  scrape_ticket_updates()   - Enter each screening's seat page → count seats
+
+All 3 scrape methods accept optional on_progress callback for live UI updates.
+
+Proxy support via env vars:
+  SCRAPER_PROXY_SERVER, SCRAPER_PROXY_USERNAME, SCRAPER_PROXY_PASSWORD
+
+Debug: saves debug.png / debug_tickets.png after page loads
+
+--- CINEMA CITY SCRAPER (cinema_city.py) ---
+
+CinemaCityScraper(BaseScraper)
+
+7 Branches:
+  Yes Planet: Rishon LeZion (1058), Haifa (1071), Beer Sheva (1072), Jerusalem (1073)
+  Cinema City: Glilot (1025), Netanya (1070), Ashdod (1075)
+
+Approach: REST API calls to Cinema City's internal data API
+  URL pattern: /il/data-api-service/v1/quickbook/10104/film-events/in-cinema/{id}/at-date/{date}
+  Format detection via attributeIds (IMAX, 3D, 4DX, ScreenX)
+  Gets soldSeats and seatsAvailable directly from API
+
+--- LEV CINEMA SCRAPER (lev_cinema.py) ---
+
+LevCinemaScraper(BaseScraper)
+
+3 Branches: Smadar, Dizengoff, Givatayim
+Approach: HTML parsing with BeautifulSoup
+  Selectors: .movie-item, .film-item, .movie-card for movies
+             .screening-item, .show-item for screenings
+
+--- GLOBUS MAX SCRAPER (globus_max.py) ---
+
+GlobusMaxScraper(BaseScraper)
+
+4 Branches: Rishon LeZion, Holon, Hadera, Netanya
+Approach: REST API at /api/screenings/{branch_id}?date=YYYY-MM-DD
+  JSON response with screenType, capacity, ticketsSold
+
+================================================================================
+SCRAPER MANAGER (backend/scrapers/manager.py)
+================================================================================
+
+Helper Functions:
+  _get_or_create_chain(db, name, name_he, website) → CinemaChain
+  _get_or_create_cinema(db, chain_id, name, city, name_he, city_he) → Cinema
+  _get_or_create_movie(db, scraped) → Movie
+  _lookup_hebrew(cinema_name) → (name_he, city_he)  via HOT_CINEMA_BRANCHES
+  _upsert_screenings(db, chain, screenings)
+    - Creates cinema/movie if needed
+    - Updates existing screening only if total_seats > 0 (real seat data)
+    - Otherwise creates new screening record
+  _make_progress_callback(db, log) → callback function
+    - Updates ScrapeLog.progress JSON field in real-time
+
+Scheduled Tasks (configured in main.py lifespan):
+
+  run_initial_scrape(db)
+    - Runs on startup if Movies table is empty
+    - Scrapes movies → screenings → ticket updates (all 3 phases)
+    - Creates ScrapeLog with status="running" → "success"/"error"
+
+  hot_cinema_weekly_movies(db)
+    - Schedule: Sunday 03:00
+    - Full movie catalog refresh from all theater pages
+
+  hot_cinema_daily_screenings(db)
+    - Schedule: Daily 06:00
+    - Screening schedule refresh for next 7 days
+
+  hot_cinema_update_tickets(db)
+    - Schedule: Every 5 hours
+    - Ticket count updates (enters seat map pages)
+
+  close_expired_screenings(db)
+    - Schedule: Every 1 minute
+    - Marks screenings as "closed" if showtime was 10+ minutes ago
+
+================================================================================
+MAIN APPLICATION (backend/main.py)
+================================================================================
+
+FastAPI Config:
+  title: "Hot Cinema Israel Dashboard"
+  version: 2.0.0
+  CORS: allow all origins
+
+Lifespan (startup):
+  1. Create all DB tables (Base.metadata.create_all)
+  2. Seed Hot Cinema chain + 10 branches if DB empty
+  3. Start APScheduler (AsyncIOScheduler) with 4 scheduled jobs
+  4. Run initial scrape as background task if Movies table empty
+
+Log Filtering:
+  _QuietPollFilter: suppresses /api/scrape-logs from uvicorn access log
+
+Static Files:
+  Mounts React build at "/" if frontend/build directory exists
+
+================================================================================
+SEED DATA (backend/seed_data.py)
+================================================================================
+
+Creates on first run:
+  - 1 CinemaChain: "Hot Cinema" / "הוט סינמה"
+  - 10 Cinema branches with Hebrew names, cities, hall counts:
+    Modi'in (8), Kfar Saba (8), Petah Tikva (10), Rehovot (7),
+    Haifa (9), Kiryon (7), Karmiel (6), Nahariya (5),
+    Ashkelon (7), Ashdod (8)
+
+Movies and screenings are NOT seeded - they come from scrapers only.
+
+================================================================================
+FRONTEND ARCHITECTURE
+================================================================================
+
+--- APP.JS (Main) ---
+State: page (string), selectedMovieId, backendStatus (checking/online/offline)
+Health check: pings /api/health every 30 seconds
+Navigation: 5 tabs - דאשבורד, סרטים, סניפים, ערים, סריקה
+Layout: Sticky header → Main content → Footer with connection status badge
+Font: Heebo (Hebrew), dark theme throughout
+
+--- PAGES ---
+
+Dashboard.js:
+  - Fetches: summary, ticketsByDate(14), topMovies(8), ticketsByBranch, occupancyByFormat
+  - 4 stat cards: tickets sold, movies, screenings, cinemas
+  - Top movie highlight box
+  - Line chart: 14-day ticket trend
+  - Bar chart: tickets by branch (horizontal)
+  - Bar chart: top 8 movies (horizontal)
+  - Bar chart: average occupancy by format (vertical)
+
+MoviesPage.js:
+  - Fetches: movies list
+  - Search input (Hebrew/English title filter)
+  - Sort dropdown: by tickets / screenings / occupancy
+  - DataTable with: index, title (he+en), genre, rating, director,
+    screenings count, tickets sold (blue), occupancy progress bar
+  - Row click → MovieDetail page
+
+MovieDetail.js:
+  - Fetches: movieDetail(id)
+  - Back button to movies list
+  - Movie header: titles, director, genre, duration, rating, release date
+  - Stats: total tickets, screenings, distinct cinemas
+  - Line chart: daily tickets
+  - Bar chart: tickets by cinema (top 10)
+  - DataTable: by cinema breakdown
+  - DataTable: individual screenings with date, time, cinema, city,
+    hall, format, total seats, sold, occupancy bar
+
+CinemasPage.js:
+  - Fetches: cinemas list
+  - 3 stat cards: branches count, total tickets, total screenings
+  - DataTable: branch name (Hebrew), city, halls, screenings, tickets
+
+CitiesPage.js:
+  - Fetches: cities list
+  - Bar chart: tickets by city (horizontal)
+  - DataTable: city, cinemas count, screenings count, tickets
+
+ScrapePage.js:
+  - Trigger scrape button (disabled while running)
+  - Debug screenshot buttons (main site + tickets)
+  - ProgressCard component: shows phase, progress bar %, current/total, detail
+  - Polls scrape-logs every 3s when running, 10s otherwise
+  - Logs table: date, chain, status badge, movies, screenings, duration, error
+
+--- COMPONENTS ---
+
+StatCard.js:
+  Props: title, value, subtitle, color, icon
+  Dark card with metric display
+
+ChartCard.js:
+  Props: title, children, style
+  Dark card wrapper for charts
+
+DataTable.js:
+  Props: columns, data, onRowClick
+  Generic table - columns define { header, key, render, align }
+  Default text-align: right (RTL for Hebrew)
+  Hover effect on rows, pointer cursor if onRowClick provided
+
+--- API CLIENT (api/client.js) ---
+Base URL: process.env.REACT_APP_API_URL || "https://cinema-back-kjkx.onrender.com"
+Axios instance: baseURL = "{API_BASE}/api", timeout = 10s
+
+Functions:
+  fetchDashboardSummary()         → GET /dashboard/summary
+  fetchMovies()                   → GET /movies
+  fetchMovieDetail(id)            → GET /movies/{id}
+  fetchCinemas()                  → GET /cinemas
+  fetchCities()                   → GET /cities
+  fetchTicketsByDate(days=14)     → GET /analytics/tickets-by-date?days={days}
+  fetchTicketsByBranch()          → GET /analytics/tickets-by-branch
+  fetchTopMovies(limit=10)        → GET /analytics/top-movies?limit={limit}
+  fetchOccupancyByFormat()        → GET /analytics/occupancy-by-format
+  fetchScrapeLogs()               → GET /scrape-logs
+  triggerScrape()                 → POST /scrape/trigger
+  checkHealth()                   → GET /health (15s timeout, returns {ok: bool})
+  getDebugScreenshotUrl()         → URL string for debug screenshot
+  getDebugScreenshotTicketsUrl()  → URL string for ticket debug screenshot
+
+================================================================================
+DATA FLOW
+================================================================================
+
+1. SCRAPING:
+   Scheduler triggers → HotCinemaScraper launches Playwright browser
+   → Visits theater pages → Collects movie URLs
+   → Visits movie pages → Intercepts API responses → Gets screening data
+   → Visits seat map pages → Counts sold/available seats by color
+   → Returns ScrapedMovie[] and ScrapedScreening[]
+
+2. DATABASE:
+   Manager receives scraped data → _get_or_create_chain/cinema/movie
+   → _upsert_screenings (create new or update if real seat data)
+   → ScrapeLog tracks progress in real-time
+
+3. API:
+   FastAPI routes query SQLAlchemy ORM → Aggregate with func.sum/count/avg
+   → Return JSON responses
+
+4. FRONTEND:
+   React pages call API client on mount (useEffect)
+   → Render with Recharts (charts) and DataTable (tables)
+   → Auto-refresh: health check every 30s, scrape logs every 3-10s
+
+================================================================================
+ENVIRONMENT VARIABLES
+================================================================================
+
+Backend (optional):
+  SCRAPER_PROXY_SERVER    - Proxy URL for Playwright (http://host:port)
+  SCRAPER_PROXY_USERNAME  - Proxy authentication username
+  SCRAPER_PROXY_PASSWORD  - Proxy authentication password
+
+Frontend:
+  REACT_APP_API_URL       - Backend API base URL
+                            (default: https://cinema-back-kjkx.onrender.com)
+
+================================================================================
+KEY DESIGN DECISIONS
+================================================================================
+
+1. SQLite (not Postgres): Lightweight, zero-config, single-file DB
+   WAL mode enabled for concurrent read/write
+2. Playwright (not Selenium): Better stealth, built-in browser management
+3. Seat counting via color parsing: Hot Cinema has no API for ticket counts,
+   so the scraper reads the seat map UI and counts colored seats
+4. All inline styles (no CSS modules/Tailwind): Quick iteration, dark theme
+5. No authentication: Internal/personal analytics tool
+6. Screenings marked "closed" automatically 10 min after showtime
+7. Upsert logic: only updates ticket counts when total_seats > 0
+   (prevents overwriting real data with empty scrape results)
+8. No tests: Relies on manual testing and scrape log monitoring
+
+================================================================================
+SUPPORTED CINEMA CHAINS & BRANCHES
+================================================================================
+
+Hot Cinema (הוט סינמה) - PRIMARY, fully scraped:
+  Modi'in, Kfar Saba, Petah Tikva, Rehovot, Haifa,
+  Kiryon, Karmiel, Nahariya, Ashkelon, Ashdod
+
+Cinema City / Yes Planet (סינמה סיטי / יס פלאנט) - scraper exists:
+  Yes Planet: Rishon LeZion, Haifa, Beer Sheva, Jerusalem
+  Cinema City: Glilot, Netanya, Ashdod
+
+Lev Cinema (לב) - scraper exists:
+  Smadar, Dizengoff, Givatayim
+
+Globus Max (גלובוס מקס) - scraper exists:
+  Rishon LeZion, Holon, Hadera, Netanya
+
+Note: Only Hot Cinema is integrated into the scheduling system.
+Other scrapers exist in code but are not called by the manager.
+
+================================================================================
