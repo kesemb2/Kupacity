@@ -292,7 +292,9 @@ class HotCinemaScraper(BaseScraper):
 
                 // This is a seat-sized element
                 const style = window.getComputedStyle(el);
-                const cls = (el.className || el.getAttribute('class') || '').toString().toLowerCase();
+                const cls = (typeof el.className === 'string' ? el.className
+                    : el.className && el.className.baseVal ? el.className.baseVal
+                    : el.getAttribute('class') || '').toLowerCase();
                 const bgRaw = style.backgroundColor;
                 const fillRaw = style.fill;
 
@@ -319,6 +321,7 @@ class HotCinemaScraper(BaseScraper):
                         fill: fillRaw ? fillRaw.substring(0, 40) : 'none',
                         fillAttr: (el.getAttribute('fill') || '').substring(0, 30),
                         bgImg: (style.backgroundImage || '').substring(0, 80),
+                        svgHref: (el.getAttribute('href') || '').substring(0, 60),
                         text: txt.substring(0, 10),
                         filter: (style.filter || '').substring(0, 30),
                         opacity: style.opacity,
@@ -331,14 +334,17 @@ class HotCinemaScraper(BaseScraper):
                 let color = null;
                 let colorSource = '';
 
-                // 0. Check background-image URL for seat status (Hot Cinema uses PNG images)
+                // 0. Check SVG <image> href or CSS background-image for seat status
                 const bgImg = style.backgroundImage || '';
-                if (bgImg.includes('/unavailable/')) {
+                const svgHref = el.getAttribute('href')
+                    || el.getAttributeNS('http://www.w3.org/1999/xlink', 'href') || '';
+                const seatImgUrl = bgImg + ' ' + svgHref;
+                if (seatImgUrl.includes('/unavailable/')) {
                     color = {r: 115, g: 115, b: 116}; // gray = sold
-                    colorSource = 'bgimg-unavailable';
-                } else if (bgImg.includes('/available/')) {
+                    colorSource = 'seat-img-unavailable';
+                } else if (seatImgUrl.includes('/available/')) {
                     color = {r: 76, g: 175, b: 80}; // green = available
-                    colorSource = 'bgimg-available';
+                    colorSource = 'seat-img-available';
                 }
 
                 const bg = parseColor(bgRaw);
@@ -392,8 +398,10 @@ class HotCinemaScraper(BaseScraper):
 
                 if (!color && !hasAvailableClass && !hasSoldClass) continue;
 
-                // Key logic: green = available, everything else = sold
-                const green = color ? isGreenish(color) : hasAvailableClass;
+                // Key logic: class/href > color. SVG fill is green for ALL seats (inherited)
+                const green = hasSoldClass ? false
+                    : hasAvailableClass ? true
+                    : (color ? isGreenish(color) : false);
 
                 colorCandidates.push({
                     rect: {left: bbox.left, top: bbox.top, width: bbox.width, height: bbox.height},
@@ -423,7 +431,7 @@ class HotCinemaScraper(BaseScraper):
                 const gap = ys[i] - ys[i - 1];
                 if (gap > maxGap) { maxGap = gap; gapY = ys[i]; }
             }
-            const cutoffY = maxGap > 50 ? gapY : Infinity;
+            const cutoffY = maxGap > 150 ? gapY : Infinity;
 
             let colorTotal = 0, colorSold = 0;
             let cutByLegend = 0;
@@ -467,7 +475,9 @@ class HotCinemaScraper(BaseScraper):
             const allPageEls = document.querySelectorAll('*');
             for (const el of allPageEls) {
                 const tag = el.tagName.toLowerCase();
-                const cls = (el.className || el.getAttribute('class') || '').toString().toLowerCase();
+                const cls = (typeof el.className === 'string' ? el.className
+                    : el.className && el.className.baseVal ? el.className.baseVal
+                    : el.getAttribute('class') || '').toLowerCase();
                 const id = (el.id || '').toLowerCase();
 
                 // Must have "seat" in class, tag, or id
