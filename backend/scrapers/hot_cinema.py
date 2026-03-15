@@ -286,6 +286,10 @@ class HotCinemaScraper(BaseScraper):
                 if (aspect < 0.4 || aspect > 2.5)
                     continue;
 
+                // Skip text-only elements (row numbers like "10", "11", "12")
+                const txt = el.textContent ? el.textContent.trim() : '';
+                if (txt && /^\\d{1,2}$/.test(txt) && el.children.length === 0) continue;
+
                 // This is a seat-sized element
                 const style = window.getComputedStyle(el);
                 const cls = (el.className || el.getAttribute('class') || '').toString().toLowerCase();
@@ -305,7 +309,8 @@ class HotCinemaScraper(BaseScraper):
                 }
 
                 // Save ALL seat-sized for debug (limited)
-                if (seatSizedAll.length < 30) {
+                if (seatSizedAll.length < 50) {
+                    const parentEl = el.parentElement;
                     seatSizedAll.push({
                         tag, cls: cls.substring(0, 60),
                         w: Math.round(bbox.width), h: Math.round(bbox.height),
@@ -313,6 +318,11 @@ class HotCinemaScraper(BaseScraper):
                         bg: bgRaw ? bgRaw.substring(0, 40) : 'none',
                         fill: fillRaw ? fillRaw.substring(0, 40) : 'none',
                         fillAttr: (el.getAttribute('fill') || '').substring(0, 30),
+                        text: txt.substring(0, 10),
+                        filter: (style.filter || '').substring(0, 30),
+                        opacity: style.opacity,
+                        parentBg: parentEl ? (window.getComputedStyle(parentEl).backgroundColor || '').substring(0, 40) : 'none',
+                        parentCls: parentEl ? (parentEl.className || '').toString().substring(0, 40) : '',
                     });
                 }
 
@@ -337,6 +347,31 @@ class HotCinemaScraper(BaseScraper):
                     if (fillAttr && isSignificantColor(fillAttr)) {
                         color = fillAttr;
                         colorSource = 'attr:' + el.getAttribute('fill');
+                    }
+                }
+
+                // 4. Check CSS filter for grayscale (seat might be green + grayscale filter = looks gray)
+                if (!color) {
+                    const filter = style.filter || '';
+                    if (filter.includes('grayscale') || filter.includes('saturate(0)')) {
+                        const bg2 = parseColor(bgRaw);
+                        if (bg2) {
+                            color = {r: 115, g: 115, b: 116}; // treat as gray/sold
+                            colorSource = 'filter-grayscale';
+                        }
+                    }
+                }
+
+                // 5. Check parent element backgroundColor
+                if (!color) {
+                    const parent = el.parentElement;
+                    if (parent) {
+                        const parentStyle = window.getComputedStyle(parent);
+                        const parentBg = parseColor(parentStyle.backgroundColor);
+                        if (parentBg && isSignificantColor(parentBg)) {
+                            color = parentBg;
+                            colorSource = 'parent-bg:' + parentStyle.backgroundColor;
+                        }
                     }
                 }
 
