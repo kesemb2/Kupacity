@@ -318,6 +318,7 @@ class HotCinemaScraper(BaseScraper):
                         bg: bgRaw ? bgRaw.substring(0, 40) : 'none',
                         fill: fillRaw ? fillRaw.substring(0, 40) : 'none',
                         fillAttr: (el.getAttribute('fill') || '').substring(0, 30),
+                        bgImg: (style.backgroundImage || '').substring(0, 80),
                         text: txt.substring(0, 10),
                         filter: (style.filter || '').substring(0, 30),
                         opacity: style.opacity,
@@ -330,8 +331,18 @@ class HotCinemaScraper(BaseScraper):
                 let color = null;
                 let colorSource = '';
 
+                // 0. Check background-image URL for seat status (Hot Cinema uses PNG images)
+                const bgImg = style.backgroundImage || '';
+                if (bgImg.includes('/unavailable/')) {
+                    color = {r: 115, g: 115, b: 116}; // gray = sold
+                    colorSource = 'bgimg-unavailable';
+                } else if (bgImg.includes('/available/')) {
+                    color = {r: 76, g: 175, b: 80}; // green = available
+                    colorSource = 'bgimg-available';
+                }
+
                 const bg = parseColor(bgRaw);
-                if (bg && isSignificantColor(bg)) {
+                if (!color && bg && isSignificantColor(bg)) {
                     color = bg;
                     colorSource = 'bg:' + bgRaw;
                 }
