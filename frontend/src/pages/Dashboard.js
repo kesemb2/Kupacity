@@ -49,6 +49,9 @@ function Dashboard({ onMovieClick }) {
         <StatCard title="סרטים" value={summary?.total_movies} icon="🎬" color="#8b5cf6" />
         <StatCard title="הקרנות" value={formatNumber(summary?.total_screenings)} icon="📽️" color="#f59e0b" />
         <StatCard title="סניפים" value={summary?.total_cinemas} icon="🏛️" color="#06b6d4" />
+        {summary?.total_blocked_seats_excluded > 0 && (
+          <StatCard title="מושבים חסומים שסוננו" value={formatNumber(summary?.total_blocked_seats_excluded)} icon="🚫" color="#ef4444" />
+        )}
       </div>
 
       {/* Top Movie Highlight */}

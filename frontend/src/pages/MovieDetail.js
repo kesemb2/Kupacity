@@ -184,6 +184,12 @@ function MovieDetail({ movieId, onBack }) {
                   ? (
                     <span style={{ color: r.tickets_sold > 0 ? '#f59e0b' : '#64748b', fontWeight: 600 }}>
                       {formatNumber(r.tickets_sold)}
+                      {r.blocked_seats_excluded > 0 && (
+                        <span title={`${r.blocked_seats_excluded} מושבים חסומים סוננו (לפני סינון: ${formatNumber(r.tickets_sold_raw)})`}
+                              style={{ color: '#ef4444', fontSize: 11, marginRight: 4, cursor: 'help' }}>
+                          *
+                        </span>
+                      )}
                     </span>
                   )
                   : <span style={{ color: '#64748b' }}>—</span>,
