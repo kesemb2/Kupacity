@@ -79,15 +79,21 @@ function App() {
         }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
             <span style={{ fontSize: 28 }}>🎬</span>
-            <h1 style={{
-              fontSize: 20,
-              fontWeight: 700,
-              background: 'linear-gradient(135deg, #60a5fa, #a78bfa)',
-              WebkitBackgroundClip: 'text',
-              WebkitTextFillColor: 'transparent',
-            }}>
-              הוט סינמה - כרטיסים
-            </h1>
+            <div>
+              <h1 style={{
+                fontSize: 20,
+                fontWeight: 700,
+                background: 'linear-gradient(135deg, #60a5fa, #a78bfa)',
+                WebkitBackgroundClip: 'text',
+                WebkitTextFillColor: 'transparent',
+                lineHeight: 1.2,
+              }}>
+                Kupacity
+              </h1>
+              <div style={{ fontSize: 11, color: '#64748b', fontWeight: 400 }}>
+                כל הכיסאות בפריים אחד
+              </div>
+            </div>
           </div>
 
           <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
@@ -140,7 +146,7 @@ function App() {
         alignItems: 'center',
         gap: 16,
       }}>
-        <span>הוט סינמה • נתוני כרטיסים מתעדכנים אוטומטית • v1.2.0</span>
+        <span>Kupacity • כל הכיסאות בפריים אחד • v1.2.0</span>
         <span style={{
           display: 'inline-flex',
           alignItems: 'center',
