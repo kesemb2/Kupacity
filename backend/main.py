@@ -81,7 +81,8 @@ async def lifespan(app: FastAPI):
                 db.close()
 
         scheduler.add_job(scheduled_hot_weekly, "cron", day_of_week="sun",
-                          hour=3, minute=0, id="hot_weekly_movies")
+                          hour=3, minute=0, id="hot_weekly_movies",
+                          max_instances=1, coalesce=True)
 
         # --- Hot Cinema: daily screenings refresh (every day at 06:00) ---
         async def scheduled_hot_daily():
@@ -92,7 +93,8 @@ async def lifespan(app: FastAPI):
                 db.close()
 
         scheduler.add_job(scheduled_hot_daily, "cron", hour=6, minute=0,
-                          id="hot_daily_screenings")
+                          id="hot_daily_screenings",
+                          max_instances=1, coalesce=True)
 
         # --- Hot Cinema: ticket count updates (every 5 hours) ---
         async def scheduled_hot_tickets():
@@ -103,7 +105,8 @@ async def lifespan(app: FastAPI):
                 db.close()
 
         scheduler.add_job(scheduled_hot_tickets, "interval", hours=5,
-                          id="hot_ticket_updates")
+                          id="hot_ticket_updates",
+                          max_instances=1, coalesce=True)
 
         # --- Close expired screenings (every minute) ---
         def scheduled_close_expired():

@@ -122,6 +122,22 @@ def _make_progress_callback(db: Session, log: ScrapeLog):
     return on_progress
 
 
+def _make_screening_callback(db: Session, chain: CinemaChain, log: ScrapeLog):
+    """Create a callback that saves each screening to DB immediately."""
+    saved_count = [0]  # mutable counter
+
+    def on_screening_update(screening: ScrapedScreening):
+        try:
+            _upsert_screenings(db, chain, [screening])
+            db.commit()
+            saved_count[0] += 1
+            log.screenings_found = saved_count[0]
+            db.commit()
+        except Exception:
+            db.rollback()
+    return on_screening_update
+
+
 async def run_initial_scrape(db: Session):
     """Run on startup if DB is empty - scrape movies and screenings from Hot Cinema."""
     scraper = HotCinemaScraper()
@@ -146,9 +162,11 @@ async def run_initial_scrape(db: Session):
         screenings = await scraper.scrape_screenings(on_progress=progress_cb)
         _upsert_screenings(db, chain, screenings)
 
-        # Run ticket updates to get real seat counts
-        ticket_screenings = await scraper.scrape_ticket_updates(on_progress=progress_cb)
-        _upsert_screenings(db, chain, ticket_screenings)
+        # Run ticket updates to get real seat counts (saved incrementally)
+        screening_cb = _make_screening_callback(db, chain, log)
+        ticket_screenings = await scraper.scrape_ticket_updates(
+            on_progress=progress_cb, on_screening_update=screening_cb,
+        )
 
         duration = (datetime.utcnow() - start).total_seconds()
         log.status = "success"
@@ -259,11 +277,13 @@ async def hot_cinema_update_tickets(db: Session):
     progress_cb = _make_progress_callback(db, log)
 
     try:
-        screenings = await scraper.scrape_ticket_updates(on_progress=progress_cb)
         chain = _get_or_create_chain(
             db, scraper.chain_name, scraper.chain_name_he, scraper.base_url
         )
-        _upsert_screenings(db, chain, screenings)
+        screening_cb = _make_screening_callback(db, chain, log)
+        screenings = await scraper.scrape_ticket_updates(
+            on_progress=progress_cb, on_screening_update=screening_cb,
+        )
 
         duration = (datetime.utcnow() - start).total_seconds()
         log.status = "success"

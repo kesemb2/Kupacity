@@ -1672,7 +1672,7 @@ class HotCinemaScraper(BaseScraper):
         logger.info(f"[Hot Cinema] Daily scrape: {len(all_screenings)} screenings from {len(movie_list)} movies")
         return all_screenings
 
-    async def scrape_ticket_updates(self, on_progress=None) -> list[ScrapedScreening]:
+    async def scrape_ticket_updates(self, on_progress=None, on_screening_update=None) -> list[ScrapedScreening]:
         """Every 5 hours: fetch screenings via API, navigate seat maps for occupancy."""
         all_screenings: list[ScrapedScreening] = []
         pw, browser, context = await self._launch_browser()
@@ -1813,6 +1813,13 @@ class HotCinemaScraper(BaseScraper):
                     )
                     screening.revenue = screening.tickets_sold * screening.ticket_price
                     all_screenings.append(screening)
+
+                    # Save to DB immediately so dashboard updates in real-time
+                    if on_screening_update:
+                        try:
+                            on_screening_update(screening)
+                        except Exception as e:
+                            logger.debug(f"[Hot Cinema] Screening save callback failed: {e}")
         finally:
             await browser.close()
             await pw.stop()
