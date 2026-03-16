@@ -136,7 +136,7 @@ function App() {
         alignItems: 'center',
         gap: 16,
       }}>
-        <span>הוט סינמה • נתוני כרטיסים מתעדכנים אוטומטית • v1.1.0</span>
+        <span>הוט סינמה • נתוני כרטיסים מתעדכנים אוטומטית • v1.2.0</span>
         <span style={{
           display: 'inline-flex',
           alignItems: 'center',
