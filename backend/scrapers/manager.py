@@ -65,36 +65,62 @@ def _lookup_hebrew(cinema_name: str) -> tuple[str, str]:
     return "", ""
 
 
-def _update_blocked_seats(db: Session, cinema_id: int, hall: str,
-                          sold_positions: list[list[int]]) -> int:
-    """Update seat-level stats and return number of blocked seats for this hall."""
-    stats = db.query(HallSeatStats).filter_by(cinema_id=cinema_id, hall=hall).first()
-    if not stats:
-        stats = HallSeatStats(cinema_id=cinema_id, hall=hall)
-        db.add(stats)
-        db.flush()
+def _finalize_blocked_seats(db: Session, hall_data: dict) -> None:
+    """After a scrape run, update blocked-seat stats once per hall.
 
-    stats.scan_count += 1
-    sold_counts = json.loads(stats.seat_sold_counts)
+    hall_data: {(cinema_id, hall): [set_of_pos_keys, ...]}
+        Each set contains "x,y" keys of sold seats from one screening.
+        A seat is "always-sold in this run" only if it appears in ALL screenings
+        of that hall (intersection).  scan_count increments once per run.
+    """
+    for (cinema_id, hall), position_sets in hall_data.items():
+        if not position_sets:
+            continue
 
-    for pos in sold_positions:
-        key = f"{pos[0]},{pos[1]}"
-        sold_counts[key] = sold_counts.get(key, 0) + 1
+        # Intersection: seats sold in ALL screenings of this hall in this run
+        always_sold = position_sets[0]
+        for ps in position_sets[1:]:
+            always_sold = always_sold & ps
+        if not always_sold:
+            continue
 
-    stats.seat_sold_counts = json.dumps(sold_counts)
+        stats = db.query(HallSeatStats).filter_by(cinema_id=cinema_id, hall=hall).first()
+        if not stats:
+            stats = HallSeatStats(cinema_id=cinema_id, hall=hall)
+            db.add(stats)
+            db.flush()
 
-    # Recompute blocked seats: >= 90% of scans, minimum 5 scans
-    blocked = []
-    if stats.scan_count >= 5:
-        threshold = 0.90
-        for key, count in sold_counts.items():
-            if count / stats.scan_count >= threshold:
-                blocked.append(key)
+        stats.scan_count += 1
+        sold_counts = json.loads(stats.seat_sold_counts)
 
-    stats.blocked_seats = json.dumps(blocked)
-    stats.blocked_count = len(blocked)
-    stats.updated_at = datetime.utcnow()
-    return stats.blocked_count
+        for key in always_sold:
+            sold_counts[key] = sold_counts.get(key, 0) + 1
+
+        stats.seat_sold_counts = json.dumps(sold_counts)
+
+        # Recompute blocked seats: >= 90% of scan runs, minimum 3 runs
+        blocked = []
+        if stats.scan_count >= 3:
+            threshold = 0.90
+            for key, count in sold_counts.items():
+                if count / stats.scan_count >= threshold:
+                    blocked.append(key)
+
+        stats.blocked_seats = json.dumps(blocked)
+        stats.blocked_count = len(blocked)
+        stats.updated_at = datetime.utcnow()
+
+        # Update all active screenings in this hall with the new blocked count
+        db.query(Screening).filter(
+            Screening.cinema_id == cinema_id,
+            Screening.hall == hall,
+            Screening.status == "active",
+        ).update({"blocked_seats_excluded": stats.blocked_count}, synchronize_session="fetch")
+
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
 
 
 def _upsert_screenings(db: Session, chain: CinemaChain, screenings: list[ScrapedScreening]):
@@ -135,12 +161,6 @@ def _upsert_screenings(db: Session, chain: CinemaChain, screenings: list[Scraped
             )
             db.add(screening)
 
-        # Update blocked seats learning and adjust counts
-        if ss.sold_positions and ss.total_seats > 0 and ss.hall:
-            blocked_count = _update_blocked_seats(db, cinema.id, ss.hall, ss.sold_positions)
-            target = existing if existing else screening
-            target.blocked_seats_excluded = blocked_count
-            target.tickets_sold = max(0, ss.tickets_sold - blocked_count)
 
 
 # ---------------------------------------------------------------------------
@@ -162,8 +182,13 @@ def _make_progress_callback(db: Session, log: ScrapeLog):
 
 
 def _make_screening_callback(db: Session, chain: CinemaChain, log: ScrapeLog):
-    """Create a callback that saves each screening to DB immediately."""
+    """Create a callback that saves each screening to DB immediately.
+
+    Returns (callback_fn, hall_data) — hall_data accumulates sold positions
+    per (cinema_id, hall) for blocked-seat learning at end of run.
+    """
     saved_count = [0]  # mutable counter
+    hall_data = {}  # {(cinema_id, hall): [set_of_pos_keys, ...]}
 
     def on_screening_update(screening: ScrapedScreening):
         try:
@@ -172,9 +197,18 @@ def _make_screening_callback(db: Session, chain: CinemaChain, log: ScrapeLog):
             saved_count[0] += 1
             log.screenings_found = saved_count[0]
             db.commit()
+
+            # Accumulate sold positions for blocked-seat learning
+            if screening.sold_positions and screening.total_seats > 0 and screening.hall:
+                name_he, city_he = _lookup_hebrew(screening.cinema_name)
+                cinema = _get_or_create_cinema(db, chain.id, screening.cinema_name,
+                                               screening.city, name_he=name_he, city_he=city_he)
+                key = (cinema.id, screening.hall)
+                pos_set = {f"{p[0]},{p[1]}" for p in screening.sold_positions}
+                hall_data.setdefault(key, []).append(pos_set)
         except Exception:
             db.rollback()
-    return on_screening_update
+    return on_screening_update, hall_data
 
 
 async def run_initial_scrape(db: Session):
@@ -202,10 +236,11 @@ async def run_initial_scrape(db: Session):
         _upsert_screenings(db, chain, screenings)
 
         # Run ticket updates to get real seat counts (saved incrementally)
-        screening_cb = _make_screening_callback(db, chain, log)
+        screening_cb, hall_data = _make_screening_callback(db, chain, log)
         ticket_screenings = await scraper.scrape_ticket_updates(
             on_progress=progress_cb, on_screening_update=screening_cb,
         )
+        _finalize_blocked_seats(db, hall_data)
 
         duration = (datetime.utcnow() - start).total_seconds()
         log.status = "success"
@@ -319,10 +354,11 @@ async def hot_cinema_update_tickets(db: Session):
         chain = _get_or_create_chain(
             db, scraper.chain_name, scraper.chain_name_he, scraper.base_url
         )
-        screening_cb = _make_screening_callback(db, chain, log)
+        screening_cb, hall_data = _make_screening_callback(db, chain, log)
         screenings = await scraper.scrape_ticket_updates(
             on_progress=progress_cb, on_screening_update=screening_cb,
         )
+        _finalize_blocked_seats(db, hall_data)
 
         duration = (datetime.utcnow() - start).total_seconds()
         log.status = "success"
