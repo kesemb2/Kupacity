@@ -44,6 +44,18 @@ async def lifespan(app: FastAPI):
     # Startup: create tables and seed if empty
     Base.metadata.create_all(bind=engine)
 
+    # Migrate: add blocked_seats_excluded column if missing
+    try:
+        with engine.connect() as conn:
+            conn.execute(
+                __import__("sqlalchemy").text(
+                    "ALTER TABLE screenings ADD COLUMN blocked_seats_excluded INTEGER DEFAULT 0"
+                )
+            )
+            conn.commit()
+    except Exception:
+        pass  # column already exists
+
     from models.models import CinemaChain
     db = SessionLocal()
     try:

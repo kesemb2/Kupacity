@@ -23,6 +23,7 @@ def get_dashboard_summary(db: Session = Depends(get_db)):
     total_cinemas = db.query(Cinema).count()
     total_screenings = db.query(Screening).count()
     total_tickets = db.query(func.sum(Screening.tickets_sold)).scalar() or 0
+    total_blocked_excluded = db.query(func.sum(Screening.blocked_seats_excluded)).scalar() or 0
 
     # Top movie by tickets sold
     top_movie_row = (
@@ -42,6 +43,7 @@ def get_dashboard_summary(db: Session = Depends(get_db)):
         "total_cinemas": total_cinemas,
         "total_screenings": total_screenings,
         "total_tickets_sold": total_tickets,
+        "total_blocked_seats_excluded": total_blocked_excluded,
         "top_movie": {
             "title": top_movie_row[0] if top_movie_row else None,
             "title_he": top_movie_row[1] if top_movie_row else None,
@@ -165,6 +167,8 @@ def get_movie_detail(movie_id: int, db: Session = Depends(get_db)):
                 "format": scr.format or "",
                 "total_seats": scr.total_seats or 0,
                 "tickets_sold": scr.tickets_sold or 0,
+                "tickets_sold_raw": (scr.tickets_sold or 0) + (scr.blocked_seats_excluded or 0),
+                "blocked_seats_excluded": scr.blocked_seats_excluded or 0,
                 "occupancy": round((scr.tickets_sold or 0) * 100 / scr.total_seats, 1) if scr.total_seats else 0,
                 "status": scr.status or "active",
             }

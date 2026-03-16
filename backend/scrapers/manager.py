@@ -12,7 +12,7 @@ import logging
 from datetime import datetime, timedelta
 from sqlalchemy.orm import Session
 
-from models.models import CinemaChain, Cinema, Movie, Screening, ScrapeLog
+from models.models import CinemaChain, Cinema, Movie, Screening, ScrapeLog, HallSeatStats
 from scrapers.base import BaseScraper, ScrapedMovie, ScrapedScreening
 from scrapers.hot_cinema import HotCinemaScraper, HOT_CINEMA_BRANCHES
 
@@ -65,6 +65,38 @@ def _lookup_hebrew(cinema_name: str) -> tuple[str, str]:
     return "", ""
 
 
+def _update_blocked_seats(db: Session, cinema_id: int, hall: str,
+                          sold_positions: list[list[int]]) -> int:
+    """Update seat-level stats and return number of blocked seats for this hall."""
+    stats = db.query(HallSeatStats).filter_by(cinema_id=cinema_id, hall=hall).first()
+    if not stats:
+        stats = HallSeatStats(cinema_id=cinema_id, hall=hall)
+        db.add(stats)
+        db.flush()
+
+    stats.scan_count += 1
+    sold_counts = json.loads(stats.seat_sold_counts)
+
+    for pos in sold_positions:
+        key = f"{pos[0]},{pos[1]}"
+        sold_counts[key] = sold_counts.get(key, 0) + 1
+
+    stats.seat_sold_counts = json.dumps(sold_counts)
+
+    # Recompute blocked seats: >= 90% of scans, minimum 5 scans
+    blocked = []
+    if stats.scan_count >= 5:
+        threshold = 0.90
+        for key, count in sold_counts.items():
+            if count / stats.scan_count >= threshold:
+                blocked.append(key)
+
+    stats.blocked_seats = json.dumps(blocked)
+    stats.blocked_count = len(blocked)
+    stats.updated_at = datetime.utcnow()
+    return stats.blocked_count
+
+
 def _upsert_screenings(db: Session, chain: CinemaChain, screenings: list[ScrapedScreening]):
     """Insert new screenings or update existing ones (tickets_sold)."""
     for ss in screenings:
@@ -102,6 +134,13 @@ def _upsert_screenings(db: Session, chain: CinemaChain, screenings: list[Scraped
                 status="active",
             )
             db.add(screening)
+
+        # Update blocked seats learning and adjust counts
+        if ss.sold_positions and ss.total_seats > 0 and ss.hall:
+            blocked_count = _update_blocked_seats(db, cinema.id, ss.hall, ss.sold_positions)
+            target = existing if existing else screening
+            target.blocked_seats_excluded = blocked_count
+            target.tickets_sold = max(0, ss.tickets_sold - blocked_count)
 
 
 # ---------------------------------------------------------------------------

@@ -28,7 +28,7 @@ class ScrapedScreening:
                  showtime: datetime, hall: str = "", format: str = "2D",
                  language: str = "", ticket_price: float = 0,
                  tickets_sold: int = 0, total_seats: int = 0,
-                 revenue: float = 0):
+                 revenue: float = 0, sold_positions: list = None):
         self.movie_title = movie_title
         self.cinema_name = cinema_name
         self.city = city
@@ -40,6 +40,7 @@ class ScrapedScreening:
         self.tickets_sold = tickets_sold
         self.total_seats = total_seats
         self.revenue = revenue
+        self.sold_positions = sold_positions or []
 
 
 class BaseScraper(ABC):

@@ -223,9 +223,10 @@ class HotCinemaScraper(BaseScraper):
     # ------------------------------------------------------------------
 
     async def _count_seats_on_page(self, page: Page,
-                                    movie_title: str = "", screening_time: str = "") -> tuple[int, int]:
+                                    movie_title: str = "", screening_time: str = "") -> tuple[int, int, list]:
         total = 0
         sold = 0
+        sold_positions = []
 
         # Wait a bit for seat map to render (Angular SPA)
         await asyncio.sleep(2)
@@ -438,6 +439,7 @@ class HotCinemaScraper(BaseScraper):
             const colorSamples = {};
             const colorSampleSeats = [];
             const colorExcludedSample = [];
+            const colorSoldPositions = [];
 
             for (const c of dedupedColor) {
                 if (c.rect.top >= cutoffY) {
@@ -453,7 +455,10 @@ class HotCinemaScraper(BaseScraper):
                 colorTotal++;
                 const key = c.colorSource || 'class-only';
                 colorSamples[key] = (colorSamples[key] || 0) + 1;
-                if (c.isGray) colorSold++;
+                if (c.isGray) {
+                    colorSold++;
+                    colorSoldPositions.push([Math.round(c.rect.left / 5), Math.round(c.rect.top / 5)]);
+                }
                 if (colorSampleSeats.length < 10) {
                     colorSampleSeats.push({
                         tag: c.tag, cls: c.cls,
@@ -470,6 +475,7 @@ class HotCinemaScraper(BaseScraper):
             let classTotal = 0, classSold = 0;
             const classSampleSeats = [];
             const classStatusCounts = {};
+            const classSoldPositions = [];
 
             // Search entire document (not just seatPlan) for seat elements
             const allPageEls = document.querySelectorAll('*');
@@ -507,7 +513,11 @@ class HotCinemaScraper(BaseScraper):
                 }
 
                 classTotal++;
-                if (isSold) classSold++;
+                if (isSold) {
+                    classSold++;
+                    const bbox2 = el.getBoundingClientRect();
+                    classSoldPositions.push([Math.round(bbox2.left / 5), Math.round(bbox2.top / 5)]);
+                }
 
                 const statusKey = isSold ? 'sold' : 'available';
                 classStatusCounts[statusKey] = (classStatusCounts[statusKey] || 0) + 1;
@@ -571,12 +581,14 @@ class HotCinemaScraper(BaseScraper):
                     colorSamples,
                     sampleSeats: colorSampleSeats,
                     excludedSample: colorExcludedSample,
+                    soldPositions: colorSoldPositions,
                 },
                 // Method B results (class/attribute-based)
                 classMethod: {
                     total: classTotal, sold: classSold,
                     statusCounts: classStatusCounts,
                     sampleSeats: classSampleSeats,
+                    soldPositions: classSoldPositions,
                 },
                 // Debug info
                 debug: {
@@ -647,14 +659,17 @@ class HotCinemaScraper(BaseScraper):
             color_total = color.get("total", 0)
             class_total = cls.get("total", 0)
 
+            sold_positions = []
             if color_total >= 10 or class_total >= 10:
                 if class_total > color_total:
                     total = class_total
                     sold = cls.get("sold", 0)
+                    sold_positions = cls.get("soldPositions", [])
                     logger.info(f"[Hot Cinema] Using CLASS method: {sold}/{total}")
                 else:
                     total = color_total
                     sold = color.get("sold", 0)
+                    sold_positions = color.get("soldPositions", [])
                     logger.info(f"[Hot Cinema] Using COLOR method: {sold}/{total}")
             else:
                 logger.warning(
@@ -684,7 +699,7 @@ class HotCinemaScraper(BaseScraper):
             except Exception:
                 pass
 
-        return total, sold
+        return total, sold, sold_positions
 
     # ------------------------------------------------------------------
     # Theater page scraping - collect movies + their detail URLs
@@ -1317,7 +1332,7 @@ class HotCinemaScraper(BaseScraper):
     # ------------------------------------------------------------------
 
     async def _navigate_to_seat_map(self, page: Page, booking_url: str,
-                                    movie_title: str = "", screening_time: str = "") -> tuple[int, int]:
+                                    movie_title: str = "", screening_time: str = "") -> tuple[int, int, list]:
         """Navigate from booking URL through ticket selection to seat map.
 
         Flow: booking_url → ticket page → click + → click המשך → seat map
@@ -1347,7 +1362,7 @@ class HotCinemaScraper(BaseScraper):
                     logger.warning(f"[Hot Cinema] Ticket page error: {body_text}")
                 except Exception:
                     pass
-                return 0, 0
+                return 0, 0, []
 
             # Check if already on seat map
             if "/seats" in current_url:
@@ -1370,9 +1385,9 @@ class HotCinemaScraper(BaseScraper):
                         await page.screenshot(path=_debug_screenshot_path("step4_seat_map_shortcut", movie_title, screening_time))
                     except Exception:
                         pass
-                    total, sold = await self._count_seats_on_page(page, movie_title=movie_title, screening_time=screening_time)
+                    total, sold, sold_positions = await self._count_seats_on_page(page, movie_title=movie_title, screening_time=screening_time)
                     logger.info(f"[Hot Cinema] Seat map: counted {sold}/{total} seats")
-                    return total, sold
+                    return total, sold, sold_positions
 
                 # Shortcut didn't work, go back to ticket page
                 logger.info("[Hot Cinema] Seat map: shortcut failed, going through ticket flow")
@@ -1548,9 +1563,9 @@ class HotCinemaScraper(BaseScraper):
             except Exception:
                 pass
 
-            total, sold = await self._count_seats_on_page(page, movie_title=movie_title, screening_time=screening_time)
+            total, sold, sold_positions = await self._count_seats_on_page(page, movie_title=movie_title, screening_time=screening_time)
             logger.info(f"[Hot Cinema] Seat map: counted {sold}/{total} seats")
-            return total, sold
+            return total, sold, sold_positions
 
         except Exception as e:
             logger.warning(f"[Hot Cinema] Seat map navigation failed: {e}")
@@ -1762,6 +1777,7 @@ class HotCinemaScraper(BaseScraper):
 
                     total_seats = 0
                     tickets_sold = 0
+                    seat_positions = []
 
                     # Construct booking URL from TheaterID→siteId mapping + EventId
                     tid = str(info.get("theater_id", ""))
@@ -1778,7 +1794,7 @@ class HotCinemaScraper(BaseScraper):
 
                     if booking_url:
                         try:
-                            total, sold = await self._navigate_to_seat_map(
+                            total, sold, positions = await self._navigate_to_seat_map(
                                 page, booking_url,
                                 movie_title=info["movie_title"],
                                 screening_time=info["showtime"].strftime("%H%M"),
@@ -1786,6 +1802,7 @@ class HotCinemaScraper(BaseScraper):
                             if total > 0:
                                 total_seats = total
                                 tickets_sold = sold
+                                seat_positions = positions
                                 logger.info(
                                     f"  [{info['cinema_name']}] {info['movie_title']} "
                                     f"{info['showtime'].strftime('%d/%m %H:%M')}: "
@@ -1810,6 +1827,7 @@ class HotCinemaScraper(BaseScraper):
                         ticket_price=39.0,
                         total_seats=total_seats,
                         tickets_sold=tickets_sold,
+                        sold_positions=seat_positions,
                     )
                     screening.revenue = screening.tickets_sold * screening.ticket_price
                     all_screenings.append(screening)
