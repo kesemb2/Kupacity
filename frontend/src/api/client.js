@@ -18,6 +18,13 @@ export const fetchTicketsByDate = (days = 14) => api.get(`/analytics/tickets-by-
 export const fetchTicketsByBranch = () => api.get('/analytics/tickets-by-branch').then(r => r.data);
 export const fetchTopMovies = (limit = 10) => api.get(`/analytics/top-movies?limit=${limit}`).then(r => r.data);
 export const fetchOccupancyByFormat = () => api.get('/analytics/occupancy-by-format').then(r => r.data);
+export const fetchTicketsByHour = () => api.get('/analytics/tickets-by-hour').then(r => r.data);
+export const fetchOccupancyByDayOfWeek = () => api.get('/analytics/occupancy-by-day-of-week').then(r => r.data);
+export const fetchMovieTrends = () => api.get('/analytics/movie-trends').then(r => r.data);
+export const fetchDeadScreenings = (threshold = 10) => api.get(`/analytics/dead-screenings?threshold=${threshold}`).then(r => r.data);
+export const fetchFormatByBranch = () => api.get('/analytics/format-by-branch').then(r => r.data);
+export const fetchBranchEfficiency = () => api.get('/analytics/branch-efficiency').then(r => r.data);
+export const fetchGenreStats = () => api.get('/analytics/genre-stats').then(r => r.data);
 export const fetchScrapeLogs = () => api.get('/scrape-logs').then(r => r.data);
 export const triggerScrape = () => api.post('/scrape/trigger').then(r => r.data);
 

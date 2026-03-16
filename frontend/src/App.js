@@ -6,10 +6,12 @@ import CinemasPage from './pages/CinemasPage';
 import CitiesPage from './pages/CitiesPage';
 import MovieDetail from './pages/MovieDetail';
 import ScrapePage from './pages/ScrapePage';
+import AnalyticsPage from './pages/AnalyticsPage';
 import { checkHealth } from './api/client';
 
 const NAV_ITEMS = [
   { key: 'dashboard', label: 'דאשבורד' },
+  { key: 'analytics', label: 'ניתוחים' },
   { key: 'movies', label: 'סרטים' },
   { key: 'cinemas', label: 'סניפים' },
   { key: 'cities', label: 'ערים' },
@@ -45,6 +47,8 @@ function App() {
         return <CinemasPage />;
       case 'cities':
         return <CitiesPage />;
+      case 'analytics':
+        return <AnalyticsPage />;
       case 'scrape':
         return <ScrapePage />;
       case 'movieDetail':

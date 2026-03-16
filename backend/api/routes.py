@@ -349,6 +349,269 @@ def get_occupancy_by_format(db: Session = Depends(get_db)):
     ]
 
 
+@router.get("/analytics/tickets-by-hour")
+def get_tickets_by_hour(db: Session = Depends(get_db)):
+    """שעת הזהב - כרטיסים לפי שעת הקרנה"""
+    results = (
+        db.query(
+            func.strftime('%H', Screening.showtime).label("hour"),
+            func.sum(Screening.tickets_sold).label("tickets"),
+            func.count(Screening.id).label("screenings"),
+            func.avg(Screening.tickets_sold * 100.0 / func.nullif(Screening.total_seats, 0)).label("avg_occupancy"),
+        )
+        .filter(Screening.showtime.isnot(None))
+        .group_by("hour")
+        .order_by("hour")
+        .all()
+    )
+
+    return [
+        {
+            "hour": h,
+            "hour_display": f"{h}:00",
+            "tickets_sold": t or 0,
+            "screenings_count": s,
+            "avg_occupancy": round(o or 0, 1),
+        }
+        for h, t, s, o in results
+    ]
+
+
+@router.get("/analytics/occupancy-by-day-of-week")
+def get_occupancy_by_day_of_week(db: Session = Depends(get_db)):
+    """תפוסה לפי יום בשבוע"""
+    day_names_he = {
+        '0': 'ראשון', '1': 'שני', '2': 'שלישי', '3': 'רביעי',
+        '4': 'חמישי', '5': 'שישי', '6': 'שבת',
+    }
+    results = (
+        db.query(
+            func.strftime('%w', Screening.showtime).label("dow"),
+            func.sum(Screening.tickets_sold).label("tickets"),
+            func.count(Screening.id).label("screenings"),
+            func.avg(Screening.tickets_sold * 100.0 / func.nullif(Screening.total_seats, 0)).label("avg_occupancy"),
+        )
+        .filter(Screening.showtime.isnot(None))
+        .group_by("dow")
+        .order_by("dow")
+        .all()
+    )
+
+    return [
+        {
+            "day_index": int(d),
+            "day_name": day_names_he.get(d, d),
+            "tickets_sold": t or 0,
+            "screenings_count": s,
+            "avg_occupancy": round(o or 0, 1),
+        }
+        for d, t, s, o in results
+    ]
+
+
+@router.get("/analytics/movie-trends")
+def get_movie_trends(db: Session = Depends(get_db)):
+    """מגמות סרטים - השוואה בין 3 ימים אחרונים ל-3 ימים לפני"""
+    now = datetime.now()
+    recent_start = now - timedelta(days=3)
+    prev_start = now - timedelta(days=6)
+
+    # Recent 3 days
+    recent = dict(
+        db.query(
+            Movie.id,
+            func.sum(Screening.tickets_sold),
+        )
+        .join(Screening)
+        .filter(Screening.showtime >= recent_start)
+        .group_by(Movie.id)
+        .all()
+    )
+
+    # Previous 3 days
+    previous = dict(
+        db.query(
+            Movie.id,
+            func.sum(Screening.tickets_sold),
+        )
+        .join(Screening)
+        .filter(Screening.showtime >= prev_start, Screening.showtime < recent_start)
+        .group_by(Movie.id)
+        .all()
+    )
+
+    movie_ids = set(recent.keys()) | set(previous.keys())
+    movies = {m.id: m for m in db.query(Movie).filter(Movie.id.in_(movie_ids)).all()}
+
+    trends = []
+    for mid in movie_ids:
+        movie = movies.get(mid)
+        if not movie:
+            continue
+        r = recent.get(mid, 0) or 0
+        p = previous.get(mid, 0) or 0
+        change_pct = round(((r - p) / p * 100), 1) if p > 0 else (100.0 if r > 0 else 0)
+        trends.append({
+            "movie_id": mid,
+            "title": movie.title,
+            "title_he": movie.title_he,
+            "recent_tickets": r,
+            "previous_tickets": p,
+            "change_pct": change_pct,
+            "trend": "up" if r > p else ("down" if r < p else "stable"),
+        })
+
+    trends.sort(key=lambda x: x["recent_tickets"], reverse=True)
+    return trends[:15]
+
+
+@router.get("/analytics/dead-screenings")
+def get_dead_screenings(threshold: float = Query(default=10.0), db: Session = Depends(get_db)):
+    """הקרנות מתות - תפוסה מתחת לסף"""
+    results = (
+        db.query(
+            Screening, Movie.title, Movie.title_he, Cinema.name, Cinema.city,
+        )
+        .join(Movie, Screening.movie_id == Movie.id)
+        .join(Cinema, Screening.cinema_id == Cinema.id)
+        .filter(
+            Screening.total_seats > 0,
+            (Screening.tickets_sold * 100.0 / Screening.total_seats) < threshold,
+        )
+        .order_by(Screening.showtime.desc())
+        .limit(50)
+        .all()
+    )
+
+    total_screenings = db.query(Screening).filter(Screening.total_seats > 0).count()
+    dead_count = (
+        db.query(Screening)
+        .filter(
+            Screening.total_seats > 0,
+            (Screening.tickets_sold * 100.0 / Screening.total_seats) < threshold,
+        )
+        .count()
+    )
+
+    return {
+        "threshold": threshold,
+        "dead_count": dead_count,
+        "total_screenings": total_screenings,
+        "dead_pct": round(dead_count * 100 / total_screenings, 1) if total_screenings > 0 else 0,
+        "screenings": [
+            {
+                "movie": th or t,
+                "cinema": cn,
+                "city": cc,
+                "showtime": scr.showtime.isoformat() if scr.showtime else None,
+                "hall": scr.hall or "",
+                "format": scr.format or "",
+                "tickets_sold": scr.tickets_sold or 0,
+                "total_seats": scr.total_seats or 0,
+                "occupancy": round((scr.tickets_sold or 0) * 100 / scr.total_seats, 1) if scr.total_seats else 0,
+            }
+            for scr, t, th, cn, cc in results
+        ],
+    }
+
+
+@router.get("/analytics/format-by-branch")
+def get_format_by_branch(db: Session = Depends(get_db)):
+    """ניתוח פורמט לפי סניף"""
+    results = (
+        db.query(
+            Cinema.name,
+            Cinema.city,
+            Screening.format,
+            func.count(Screening.id).label("screenings"),
+            func.sum(Screening.tickets_sold).label("tickets"),
+            func.avg(Screening.tickets_sold * 100.0 / func.nullif(Screening.total_seats, 0)).label("avg_occupancy"),
+        )
+        .join(Cinema, Screening.cinema_id == Cinema.id)
+        .group_by(Cinema.id, Screening.format)
+        .order_by(desc("tickets"))
+        .all()
+    )
+
+    return [
+        {
+            "cinema": n,
+            "city": c,
+            "format": f or "רגיל",
+            "screenings_count": s,
+            "tickets_sold": t or 0,
+            "avg_occupancy": round(o or 0, 1),
+        }
+        for n, c, f, s, t, o in results
+    ]
+
+
+@router.get("/analytics/branch-efficiency")
+def get_branch_efficiency(db: Session = Depends(get_db)):
+    """דירוג סניפים לפי יעילות (ממוצע תפוסה)"""
+    results = (
+        db.query(
+            Cinema.name,
+            Cinema.city,
+            CinemaChain.name.label("chain"),
+            func.count(Screening.id).label("screenings"),
+            func.sum(Screening.tickets_sold).label("total_tickets"),
+            func.sum(Screening.total_seats).label("total_seats"),
+            func.avg(Screening.tickets_sold * 100.0 / func.nullif(Screening.total_seats, 0)).label("avg_occupancy"),
+        )
+        .join(Cinema, Screening.cinema_id == Cinema.id)
+        .join(CinemaChain, Cinema.chain_id == CinemaChain.id)
+        .group_by(Cinema.id)
+        .having(func.count(Screening.id) >= 5)
+        .order_by(desc("avg_occupancy"))
+        .all()
+    )
+
+    return [
+        {
+            "cinema": n,
+            "city": c,
+            "chain": ch,
+            "screenings_count": s,
+            "total_tickets": tt or 0,
+            "total_seats": ts or 0,
+            "avg_occupancy": round(o or 0, 1),
+            "fill_rate": round((tt or 0) * 100 / ts, 1) if ts else 0,
+        }
+        for n, c, ch, s, tt, ts, o in results
+    ]
+
+
+@router.get("/analytics/genre-stats")
+def get_genre_stats(db: Session = Depends(get_db)):
+    """סטטיסטיקות לפי ז'אנר"""
+    results = (
+        db.query(
+            Movie.genre,
+            func.count(func.distinct(Movie.id)).label("movies_count"),
+            func.count(Screening.id).label("screenings"),
+            func.sum(Screening.tickets_sold).label("tickets"),
+            func.avg(Screening.tickets_sold * 100.0 / func.nullif(Screening.total_seats, 0)).label("avg_occupancy"),
+        )
+        .join(Screening)
+        .filter(Movie.genre.isnot(None), Movie.genre != '')
+        .group_by(Movie.genre)
+        .order_by(desc("tickets"))
+        .all()
+    )
+
+    return [
+        {
+            "genre": g,
+            "movies_count": mc,
+            "screenings_count": s,
+            "total_tickets": t or 0,
+            "avg_occupancy": round(o or 0, 1),
+        }
+        for g, mc, s, t, o in results
+    ]
+
+
 # ─── Manual Scrape Trigger ────────────────────────────────────────────
 
 @router.post("/scrape/trigger")
