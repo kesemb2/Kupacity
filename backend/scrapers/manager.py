@@ -1,11 +1,16 @@
 """
-Scraper manager - coordinates Hot Cinema scraper and persists data to DB.
+Scraper manager - coordinates scrapers and persists data to DB.
 
 Hot Cinema schedule:
 - Weekly:       full movie catalog refresh
 - Daily:        screening schedule refresh (next 7 days)
 - Every 5h:     ticket count updates for active screenings
 - Every 1 min:  close screenings that started 10+ minutes ago
+
+Movieland schedule:
+- Weekly:       full movie catalog refresh
+- Daily:        screening schedule refresh
+- Every 5h:     ticket count updates (offset from Hot Cinema)
 """
 import json
 import logging
@@ -15,6 +20,7 @@ from sqlalchemy.orm import Session
 from models.models import CinemaChain, Cinema, Movie, Screening, ScrapeLog, HallSeatStats
 from scrapers.base import BaseScraper, ScrapedMovie, ScrapedScreening
 from scrapers.hot_cinema import HotCinemaScraper, HOT_CINEMA_BRANCHES
+from scrapers.movieland import MovielandScraper, MOVIELAND_BRANCHES
 
 logger = logging.getLogger(__name__)
 
@@ -58,8 +64,11 @@ def _get_or_create_movie(db: Session, scraped: ScrapedMovie) -> Movie:
 
 
 def _lookup_hebrew(cinema_name: str) -> tuple[str, str]:
-    """Look up Hebrew name and city for a Hot Cinema branch."""
+    """Look up Hebrew name and city for a cinema branch (any chain)."""
     for branch in HOT_CINEMA_BRANCHES.values():
+        if branch["name"] == cinema_name:
+            return branch["name_he"], branch["city_he"]
+    for branch in MOVIELAND_BRANCHES.values():
         if branch["name"] == cinema_name:
             return branch["name_he"], branch["city_he"]
     return "", ""
@@ -376,6 +385,128 @@ async def hot_cinema_update_tickets(db: Session):
         log.progress = None
         db.commit()
         logger.error(f"[Hot Cinema] Ticket update failed: {e}")
+    finally:
+        await scraper.close()
+
+
+# ---------------------------------------------------------------------------
+# Movieland specific scheduled tasks
+# ---------------------------------------------------------------------------
+
+async def movieland_weekly_movies(db: Session):
+    """Weekly: refresh full movie catalog from Movieland."""
+    scraper = MovielandScraper()
+    start = datetime.utcnow()
+
+    log = ScrapeLog(chain_name="Movieland", status="running",
+                    progress=json.dumps({"phase": "סריקת סרטים שבועית - מובילנד", "current": 0, "total": 0, "detail": ""}, ensure_ascii=False))
+    db.add(log)
+    db.commit()
+    progress_cb = _make_progress_callback(db, log)
+
+    try:
+        movies = await scraper.scrape_movies(on_progress=progress_cb)
+        chain = _get_or_create_chain(
+            db, scraper.chain_name, scraper.chain_name_he, scraper.base_url
+        )
+        for sm in movies:
+            _get_or_create_movie(db, sm)
+
+        duration = (datetime.utcnow() - start).total_seconds()
+        log.status = "success"
+        log.movies_found = len(movies)
+        log.screenings_found = 0
+        log.duration_seconds = duration
+        log.progress = None
+        db.commit()
+        logger.info(f"[Movieland] Weekly movies refresh: {len(movies)} movies")
+    except Exception as e:
+        duration = (datetime.utcnow() - start).total_seconds()
+        log.status = "error"
+        log.error_message = str(e)
+        log.duration_seconds = duration
+        log.progress = None
+        db.commit()
+        logger.error(f"[Movieland] Weekly movies refresh failed: {e}")
+    finally:
+        await scraper.close()
+
+
+async def movieland_daily_screenings(db: Session):
+    """Daily: refresh screening schedule from Movieland."""
+    scraper = MovielandScraper()
+    start = datetime.utcnow()
+
+    log = ScrapeLog(chain_name="Movieland", status="running",
+                    progress=json.dumps({"phase": "סריקת הקרנות יומית - מובילנד", "current": 0, "total": 0, "detail": ""}, ensure_ascii=False))
+    db.add(log)
+    db.commit()
+    progress_cb = _make_progress_callback(db, log)
+
+    try:
+        screenings = await scraper.scrape_screenings(on_progress=progress_cb)
+        chain = _get_or_create_chain(
+            db, scraper.chain_name, scraper.chain_name_he, scraper.base_url
+        )
+        _upsert_screenings(db, chain, screenings)
+
+        duration = (datetime.utcnow() - start).total_seconds()
+        log.status = "success"
+        log.movies_found = 0
+        log.screenings_found = len(screenings)
+        log.duration_seconds = duration
+        log.progress = None
+        db.commit()
+        logger.info(f"[Movieland] Daily screenings refresh: {len(screenings)} screenings")
+    except Exception as e:
+        duration = (datetime.utcnow() - start).total_seconds()
+        log.status = "error"
+        log.error_message = str(e)
+        log.duration_seconds = duration
+        log.progress = None
+        db.commit()
+        logger.error(f"[Movieland] Daily screenings refresh failed: {e}")
+    finally:
+        await scraper.close()
+
+
+async def movieland_update_tickets(db: Session):
+    """Every 5 hours: update ticket counts for Movieland screenings."""
+    scraper = MovielandScraper()
+    start = datetime.utcnow()
+
+    log = ScrapeLog(chain_name="Movieland", status="running",
+                    progress=json.dumps({"phase": "עדכון כרטיסים - מובילנד", "current": 0, "total": 0, "detail": ""}, ensure_ascii=False))
+    db.add(log)
+    db.commit()
+    progress_cb = _make_progress_callback(db, log)
+
+    try:
+        chain = _get_or_create_chain(
+            db, scraper.chain_name, scraper.chain_name_he, scraper.base_url
+        )
+        screening_cb, hall_data = _make_screening_callback(db, chain, log)
+        screenings = await scraper.scrape_ticket_updates(
+            on_progress=progress_cb, on_screening_update=screening_cb,
+        )
+        _finalize_blocked_seats(db, hall_data)
+
+        duration = (datetime.utcnow() - start).total_seconds()
+        log.status = "success"
+        log.movies_found = 0
+        log.screenings_found = len(screenings)
+        log.duration_seconds = duration
+        log.progress = None
+        db.commit()
+        logger.info(f"[Movieland] Ticket update: {len(screenings)} screenings refreshed")
+    except Exception as e:
+        duration = (datetime.utcnow() - start).total_seconds()
+        log.status = "error"
+        log.error_message = str(e)
+        log.duration_seconds = duration
+        log.progress = None
+        db.commit()
+        logger.error(f"[Movieland] Ticket update failed: {e}")
     finally:
         await scraper.close()
 

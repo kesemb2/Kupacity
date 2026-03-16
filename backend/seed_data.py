@@ -1,11 +1,12 @@
 """
-Seed the database with Hot Cinema chain and its real branches.
-Movies and screenings come from the Playwright scraper - not from seed data.
+Seed the database with cinema chains and their real branches.
+Movies and screenings come from the Playwright scrapers - not from seed data.
 """
 from database import engine, SessionLocal, Base
 from models.models import CinemaChain, Cinema
 
-# Real Hot Cinema branches (matching scrapers/hot_cinema.py HOT_CINEMA_BRANCHES)
+# ── Hot Cinema ───────────────────────────────────────────────────────────────
+
 HOT_CINEMA_CHAIN = {
     "name": "Hot Cinema",
     "name_he": "הוט סינמה",
@@ -25,37 +26,57 @@ HOT_CINEMA_BRANCHES = [
     {"name": "Hot Cinema Ashdod", "name_he": "הוט סינמה אשדוד", "city": "Ashdod", "city_he": "אשדוד", "halls": 8},
 ]
 
+# ── Movieland ────────────────────────────────────────────────────────────────
+
+MOVIELAND_CHAIN = {
+    "name": "Movieland",
+    "name_he": "מובילנד",
+    "website": "https://movieland.co.il",
+}
+
+MOVIELAND_BRANCHES = [
+    {"name": "Movieland Tel Aviv", "name_he": "מובילנד תל אביב", "city": "Tel Aviv", "city_he": "תל אביב", "halls": 8},
+    {"name": "Movieland Netanya", "name_he": "מובילנד נתניה", "city": "Netanya", "city_he": "נתניה", "halls": 6},
+    {"name": "Movieland Haifa", "name_he": "מובילנד חיפה", "city": "Haifa", "city_he": "חיפה", "halls": 7},
+    {"name": "Movieland Karmiel", "name_he": "מובילנד כרמיאל", "city": "Karmiel", "city_he": "כרמיאל", "halls": 5},
+    {"name": "Movieland Afula", "name_he": "מובילנד עפולה", "city": "Afula", "city_he": "עפולה", "halls": 5},
+]
+
+
+def _seed_chain(db, chain_data: dict, branches: list[dict]):
+    """Seed a single chain and its branches if not already present."""
+    existing = db.query(CinemaChain).filter_by(name=chain_data["name"]).first()
+    if existing:
+        print(f"{chain_data['name']} already exists, skipping.")
+        return
+
+    chain = CinemaChain(**chain_data)
+    db.add(chain)
+    db.flush()
+
+    for branch in branches:
+        cinema = Cinema(
+            chain_id=chain.id,
+            name=branch["name"],
+            name_he=branch["name_he"],
+            city=branch["city"],
+            city_he=branch["city_he"],
+            halls_count=branch["halls"],
+        )
+        db.add(cinema)
+
+    print(f"Seeded: {chain_data['name']} with {len(branches)} branches")
+
 
 def seed_database():
-    """Create Hot Cinema chain and its branches. Movies come from the scraper."""
+    """Create all cinema chains and their branches."""
     Base.metadata.create_all(bind=engine)
     db = SessionLocal()
 
-    # Skip if chain already exists
-    if db.query(CinemaChain).filter_by(name="Hot Cinema").first():
-        print("Hot Cinema chain already exists, skipping seed.")
-        db.close()
-        return
-
     try:
-        chain = CinemaChain(**HOT_CINEMA_CHAIN)
-        db.add(chain)
-        db.flush()
-
-        for branch in HOT_CINEMA_BRANCHES:
-            cinema = Cinema(
-                chain_id=chain.id,
-                name=branch["name"],
-                name_he=branch["name_he"],
-                city=branch["city"],
-                city_he=branch["city_he"],
-                halls_count=branch["halls"],
-            )
-            db.add(cinema)
-
+        _seed_chain(db, HOT_CINEMA_CHAIN, HOT_CINEMA_BRANCHES)
+        _seed_chain(db, MOVIELAND_CHAIN, MOVIELAND_BRANCHES)
         db.commit()
-        print(f"Seeded: Hot Cinema chain with {len(HOT_CINEMA_BRANCHES)} branches")
-
     except Exception as e:
         db.rollback()
         print(f"Seed error: {e}")

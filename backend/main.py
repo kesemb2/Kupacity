@@ -59,13 +59,11 @@ async def lifespan(app: FastAPI):
     from models.models import CinemaChain
     db = SessionLocal()
     try:
-        if db.query(CinemaChain).count() == 0:
-            logger.info("No cinema chains - seeding Hot Cinema branches...")
-            from seed_data import seed_database
-            seed_database()
-            logger.info("Hot Cinema branches seeded successfully")
-        else:
-            logger.info("Cinema chains already exist")
+        from seed_data import seed_database
+        # Seed any missing chains (idempotent - skips existing)
+        seed_database()
+        chain_count = db.query(CinemaChain).count()
+        logger.info(f"{chain_count} cinema chain(s) in database")
     except Exception as e:
         logger.warning(f"Seed data loading failed: {e}")
     finally:
@@ -78,6 +76,9 @@ async def lifespan(app: FastAPI):
             hot_cinema_weekly_movies,
             hot_cinema_daily_screenings,
             hot_cinema_update_tickets,
+            movieland_weekly_movies,
+            movieland_daily_screenings,
+            movieland_update_tickets,
             close_expired_screenings,
             run_initial_scrape,
         )
@@ -120,6 +121,43 @@ async def lifespan(app: FastAPI):
                           id="hot_ticket_updates",
                           max_instances=1, coalesce=True)
 
+        # --- Movieland: weekly movie catalog refresh (every Sunday at 04:00) ---
+        async def scheduled_mvl_weekly():
+            db = SessionLocal()
+            try:
+                await movieland_weekly_movies(db)
+            finally:
+                db.close()
+
+        scheduler.add_job(scheduled_mvl_weekly, "cron", day_of_week="sun",
+                          hour=4, minute=0, id="mvl_weekly_movies",
+                          max_instances=1, coalesce=True)
+
+        # --- Movieland: daily screenings refresh (every day at 07:00) ---
+        async def scheduled_mvl_daily():
+            db = SessionLocal()
+            try:
+                await movieland_daily_screenings(db)
+            finally:
+                db.close()
+
+        scheduler.add_job(scheduled_mvl_daily, "cron", hour=7, minute=0,
+                          id="mvl_daily_screenings",
+                          max_instances=1, coalesce=True)
+
+        # --- Movieland: ticket count updates (every 5 hours, offset by 2.5h) ---
+        async def scheduled_mvl_tickets():
+            db = SessionLocal()
+            try:
+                await movieland_update_tickets(db)
+            finally:
+                db.close()
+
+        scheduler.add_job(scheduled_mvl_tickets, "interval", hours=5,
+                          start_date="2026-01-01 02:30:00",
+                          id="mvl_ticket_updates",
+                          max_instances=1, coalesce=True)
+
         # --- Close expired screenings (every minute) ---
         def scheduled_close_expired():
             db = SessionLocal()
@@ -132,8 +170,8 @@ async def lifespan(app: FastAPI):
                           id="close_expired_screenings")
 
         scheduler.start()
-        logger.info("Scheduler started: hot_weekly(Sun 03:00), "
-                     "hot_daily(06:00), hot_tickets(5h), close_expired(1m)")
+        logger.info("Scheduler started: hot_weekly(Sun 03:00), hot_daily(06:00), hot_tickets(5h), "
+                     "mvl_weekly(Sun 04:00), mvl_daily(07:00), mvl_tickets(5h+2.5h), close_expired(1m)")
 
         # Run initial scrape if DB is empty
         async def initial_scrape():
@@ -156,9 +194,9 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="Hot Cinema Israel Dashboard",
-    description="דאשבורד כרטיסים - הוט סינמה ישראל",
-    version="2.0.0",
+    title="Kupacity - Israel Cinema Seat Analytics",
+    description="כל הכיסאות בפריים אחד — דאשבורד נתוני מושבים לבתי קולנוע בישראל",
+    version="1.2.0",
     lifespan=lifespan,
 )
 
@@ -172,12 +210,12 @@ app.add_middleware(
 
 @app.get("/api/health")
 def health():
-    return {"status": "ok", "service": "Hot Cinema Dashboard"}
+    return {"status": "ok", "service": "Kupacity"}
 
 
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "Hot Cinema Dashboard", "docs": "/docs"}
+    return {"status": "ok", "service": "Kupacity", "docs": "/docs"}
 
 
 app.include_router(router)
