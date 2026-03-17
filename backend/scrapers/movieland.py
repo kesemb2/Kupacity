@@ -552,7 +552,7 @@ class MovielandScraper(BaseScraper):
                         href = await link.get_attribute("href") or ""
                         link_text = (await link.inner_text()).strip()
 
-                        # Extract time
+                        # Extract time from link text
                         time_match = re.search(r'(\d{1,2}:\d{2})', link_text)
                         if not time_match:
                             continue
@@ -601,18 +601,30 @@ class MovielandScraper(BaseScraper):
                         ))
 
                         # Collect booking URL for ticket updates
-                        if collect_booking_urls and BOOKING_DOMAIN in href:
-                            booking_items.append({
-                                "movie_title": title,
-                                "booking_url": href,
-                                "cinema_name": binfo["name"],
-                                "city": binfo["city"],
-                                "showtime": showtime,
-                                "hall": hall,
-                                "format": fmt,
-                                "branch_he": binfo["city_he"],
-                                "time_str": time_str,
-                            })
+                        # Links can be either:
+                        # - /order/?eventID=X&theaterId=Y (movieland.co.il order page → redirects to biggerpicture)
+                        # - ecom.biggerpicture.ai/... (direct seat map link)
+                        if collect_booking_urls:
+                            is_order_link = "/order/" in href and "eventID" in href
+                            is_booking_link = BOOKING_DOMAIN in href
+
+                            if is_order_link or is_booking_link:
+                                # Normalize order URLs to full path
+                                booking_url = href
+                                if booking_url.startswith("/"):
+                                    booking_url = f"{BASE_URL}{booking_url}"
+
+                                booking_items.append({
+                                    "movie_title": title,
+                                    "booking_url": booking_url,
+                                    "cinema_name": binfo["name"],
+                                    "city": binfo["city"],
+                                    "showtime": showtime,
+                                    "hall": hall,
+                                    "format": fmt,
+                                    "branch_he": binfo["city_he"],
+                                    "time_str": time_str,
+                                })
 
                     except Exception:
                         continue
@@ -656,7 +668,10 @@ class MovielandScraper(BaseScraper):
             for link in all_page_links:
                 try:
                     href = await link.get_attribute("href") or ""
-                    if BOOKING_DOMAIN not in href:
+                    # Match either biggerpicture links or /order/ links
+                    is_order_link = "/order/" in href and "eventID" in href
+                    is_booking_link = BOOKING_DOMAIN in href
+                    if not is_order_link and not is_booking_link:
                         continue
 
                     link_text = (await link.inner_text()).strip()
@@ -691,9 +706,13 @@ class MovielandScraper(BaseScraper):
                         except Exception:
                             pass
 
+                    booking_url = href
+                    if booking_url.startswith("/"):
+                        booking_url = f"{BASE_URL}{booking_url}"
+
                     booking_items.append({
                         "movie_title": movie_title or "Unknown",
-                        "booking_url": href,
+                        "booking_url": booking_url,
                         "cinema_name": binfo["name"],
                         "city": binfo["city"],
                         "showtime": showtime,
@@ -711,7 +730,9 @@ class MovielandScraper(BaseScraper):
             for link in all_page_links:
                 try:
                     href = await link.get_attribute("href") or ""
-                    if BOOKING_DOMAIN not in href:
+                    is_order_link = "/order/" in href and "eventID" in href
+                    is_booking_link = BOOKING_DOMAIN in href
+                    if not is_order_link and not is_booking_link:
                         continue
                     link_text = (await link.inner_text()).strip()
                     time_match = re.search(r'(\d{1,2}:\d{2})', link_text)
@@ -754,9 +775,12 @@ class MovielandScraper(BaseScraper):
                     ))
 
                     if collect_booking_urls:
+                        booking_url = href
+                        if booking_url.startswith("/"):
+                            booking_url = f"{BASE_URL}{booking_url}"
                         booking_items.append({
                             "movie_title": movie_title or "Unknown",
-                            "booking_url": href,
+                            "booking_url": booking_url,
                             "cinema_name": binfo["name"],
                             "city": binfo["city"],
                             "showtime": showtime,
@@ -1222,8 +1246,11 @@ class MovielandScraper(BaseScraper):
                                      on_screening_update=None) -> list[ScrapedScreening]:
         """Navigate to each screening's seat map and count seats.
 
-        Unlike Hot Cinema, Movieland's booking links go directly to the seat map
-        — no intermediate steps needed.
+        Movieland uses two types of booking URLs:
+        1. /order/?eventID=X&theaterId=Y → redirects to ecom.biggerpicture.ai seat map
+        2. Direct ecom.biggerpicture.ai links (rare)
+
+        Both end up on the BiggerPicture seat map page where we count seats.
         """
         pw, browser, context = await self._launch_browser()
         results: list[ScrapedScreening] = []
@@ -1275,8 +1302,46 @@ class MovielandScraper(BaseScraper):
                                 f"{item['movie_title']} @ {item.get('branch_he', '')}")
 
                 try:
-                    await self._open_url(page, item["booking_url"], wait_for_network=True)
-                    await asyncio.sleep(3)
+                    booking_url = item["booking_url"]
+                    is_order_url = "/order/" in booking_url and "eventID" in booking_url
+
+                    if is_order_url:
+                        # /order/ URLs redirect to ecom.biggerpicture.ai
+                        # Navigate and wait for redirect to complete
+                        logger.info(f"[Movieland] Navigating to order URL: {booking_url}")
+                        try:
+                            await page.goto(booking_url, wait_until="domcontentloaded", timeout=30000)
+                        except Exception as e:
+                            logger.warning(f"[Movieland] Order URL navigation: {e}")
+
+                        # Wait for redirect to biggerpicture
+                        for _ in range(10):
+                            if BOOKING_DOMAIN in page.url:
+                                break
+                            await asyncio.sleep(1)
+
+                        if BOOKING_DOMAIN not in page.url:
+                            logger.warning(
+                                f"[Movieland] Order URL did not redirect to {BOOKING_DOMAIN}. "
+                                f"Current URL: {page.url}"
+                            )
+                            # Take a debug screenshot to see what happened
+                            try:
+                                await page.screenshot(path=_debug_screenshot_path(
+                                    "redirect_fail",
+                                    movie=item["movie_title"],
+                                    branch=item.get("branch_he", ""),
+                                ))
+                            except Exception:
+                                pass
+                            continue
+
+                        logger.info(f"[Movieland] Redirected to: {page.url}")
+                        await asyncio.sleep(3)  # Wait for SPA to render
+                    else:
+                        # Direct biggerpicture URL
+                        await self._open_url(page, booking_url, wait_for_network=True)
+                        await asyncio.sleep(3)
 
                     total, sold, sold_positions = await self._count_seats_on_page(
                         page,
