@@ -229,7 +229,8 @@ class HotCinemaScraper(BaseScraper):
     # ------------------------------------------------------------------
 
     async def _count_seats_on_page(self, page: Page,
-                                    movie_title: str = "", screening_time: str = "") -> tuple[int, int, list]:
+                                    movie_title: str = "", screening_time: str = "",
+                                    branch: str = "") -> tuple[int, int, list]:
         total = 0
         sold = 0
         sold_positions = []
@@ -610,7 +611,7 @@ class HotCinemaScraper(BaseScraper):
 
         # Take annotated screenshot (step 5) - overlays are now on the page
         try:
-            await page.screenshot(path=_debug_screenshot_path("step5_annotated", movie_title, screening_time))
+            await page.screenshot(path=_debug_screenshot_path("step5_annotated", movie_title, screening_time, branch=branch))
             logger.info("[Hot Cinema] Step 5 screenshot saved (annotated seats)")
         except Exception:
             pass
@@ -1338,7 +1339,8 @@ class HotCinemaScraper(BaseScraper):
     # ------------------------------------------------------------------
 
     async def _navigate_to_seat_map(self, page: Page, booking_url: str,
-                                    movie_title: str = "", screening_time: str = "") -> tuple[int, int, list]:
+                                    movie_title: str = "", screening_time: str = "",
+                                    branch: str = "") -> tuple[int, int, list]:
         """Navigate from booking URL through ticket selection to seat map.
 
         Flow: booking_url → ticket page → click + → click המשך → seat map
@@ -1356,7 +1358,7 @@ class HotCinemaScraper(BaseScraper):
             # Save debug screenshots - step 1: booking page
             try:
                 await page.screenshot(path=_TICKET_DEBUG_SCREENSHOT)
-                await page.screenshot(path=_debug_screenshot_path("step1_booking", movie_title, screening_time))
+                await page.screenshot(path=_debug_screenshot_path("step1_booking", movie_title, screening_time, branch=branch))
                 logger.info(f"[Hot Cinema] Step 1 screenshot saved (booking page)")
             except Exception:
                 pass
@@ -1373,7 +1375,7 @@ class HotCinemaScraper(BaseScraper):
             # Check if already on seat map
             if "/seats" in current_url:
                 logger.info("[Hot Cinema] Seat map: already on seat page")
-                return await self._count_seats_on_page(page, movie_title=movie_title, screening_time=screening_time)
+                return await self._count_seats_on_page(page, movie_title=movie_title, screening_time=screening_time, branch=branch)
 
             # Shortcut: try navigating directly to /seats
             # Extract base site URL (e.g., /site/1183)
@@ -1388,10 +1390,10 @@ class HotCinemaScraper(BaseScraper):
                     logger.info(f"[Hot Cinema] Seat map: shortcut worked → {page.url}")
                     try:
                         await page.screenshot(path=_TICKET_DEBUG_SCREENSHOT)
-                        await page.screenshot(path=_debug_screenshot_path("step4_seat_map_shortcut", movie_title, screening_time))
+                        await page.screenshot(path=_debug_screenshot_path("step4_seat_map_shortcut", movie_title, screening_time, branch=branch))
                     except Exception:
                         pass
-                    total, sold, sold_positions = await self._count_seats_on_page(page, movie_title=movie_title, screening_time=screening_time)
+                    total, sold, sold_positions = await self._count_seats_on_page(page, movie_title=movie_title, screening_time=screening_time, branch=branch)
                     logger.info(f"[Hot Cinema] Seat map: counted {sold}/{total} seats")
                     return total, sold, sold_positions
 
@@ -1501,7 +1503,7 @@ class HotCinemaScraper(BaseScraper):
                 await asyncio.sleep(2)
                 # Step 2 screenshot: after clicking +
                 try:
-                    await page.screenshot(path=_debug_screenshot_path("step2_plus_click", movie_title, screening_time))
+                    await page.screenshot(path=_debug_screenshot_path("step2_plus_click", movie_title, screening_time, branch=branch))
                     logger.info("[Hot Cinema] Step 2 screenshot saved (after + click)")
                 except Exception:
                     pass
@@ -1553,7 +1555,7 @@ class HotCinemaScraper(BaseScraper):
                 await asyncio.sleep(3)
                 # Step 3 screenshot: after clicking המשך
                 try:
-                    await page.screenshot(path=_debug_screenshot_path("step3_continue", movie_title, screening_time))
+                    await page.screenshot(path=_debug_screenshot_path("step3_continue", movie_title, screening_time, branch=branch))
                     logger.info("[Hot Cinema] Step 3 screenshot saved (after continue)")
                 except Exception:
                     pass
@@ -1564,12 +1566,12 @@ class HotCinemaScraper(BaseScraper):
             # Step 4 screenshot: seat map page
             try:
                 await page.screenshot(path=_TICKET_DEBUG_SCREENSHOT)
-                await page.screenshot(path=_debug_screenshot_path("step4_seat_map", movie_title, screening_time))
+                await page.screenshot(path=_debug_screenshot_path("step4_seat_map", movie_title, screening_time, branch=branch))
                 logger.info("[Hot Cinema] Step 4 screenshot saved (seat map page)")
             except Exception:
                 pass
 
-            total, sold, sold_positions = await self._count_seats_on_page(page, movie_title=movie_title, screening_time=screening_time)
+            total, sold, sold_positions = await self._count_seats_on_page(page, movie_title=movie_title, screening_time=screening_time, branch=branch)
             logger.info(f"[Hot Cinema] Seat map: counted {sold}/{total} seats")
             return total, sold, sold_positions
 
@@ -1804,6 +1806,7 @@ class HotCinemaScraper(BaseScraper):
                                 page, booking_url,
                                 movie_title=info["movie_title"],
                                 screening_time=info["showtime"].strftime("%H%M"),
+                                branch=info["cinema_name"],
                             )
                             if total > 0:
                                 total_seats = total

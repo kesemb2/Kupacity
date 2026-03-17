@@ -220,10 +220,76 @@ class MovielandScraper(BaseScraper):
 
         await asyncio.sleep(2)
 
+        # Dismiss any popup/modal that appears
+        await self._dismiss_popup(page)
+
+    async def _dismiss_popup(self, page: Page):
+        """Try to dismiss popups/modals (cookie banners, promo popups, etc.)."""
+        try:
+            # Look for common close/dismiss buttons
+            close_selectors = [
+                'button[aria-label="close"]',
+                'button[aria-label="Close"]',
+                'button[aria-label="סגור"]',
+                '.close-btn', '.close-button', '.modal-close',
+                '[class*="close"]', '[class*="Close"]',
+                'button.close', 'a.close',
+                '[class*="popup"] button', '[class*="Popup"] button',
+                '[class*="modal"] button', '[class*="Modal"] button',
+                '[class*="overlay"] button',
+                'button[class*="dismiss"]',
+                # X button patterns
+                'button:has-text("×")', 'button:has-text("✕")',
+                'button:has-text("X")', 'button:has-text("x")',
+                'button:has-text("סגור")', 'a:has-text("סגור")',
+            ]
+
+            for selector in close_selectors:
+                try:
+                    btn = await page.query_selector(selector)
+                    if btn:
+                        is_visible = await btn.is_visible()
+                        if is_visible:
+                            await btn.click()
+                            logger.info(f"[Movieland] Dismissed popup via: {selector}")
+                            await asyncio.sleep(1)
+                            return
+                except Exception:
+                    continue
+
+            # Also try pressing Escape
+            try:
+                await page.keyboard.press("Escape")
+                await asyncio.sleep(0.5)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
     # ── Branch discovery ─────────────────────────────────────────────────
 
+    @staticmethod
+    def _is_junk_link(href: str) -> bool:
+        """Filter out links that are clearly not branch/movie pages."""
+        junk_patterns = [
+            'whatsapp.com', 'wa.me', 'api.whatsapp',
+            'facebook.com', 'instagram.com', 'twitter.com', 'tiktok.com',
+            'youtube.com', 'linkedin.com',
+            'mailto:', 'tel:', 'javascript:',
+            '#', '/cancel', '/ביטול', '/refund', '/החזר',
+            '/contact', '/צור-קשר', '/about', '/אודות',
+            '/terms', '/תקנון', '/privacy', '/פרטיות',
+            '/faq', '/login', '/register', '/cart',
+            '/careers', '/דרושים',
+        ]
+        href_lower = href.lower()
+        return any(p in href_lower for p in junk_patterns)
+
     async def _discover_branch_urls(self, page: Page) -> dict[str, str]:
-        """Discover branch page URLs from the site header dropdown.
+        """Discover branch page URLs from the site.
+
+        Movieland branch pages follow the pattern:
+        https://movieland.co.il/theater/{theater_id}/{city_he}
 
         Returns {branch_key: full_url} for each known branch.
         """
@@ -239,99 +305,119 @@ class MovielandScraper(BaseScraper):
         except Exception:
             pass
 
-        # Strategy 1: Hover over "סניפים" to reveal dropdown
-        try:
-            # Look for navigation items containing "סניפים" (branches)
-            nav_items = await page.query_selector_all(
-                'nav a, header a, [class*="menu"] a, [class*="nav"] a, '
-                'li a, .menu-item a'
-            )
-            snifim_el = None
-            for item in nav_items:
-                text = (await item.inner_text()).strip()
-                if "סניפים" in text or "סניף" in text:
-                    snifim_el = item
-                    break
+        # Strategy 1: Find /theater/ links anywhere on the page
+        # These follow the pattern /theater/{id}/{city_he}
+        all_links = await page.query_selector_all('a[href]')
+        theater_links: list[tuple[str, str]] = []  # (href, text)
 
-            if snifim_el:
-                await snifim_el.hover()
-                await asyncio.sleep(1.5)
-                logger.info("[Movieland] Hovered on 'סניפים' menu item")
+        for link in all_links:
+            try:
+                href = await link.get_attribute("href") or ""
+                if self._is_junk_link(href):
+                    continue
+                text = (await link.inner_text()).strip()
 
-                try:
-                    await page.screenshot(
-                        path=_debug_screenshot_path("dropdown", branch="snifim")
-                    )
-                except Exception:
-                    pass
+                # Collect /theater/ links specifically
+                if "/theater/" in href or "/theater/" in href.lower():
+                    if href.startswith("/"):
+                        href = f"{BASE_URL}{href}"
+                    theater_links.append((href, text))
 
-                # Now look for branch links in the dropdown
-                all_links = await page.query_selector_all('a[href]')
-                for link in all_links:
-                    try:
-                        href = await link.get_attribute("href") or ""
-                        text = (await link.inner_text()).strip()
-
-                        for bid, binfo in MOVIELAND_BRANCHES.items():
-                            slug = binfo["slug"]
-                            # Check if link goes to this branch's page
-                            if (slug in href.lower() or
-                                    binfo["city_he"] in text or
-                                    binfo["name_he"] in text):
-                                if href.startswith("/"):
-                                    href = f"{BASE_URL}{href}"
-                                if href.startswith("http"):
-                                    branch_urls[bid] = href
-                                    logger.info(f"[Movieland] Found branch URL: {binfo['name']} -> {href}")
-                    except Exception:
+                # Also try to match branches by city name in any link
+                for bid, binfo in MOVIELAND_BRANCHES.items():
+                    if bid in branch_urls:
                         continue
-        except Exception as e:
-            logger.warning(f"[Movieland] Dropdown discovery failed: {e}")
-
-        # Strategy 2: Try known URL patterns for missing branches
-        for bid, binfo in MOVIELAND_BRANCHES.items():
-            if bid in branch_urls:
-                continue
-            # Try common patterns
-            for pattern in [
-                f"{BASE_URL}/{binfo['slug']}/",
-                f"{BASE_URL}/branch/{binfo['slug']}/",
-                f"{BASE_URL}/snif/{binfo['slug']}/",
-                f"{BASE_URL}/{binfo['slug']}",
-            ]:
-                try:
-                    resp = await page.goto(pattern, wait_until="domcontentloaded", timeout=10000)
-                    if resp and resp.ok:
-                        # Check it's actually a branch page (has movie/showtime content)
-                        content = await page.content()
-                        if any(kw in content for kw in [
-                            "showtime", "הקרנ", "שעת", BOOKING_DOMAIN,
-                            "movie", "סרט", binfo["city_he"],
-                        ]):
-                            branch_urls[bid] = pattern.rstrip("/")
-                            logger.info(f"[Movieland] Found branch URL by pattern: {binfo['name']} -> {pattern}")
-                            break
-                except Exception:
-                    continue
-
-        # Strategy 3: Search page content for branch page links
-        if len(branch_urls) < len(MOVIELAND_BRANCHES):
-            await self._open_url(page, BASE_URL, wait_for_network=True)
-            all_links = await page.query_selector_all('a[href]')
-            for link in all_links:
-                try:
-                    href = await link.get_attribute("href") or ""
-                    text = (await link.inner_text()).strip()
-                    for bid, binfo in MOVIELAND_BRANCHES.items():
-                        if bid in branch_urls:
+                    city_he = binfo["city_he"]
+                    # Match by URL containing city name or by link text
+                    if city_he in href or city_he in text:
+                        if self._is_junk_link(href):
                             continue
-                        if binfo["city_he"] in text or binfo["slug"] in href.lower():
-                            if href.startswith("/"):
-                                href = f"{BASE_URL}{href}"
-                            if href.startswith("http"):
-                                branch_urls[bid] = href
-                except Exception:
+                        if href.startswith("/"):
+                            href = f"{BASE_URL}{href}"
+                        if href.startswith("http") and "movieland.co.il" in href:
+                            branch_urls[bid] = href
+                            logger.info(f"[Movieland] Found branch URL: {binfo['name']} -> {href}")
+
+            except Exception:
+                continue
+
+        # Process collected /theater/ links
+        for href, text in theater_links:
+            for bid, binfo in MOVIELAND_BRANCHES.items():
+                if bid in branch_urls:
                     continue
+                # Check if this theater link matches a branch
+                city_he = binfo["city_he"]
+                if city_he in href or city_he in text:
+                    branch_urls[bid] = href
+                    logger.info(f"[Movieland] Found branch URL via /theater/: {binfo['name']} -> {href}")
+
+        logger.info(f"[Movieland] Strategy 1 (page links): found {len(branch_urls)} branches")
+
+        # Strategy 2: Hover over "סניפים" in the nav to reveal dropdown
+        if len(branch_urls) < len(MOVIELAND_BRANCHES):
+            try:
+                nav_items = await page.query_selector_all(
+                    'nav a, header a, [class*="menu"] a, [class*="nav"] a, '
+                    'li a, .menu-item a'
+                )
+                snifim_el = None
+                for item in nav_items:
+                    text = (await item.inner_text()).strip()
+                    if "סניפים" in text or "סניף" in text:
+                        snifim_el = item
+                        break
+
+                if snifim_el:
+                    # Try hover
+                    await snifim_el.hover()
+                    await asyncio.sleep(1.5)
+                    logger.info("[Movieland] Hovered on 'סניפים' menu item")
+
+                    try:
+                        await page.screenshot(
+                            path=_debug_screenshot_path("dropdown", branch="snifim")
+                        )
+                    except Exception:
+                        pass
+
+                    # Also try clicking it
+                    try:
+                        await snifim_el.click()
+                        await asyncio.sleep(2)
+                    except Exception:
+                        pass
+
+                    # Scan for new links
+                    dropdown_links = await page.query_selector_all('a[href]')
+                    for link in dropdown_links:
+                        try:
+                            href = await link.get_attribute("href") or ""
+                            if self._is_junk_link(href):
+                                continue
+                            text = (await link.inner_text()).strip()
+
+                            for bid, binfo in MOVIELAND_BRANCHES.items():
+                                if bid in branch_urls:
+                                    continue
+                                city_he = binfo["city_he"]
+                                if city_he in href or city_he in text:
+                                    if href.startswith("/"):
+                                        href = f"{BASE_URL}{href}"
+                                    if href.startswith("http") and "movieland.co.il" in href:
+                                        branch_urls[bid] = href
+                                        logger.info(f"[Movieland] Found branch URL via dropdown: {binfo['name']} -> {href}")
+                        except Exception:
+                            continue
+
+                    # Navigate back to homepage if we left it
+                    if page.url != BASE_URL and page.url != f"{BASE_URL}/":
+                        await self._open_url(page, BASE_URL, wait_for_network=True)
+
+            except Exception as e:
+                logger.warning(f"[Movieland] Dropdown discovery failed: {e}")
+
+        logger.info(f"[Movieland] Strategy 2 (dropdown): total {len(branch_urls)} branches")
 
         logger.info(f"[Movieland] Discovered {len(branch_urls)}/{len(MOVIELAND_BRANCHES)} branch URLs")
         return branch_urls
@@ -414,11 +500,24 @@ class MovielandScraper(BaseScraper):
                 if not title or len(title) < 2 or title in seen_titles:
                     continue
 
-                # Skip navigation/branch labels
+                # Skip navigation/branch labels and junk titles
                 if any(binfo2["city_he"] in title for binfo2 in MOVIELAND_BRANCHES.values()):
                     continue
-                skip_words = ["סניפים", "תקנון", "צור קשר", "אודות", "FAQ", "שאלות"]
-                if any(w in title for w in skip_words):
+                skip_words = [
+                    "סניפים", "תקנון", "צור קשר", "אודות", "FAQ", "שאלות",
+                    "whatsapp", "ווטסאפ", "ואטסאפ", "מובילנד", "movieland",
+                    "דרושים", "careers", "קניון", "mall",
+                    "הזמנת כרטיסים", "ביטול", "החזר", "תנאי",
+                    "כל הזכויות", "copyright", "powered by",
+                    "נגישות", "accessibility",
+                ]
+                if any(w.lower() in title.lower() for w in skip_words):
+                    continue
+                # Skip very long strings (likely not movie titles)
+                if len(title) > 80:
+                    continue
+                # Skip if title is just numbers/punctuation
+                if re.match(r'^[\d\s\-_.,:;!?]+$', title):
                     continue
 
                 seen_titles.add(title)

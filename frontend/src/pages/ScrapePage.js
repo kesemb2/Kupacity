@@ -249,9 +249,17 @@ const CHAIN_COLORS = {
   mvl: '#7c3aed',
 };
 
+// All known step keywords (both single and compound)
+const STEP_KEYWORDS_SINGLE = ['page', 'branch', 'dropdown', 'booking', 'seats'];
+const STEP_KEYWORDS_COMPOUND = [
+  'step1_booking', 'step2_plus_click', 'step3_continue',
+  'step4_seat_map', 'step4_seat_map_shortcut', 'step5_annotated',
+];
+
 function parseScreenshotFilename(filename) {
   // Format: {chain}_{branch}_{movie}_{time}_{step}_{timestamp}.png
-  // or: {chain}_{step}_{detail}_{timestamp}.png (legacy / simpler)
+  // Timestamp is always 6 digits (HHMMSS) at the end before .png
+  // Step is the second-to-last segment (or compound like step4_seat_map)
   const name = filename.replace('.png', '');
   const parts = name.split('_');
 
@@ -263,53 +271,82 @@ function parseScreenshotFilename(filename) {
 
   if (parts[0] === 'hot' || parts[0] === 'mvl') {
     chain = parts[0];
-    // Find the step part by matching known step keywords
-    const stepKeywords = Object.keys(STEP_LABELS);
-    let stepIdx = -1;
+  } else {
+    // Legacy format - just return basic info
+    return { chain: 'unknown', branch: '', movie: '', time: '', step: parts[0] || '' };
+  }
 
-    // Try compound step names first (e.g., "step1_booking")
-    for (let i = 1; i < parts.length - 1; i++) {
-      const compound = parts[i] + '_' + parts[i + 1];
-      if (stepKeywords.includes(compound)) {
-        step = compound;
-        stepIdx = i;
+  // Last part is always timestamp (6 digits)
+  // Work backwards to find the step
+  const lastPart = parts[parts.length - 1];
+  let timestampIdx = parts.length - 1;
+  if (/^\d{6}$/.test(lastPart)) {
+    timestampIdx = parts.length - 1;
+  }
+
+  // Find the step by scanning from the end (before timestamp)
+  let stepStartIdx = -1;
+  let stepEndIdx = timestampIdx;
+
+  // Try compound step names first (scan backwards for step patterns)
+  for (let i = timestampIdx - 1; i >= 1; i--) {
+    // Try 3-part compound: step4_seat_map_shortcut
+    if (i >= 3) {
+      const compound3 = parts[i - 2] + '_' + parts[i - 1] + '_' + parts[i];
+      if (STEP_KEYWORDS_COMPOUND.includes(compound3)) {
+        step = compound3;
+        stepStartIdx = i - 2;
         break;
       }
     }
-
-    // Then try single step names
-    if (!step) {
-      for (let i = 1; i < parts.length; i++) {
-        if (stepKeywords.includes(parts[i])) {
-          step = parts[i];
-          stepIdx = i;
-          break;
-        }
+    // Try 2-part compound: step1_booking, step4_seat_map, etc.
+    if (i >= 2) {
+      const compound2 = parts[i - 1] + '_' + parts[i];
+      if (STEP_KEYWORDS_COMPOUND.includes(compound2)) {
+        step = compound2;
+        stepStartIdx = i - 1;
+        break;
       }
     }
+    // Try single keyword
+    if (STEP_KEYWORDS_SINGLE.includes(parts[i])) {
+      step = parts[i];
+      stepStartIdx = i;
+      break;
+    }
+  }
 
-    // Everything between chain and step is context (branch, movie, time)
-    if (stepIdx > 1) {
-      const contextParts = parts.slice(1, stepIdx);
-      // Last context part might be a time (4 digits like 2030)
+  // Everything between chain (idx 0) and step is context
+  // Context order: branch, movie parts..., time (4 digits)
+  if (stepStartIdx > 1) {
+    const contextParts = parts.slice(1, stepStartIdx);
+
+    // Last context part might be a time (4 digits like 2030)
+    if (contextParts.length > 0) {
       const lastCtx = contextParts[contextParts.length - 1];
       if (/^\d{4}$/.test(lastCtx)) {
         time = lastCtx.substring(0, 2) + ':' + lastCtx.substring(2);
         contextParts.pop();
       }
-      // First context part is usually branch, rest is movie
-      if (contextParts.length >= 1) {
-        branch = contextParts[0];
-      }
-      if (contextParts.length >= 2) {
-        movie = contextParts.slice(1).join(' ');
-      }
     }
+
+    // First context part is branch, rest is movie
+    if (contextParts.length >= 1) {
+      branch = contextParts[0];
+    }
+    if (contextParts.length >= 2) {
+      movie = contextParts.slice(1).join(' ');
+    }
+  } else if (stepStartIdx === 1) {
+    // No context between chain and step
   } else {
-    // Legacy format: step_movie_time_ts.png
-    step = parts[0];
-    if (parts.length > 2) {
-      movie = parts.slice(1, -1).join(' ');
+    // Couldn't find step - treat everything except chain and timestamp as context
+    const contextParts = parts.slice(1, timestampIdx);
+    if (contextParts.length >= 1) {
+      branch = contextParts[0];
+    }
+    if (contextParts.length >= 2) {
+      movie = contextParts.slice(1).join(' ');
     }
   }
 
@@ -349,16 +386,30 @@ function DebugScreenshotsGallery() {
       .catch(() => {});
   };
 
-  // Group screenshots into hierarchy: chain -> movie -> items
+  // Group screenshots into hierarchy: chain -> group -> items
+  // Group by movie if available, otherwise by branch, otherwise "ניווט"
   const grouped = {};
   for (const s of screenshots) {
     const parsed = parseScreenshotFilename(s.filename);
     const chainKey = parsed.chain || 'unknown';
-    const movieKey = parsed.movie || parsed.branch || 'כללי';
+
+    // Build a descriptive group key
+    let groupKey;
+    if (parsed.movie) {
+      // Has a movie — group by movie name (with branch as sub-info shown per item)
+      groupKey = parsed.movie;
+    } else if (parsed.branch && parsed.step && ['page', 'branch', 'dropdown'].includes(parsed.step)) {
+      // Navigation screenshot — group under "ניווט" (navigation)
+      groupKey = 'ניווט';
+    } else if (parsed.branch) {
+      groupKey = parsed.branch;
+    } else {
+      groupKey = 'ניווט';
+    }
 
     if (!grouped[chainKey]) grouped[chainKey] = {};
-    if (!grouped[chainKey][movieKey]) grouped[chainKey][movieKey] = [];
-    grouped[chainKey][movieKey].push({ ...s, parsed });
+    if (!grouped[chainKey][groupKey]) grouped[chainKey][groupKey] = [];
+    grouped[chainKey][groupKey].push({ ...s, parsed });
   }
 
   const toggleChain = (chain) => {
@@ -539,6 +590,7 @@ function DebugScreenshotsGallery() {
                                 {items.map((s) => (
                                   <div
                                     key={s.filename}
+                                    title={s.filename}
                                     onClick={() => window.open(getDebugScreenshotFileUrl(s.filename), '_blank')}
                                     style={{
                                       background: '#0f172a',
@@ -551,26 +603,46 @@ function DebugScreenshotsGallery() {
                                     onMouseEnter={(e) => e.currentTarget.style.borderColor = chainColor}
                                     onMouseLeave={(e) => e.currentTarget.style.borderColor = '#1e293b'}
                                   >
+                                    {/* Step label + time */}
                                     <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}>
                                       <span style={{ fontSize: 13, fontWeight: 600, color: '#e2e8f0' }}>
                                         {getStepLabel(s.parsed.step)}
                                       </span>
                                       {s.parsed.time && (
                                         <span style={{
-                                          fontSize: 12,
-                                          color: '#94a3b8',
+                                          fontSize: 13,
+                                          fontWeight: 700,
+                                          color: '#60a5fa',
                                           fontFamily: 'monospace',
                                         }}>
                                           {s.parsed.time}
                                         </span>
                                       )}
                                     </div>
-                                    {s.parsed.branch && (
-                                      <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 2 }}>
-                                        {s.parsed.branch}
-                                      </div>
-                                    )}
-                                    <div style={{ fontSize: 11, color: '#475569', marginTop: 4 }}>
+                                    {/* Branch + movie info */}
+                                    <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginBottom: 4 }}>
+                                      {s.parsed.branch && (
+                                        <span style={{
+                                          fontSize: 11,
+                                          color: chainColor,
+                                          background: `${chainColor}15`,
+                                          padding: '1px 6px',
+                                          borderRadius: 4,
+                                          fontWeight: 600,
+                                        }}>
+                                          {s.parsed.branch}
+                                        </span>
+                                      )}
+                                      {s.parsed.movie && (
+                                        <span style={{
+                                          fontSize: 11,
+                                          color: '#94a3b8',
+                                        }}>
+                                          {s.parsed.movie}
+                                        </span>
+                                      )}
+                                    </div>
+                                    <div style={{ fontSize: 11, color: '#475569' }}>
                                       {s.size_kb} KB · {new Date(s.created_at * 1000).toLocaleTimeString('he-IL')}
                                     </div>
                                   </div>
