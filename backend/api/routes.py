@@ -615,20 +615,41 @@ def get_genre_stats(db: Session = Depends(get_db)):
 # ─── Manual Scrape Trigger ────────────────────────────────────────────
 
 @router.post("/scrape/trigger")
-async def trigger_scrape():
-    """הפעלת סריקה ידנית - רץ ברקע"""
-    async def run_scrape():
-        from scrapers.manager import run_initial_scrape
+async def trigger_scrape(chain: Optional[str] = Query(default=None)):
+    """הפעלת סריקה ידנית - רץ ברקע.
+
+    chain: "hot_cinema", "movieland", or None (both concurrently)
+    """
+    from scrapers.manager import run_initial_scrape, run_movieland_initial_scrape
+
+    async def run_hot():
         db = SessionLocal()
         try:
             await run_initial_scrape(db)
         except Exception as e:
-            logger.error(f"Manual scrape failed: {e}")
+            logger.error(f"Manual Hot Cinema scrape failed: {e}")
         finally:
             db.close()
 
-    asyncio.create_task(run_scrape())
-    return {"status": "started", "message": "סריקה הופעלה ברקע. בדוק בלוגים את ההתקדמות."}
+    async def run_mvl():
+        db = SessionLocal()
+        try:
+            await run_movieland_initial_scrape(db)
+        except Exception as e:
+            logger.error(f"Manual Movieland scrape failed: {e}")
+        finally:
+            db.close()
+
+    if chain == "hot_cinema":
+        asyncio.create_task(run_hot())
+        return {"status": "started", "message": "סריקת הוט סינמה הופעלה ברקע."}
+    elif chain == "movieland":
+        asyncio.create_task(run_mvl())
+        return {"status": "started", "message": "סריקת מובילנד הופעלה ברקע."}
+    else:
+        asyncio.create_task(run_hot())
+        asyncio.create_task(run_mvl())
+        return {"status": "started", "message": "סריקת שתי הרשתות הופעלה ברקע (במקביל)."}
 
 
 # ─── Scrape Logs ─────────────────────────────────────────────────────

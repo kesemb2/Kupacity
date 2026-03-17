@@ -79,17 +79,20 @@ def _finalize_blocked_seats(db: Session, hall_data: dict) -> None:
 
     hall_data: {(cinema_id, hall): [set_of_pos_keys, ...]}
         Each set contains "x,y" keys of sold seats from one screening.
-        A seat is "always-sold in this run" only if it appears in ALL screenings
-        of that hall (intersection).  scan_count increments once per run.
+        A seat is "always-sold in this run" if it appears in >=75% of screenings
+        of that hall (frequency-based).  scan_count increments once per run.
     """
     for (cinema_id, hall), position_sets in hall_data.items():
         if not position_sets:
             continue
 
-        # Intersection: seats sold in ALL screenings of this hall in this run
-        always_sold = position_sets[0]
-        for ps in position_sets[1:]:
-            always_sold = always_sold & ps
+        # Frequency-based: seats sold in >=75% of screenings in this hall/run
+        freq = {}
+        for ps in position_sets:
+            for key in ps:
+                freq[key] = freq.get(key, 0) + 1
+        min_count = max(1, int(len(position_sets) * 0.75))
+        always_sold = {k for k, v in freq.items() if v >= min_count}
         if not always_sold:
             continue
 
@@ -208,11 +211,12 @@ def _make_screening_callback(db: Session, chain: CinemaChain, log: ScrapeLog):
             db.commit()
 
             # Accumulate sold positions for blocked-seat learning
-            if screening.sold_positions and screening.total_seats > 0 and screening.hall:
+            if screening.sold_positions and screening.total_seats > 0:
                 name_he, city_he = _lookup_hebrew(screening.cinema_name)
                 cinema = _get_or_create_cinema(db, chain.id, screening.cinema_name,
                                                screening.city, name_he=name_he, city_he=city_he)
-                key = (cinema.id, screening.hall)
+                hall = screening.hall or "unknown"
+                key = (cinema.id, hall)
                 pos_set = {f"{p[0]},{p[1]}" for p in screening.sold_positions}
                 hall_data.setdefault(key, []).append(pos_set)
         except Exception:
@@ -267,6 +271,56 @@ async def run_initial_scrape(db: Session):
         log.progress = None
         db.commit()
         logger.error(f"[Hot Cinema] Initial scrape failed: {e}")
+    finally:
+        await scraper.close()
+
+
+async def run_movieland_initial_scrape(db: Session):
+    """Run on startup if DB is empty - scrape movies and screenings from Movieland."""
+    scraper = MovielandScraper()
+    start = datetime.utcnow()
+
+    log = ScrapeLog(chain_name="Movieland", status="running",
+                    progress=json.dumps({"phase": "מתחיל סריקה - מובילנד", "current": 0, "total": 0, "detail": ""}, ensure_ascii=False))
+    db.add(log)
+    db.commit()
+
+    progress_cb = _make_progress_callback(db, log)
+
+    try:
+        movies = await scraper.scrape_movies(on_progress=progress_cb)
+        chain = _get_or_create_chain(
+            db, scraper.chain_name, scraper.chain_name_he, scraper.base_url
+        )
+        for sm in movies:
+            _get_or_create_movie(db, sm)
+
+        screenings = await scraper.scrape_screenings(on_progress=progress_cb)
+        _upsert_screenings(db, chain, screenings)
+
+        # Run ticket updates to get real seat counts
+        screening_cb, hall_data = _make_screening_callback(db, chain, log)
+        await scraper.scrape_ticket_updates(
+            on_progress=progress_cb, on_screening_update=screening_cb,
+        )
+        _finalize_blocked_seats(db, hall_data)
+
+        duration = (datetime.utcnow() - start).total_seconds()
+        log.status = "success"
+        log.movies_found = len(movies)
+        log.screenings_found = len(screenings)
+        log.duration_seconds = duration
+        log.progress = None
+        db.commit()
+        logger.info(f"[Movieland] Initial scrape: {len(movies)} movies, {len(screenings)} screenings")
+    except Exception as e:
+        duration = (datetime.utcnow() - start).total_seconds()
+        log.status = "error"
+        log.error_message = str(e)
+        log.duration_seconds = duration
+        log.progress = None
+        db.commit()
+        logger.error(f"[Movieland] Initial scrape failed: {e}")
     finally:
         await scraper.close()
 

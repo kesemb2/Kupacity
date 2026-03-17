@@ -19,15 +19,14 @@ function ScrapePage() {
 
   useEffect(() => {
     loadLogs();
-    // Poll faster when a scrape is running
     const interval = setInterval(loadLogs, runningLog ? 3000 : 10000);
     return () => clearInterval(interval);
   }, [loadLogs, runningLog]);
 
-  const handleTrigger = () => {
+  const handleTrigger = (chain) => {
     setScraping(true);
     setMessage(null);
-    triggerScrape()
+    triggerScrape(chain)
       .then((res) => {
         setMessage(res.message || 'סריקה הופעלה');
         setTimeout(loadLogs, 2000);
@@ -61,35 +60,53 @@ function ScrapePage() {
         padding: '24px',
         border: '1px solid #334155',
         marginBottom: 24,
-        display: 'flex',
-        justifyContent: 'space-between',
-        alignItems: 'center',
       }}>
-        <div>
-          <h2 style={{ fontSize: 20, fontWeight: 700, marginBottom: 4 }}>הפעלת סריקה</h2>
-          <div style={{ color: '#94a3b8', fontSize: 14 }}>
-            סורק את אתר הוט סינמה ומעדכן סרטים, הקרנות וכרטיסים
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
+          <div>
+            <h2 style={{ fontSize: 20, fontWeight: 700, marginBottom: 4 }}>הפעלת סריקה</h2>
+            <div style={{ color: '#94a3b8', fontSize: 14 }}>
+              סורק את אתרי בתי הקולנוע ומעדכן סרטים, הקרנות וכרטיסים
+            </div>
           </div>
         </div>
-        <button
-          onClick={handleTrigger}
-          disabled={scraping || !!runningLog}
-          style={{
-            padding: '12px 32px',
-            borderRadius: 8,
-            border: 'none',
-            cursor: (scraping || runningLog) ? 'not-allowed' : 'pointer',
-            fontSize: 15,
-            fontWeight: 600,
-            fontFamily: 'Heebo, sans-serif',
-            background: (scraping || runningLog) ? '#475569' : '#3b82f6',
-            color: '#fff',
-            transition: 'all 0.2s',
-            opacity: (scraping || runningLog) ? 0.7 : 1,
-          }}
-        >
-          {(scraping || runningLog) ? 'רץ...' : 'הפעל סריקה'}
-        </button>
+        <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
+          <button
+            onClick={() => handleTrigger()}
+            disabled={scraping || !!runningLog}
+            style={{
+              ...triggerBtnStyle,
+              background: (scraping || runningLog) ? '#475569' : '#3b82f6',
+              opacity: (scraping || runningLog) ? 0.7 : 1,
+              cursor: (scraping || runningLog) ? 'not-allowed' : 'pointer',
+            }}
+          >
+            {(scraping || runningLog) ? 'רץ...' : 'סרוק הכל (במקביל)'}
+          </button>
+          <button
+            onClick={() => handleTrigger('hot_cinema')}
+            disabled={scraping || !!runningLog}
+            style={{
+              ...triggerBtnStyle,
+              background: (scraping || runningLog) ? '#475569' : '#dc2626',
+              opacity: (scraping || runningLog) ? 0.7 : 1,
+              cursor: (scraping || runningLog) ? 'not-allowed' : 'pointer',
+            }}
+          >
+            הוט סינמה בלבד
+          </button>
+          <button
+            onClick={() => handleTrigger('movieland')}
+            disabled={scraping || !!runningLog}
+            style={{
+              ...triggerBtnStyle,
+              background: (scraping || runningLog) ? '#475569' : '#7c3aed',
+              opacity: (scraping || runningLog) ? 0.7 : 1,
+              cursor: (scraping || runningLog) ? 'not-allowed' : 'pointer',
+            }}
+          >
+            מובילנד בלבד
+          </button>
+        </div>
       </div>
 
       {message && (
@@ -109,10 +126,10 @@ function ScrapePage() {
       {/* Debug Screenshots */}
       <DebugScreenshotsGallery />
 
-      {/* Live Progress Indicator */}
-      {runningLog && runningLog.progress && (
-        <ProgressCard progress={runningLog.progress} />
-      )}
+      {/* Live Progress Indicators - show all running logs */}
+      {logs.filter(l => l.status === 'running' && l.progress).map((log) => (
+        <ProgressCard key={log.id} progress={log.progress} chainName={log.chain_name} />
+      ))}
 
       {/* Logs Table */}
       <div style={{
@@ -206,25 +223,112 @@ function ScrapePage() {
 }
 
 
+// ── Screenshot parsing & labels ──────────────────────────────────────────
+
 const STEP_LABELS = {
-  step1: 'דף הזמנה',
-  step2: 'אחרי לחיצה על +',
-  step3: 'אחרי המשך',
-  step4: 'מפת כיסאות',
-  step5: 'כיסאות מסומנים',
+  page: 'עמוד ראשי',
+  branch: 'עמוד סניף',
+  dropdown: 'תפריט סניפים',
+  booking: 'דף הזמנה',
+  step1_booking: 'דף הזמנה',
+  step2_plus_click: 'אחרי +',
+  step3_continue: 'אחרי המשך',
+  step4_seat_map: 'מפת כיסאות',
+  step4_seat_map_shortcut: 'מפת כיסאות (קיצור)',
+  step5_annotated: 'כיסאות מסומנים',
+  seats: 'מפת כיסאות',
 };
 
-function getStepLabel(filename) {
-  for (const [key, label] of Object.entries(STEP_LABELS)) {
-    if (filename.startsWith(key)) return label;
+const CHAIN_LABELS = {
+  hot: 'הוט סינמה',
+  mvl: 'מובילנד',
+};
+
+const CHAIN_COLORS = {
+  hot: '#dc2626',
+  mvl: '#7c3aed',
+};
+
+function parseScreenshotFilename(filename) {
+  // Format: {chain}_{branch}_{movie}_{time}_{step}_{timestamp}.png
+  // or: {chain}_{step}_{detail}_{timestamp}.png (legacy / simpler)
+  const name = filename.replace('.png', '');
+  const parts = name.split('_');
+
+  let chain = 'unknown';
+  let branch = '';
+  let movie = '';
+  let time = '';
+  let step = '';
+
+  if (parts[0] === 'hot' || parts[0] === 'mvl') {
+    chain = parts[0];
+    // Find the step part by matching known step keywords
+    const stepKeywords = Object.keys(STEP_LABELS);
+    let stepIdx = -1;
+
+    // Try compound step names first (e.g., "step1_booking")
+    for (let i = 1; i < parts.length - 1; i++) {
+      const compound = parts[i] + '_' + parts[i + 1];
+      if (stepKeywords.includes(compound)) {
+        step = compound;
+        stepIdx = i;
+        break;
+      }
+    }
+
+    // Then try single step names
+    if (!step) {
+      for (let i = 1; i < parts.length; i++) {
+        if (stepKeywords.includes(parts[i])) {
+          step = parts[i];
+          stepIdx = i;
+          break;
+        }
+      }
+    }
+
+    // Everything between chain and step is context (branch, movie, time)
+    if (stepIdx > 1) {
+      const contextParts = parts.slice(1, stepIdx);
+      // Last context part might be a time (4 digits like 2030)
+      const lastCtx = contextParts[contextParts.length - 1];
+      if (/^\d{4}$/.test(lastCtx)) {
+        time = lastCtx.substring(0, 2) + ':' + lastCtx.substring(2);
+        contextParts.pop();
+      }
+      // First context part is usually branch, rest is movie
+      if (contextParts.length >= 1) {
+        branch = contextParts[0];
+      }
+      if (contextParts.length >= 2) {
+        movie = contextParts.slice(1).join(' ');
+      }
+    }
+  } else {
+    // Legacy format: step_movie_time_ts.png
+    step = parts[0];
+    if (parts.length > 2) {
+      movie = parts.slice(1, -1).join(' ');
+    }
   }
-  return filename;
+
+  return { chain, branch, movie, time, step };
 }
+
+function getStepLabel(step) {
+  return STEP_LABELS[step] || step;
+}
+
+
+// ── Hierarchical gallery component ───────────────────────────────────────
 
 function DebugScreenshotsGallery() {
   const [expanded, setExpanded] = useState(false);
   const [screenshots, setScreenshots] = useState([]);
   const [loading, setLoading] = useState(false);
+  const [expandedChains, setExpandedChains] = useState({});
+  const [expandedMovies, setExpandedMovies] = useState({});
 
   const loadScreenshots = useCallback(() => {
     setLoading(true);
@@ -243,6 +347,26 @@ function DebugScreenshotsGallery() {
     clearDebugScreenshots()
       .then(() => setScreenshots([]))
       .catch(() => {});
+  };
+
+  // Group screenshots into hierarchy: chain -> movie -> items
+  const grouped = {};
+  for (const s of screenshots) {
+    const parsed = parseScreenshotFilename(s.filename);
+    const chainKey = parsed.chain || 'unknown';
+    const movieKey = parsed.movie || parsed.branch || 'כללי';
+
+    if (!grouped[chainKey]) grouped[chainKey] = {};
+    if (!grouped[chainKey][movieKey]) grouped[chainKey][movieKey] = [];
+    grouped[chainKey][movieKey].push({ ...s, parsed });
+  }
+
+  const toggleChain = (chain) => {
+    setExpandedChains(prev => ({ ...prev, [chain]: !prev[chain] }));
+  };
+
+  const toggleMovie = (key) => {
+    setExpandedMovies(prev => ({ ...prev, [key]: !prev[key] }));
   };
 
   return (
@@ -288,7 +412,7 @@ function DebugScreenshotsGallery() {
 
       {expanded && (
         <div style={{ padding: '0 20px 16px' }}>
-          {/* Quick access buttons */}
+          {/* Action buttons */}
           <div style={{ display: 'flex', gap: 8, marginBottom: 16, flexWrap: 'wrap' }}>
             <button
               onClick={() => window.open(getDebugScreenshotUrl(), '_blank')}
@@ -317,40 +441,150 @@ function DebugScreenshotsGallery() {
             )}
           </div>
 
-          {/* Screenshots list */}
+          {/* Hierarchical tree */}
           {screenshots.length === 0 ? (
             <div style={{ color: '#64748b', fontSize: 14, textAlign: 'center', padding: 16 }}>
               {loading ? 'טוען...' : 'אין סקרינשוטים. הרץ סריקה עם ticket updates.'}
             </div>
           ) : (
-            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(280px, 1fr))', gap: 10 }}>
-              {screenshots.map((s) => (
-                <div
-                  key={s.filename}
-                  onClick={() => window.open(getDebugScreenshotFileUrl(s.filename), '_blank')}
-                  style={{
-                    background: '#0f172a',
-                    borderRadius: 8,
-                    padding: '10px 14px',
-                    cursor: 'pointer',
-                    border: '1px solid #1e293b',
-                    transition: 'border-color 0.2s',
-                  }}
-                  onMouseEnter={(e) => e.currentTarget.style.borderColor = '#3b82f6'}
-                  onMouseLeave={(e) => e.currentTarget.style.borderColor = '#1e293b'}
-                >
-                  <div style={{ fontSize: 13, fontWeight: 600, color: '#e2e8f0', marginBottom: 4 }}>
-                    {getStepLabel(s.filename)}
+            Object.entries(grouped).map(([chainKey, movies]) => {
+              const chainLabel = CHAIN_LABELS[chainKey] || chainKey;
+              const chainColor = CHAIN_COLORS[chainKey] || '#64748b';
+              const chainOpen = expandedChains[chainKey] !== false; // open by default
+              const chainCount = Object.values(movies).reduce((sum, arr) => sum + arr.length, 0);
+
+              return (
+                <div key={chainKey} style={{ marginBottom: 8 }}>
+                  {/* Chain header */}
+                  <div
+                    onClick={() => toggleChain(chainKey)}
+                    style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: 10,
+                      padding: '10px 12px',
+                      background: `${chainColor}15`,
+                      borderRadius: 8,
+                      cursor: 'pointer',
+                      userSelect: 'none',
+                      border: `1px solid ${chainColor}33`,
+                    }}
+                  >
+                    <span style={{ color: '#64748b', fontSize: 14 }}>
+                      {chainOpen ? '\u25BC' : '\u25B6'}
+                    </span>
+                    <span style={{
+                      fontSize: 15,
+                      fontWeight: 700,
+                      color: chainColor,
+                    }}>
+                      {chainLabel}
+                    </span>
+                    <span style={{
+                      background: `${chainColor}22`,
+                      color: chainColor,
+                      padding: '1px 8px',
+                      borderRadius: 10,
+                      fontSize: 11,
+                      fontWeight: 600,
+                    }}>
+                      {chainCount}
+                    </span>
                   </div>
-                  <div style={{ fontSize: 11, color: '#64748b', wordBreak: 'break-all' }}>
-                    {s.filename}
-                  </div>
-                  <div style={{ fontSize: 11, color: '#475569', marginTop: 4 }}>
-                    {s.size_kb} KB · {new Date(s.created_at * 1000).toLocaleTimeString('he-IL')}
-                  </div>
+
+                  {chainOpen && (
+                    <div style={{ paddingRight: 16, marginTop: 4 }}>
+                      {Object.entries(movies).map(([movieKey, items]) => {
+                        const fullKey = `${chainKey}__${movieKey}`;
+                        const movieOpen = expandedMovies[fullKey] !== false;
+
+                        return (
+                          <div key={fullKey} style={{ marginBottom: 4 }}>
+                            {/* Movie header */}
+                            <div
+                              onClick={() => toggleMovie(fullKey)}
+                              style={{
+                                display: 'flex',
+                                alignItems: 'center',
+                                gap: 8,
+                                padding: '6px 10px',
+                                cursor: 'pointer',
+                                userSelect: 'none',
+                                borderRadius: 6,
+                              }}
+                            >
+                              <span style={{ color: '#475569', fontSize: 12 }}>
+                                {movieOpen ? '\u25BC' : '\u25B6'}
+                              </span>
+                              <span style={{ fontSize: 14, fontWeight: 600, color: '#e2e8f0' }}>
+                                {movieKey}
+                              </span>
+                              <span style={{
+                                color: '#64748b',
+                                fontSize: 12,
+                              }}>
+                                ({items.length})
+                              </span>
+                            </div>
+
+                            {movieOpen && (
+                              <div style={{
+                                display: 'grid',
+                                gridTemplateColumns: 'repeat(auto-fill, minmax(260px, 1fr))',
+                                gap: 8,
+                                paddingRight: 20,
+                                marginTop: 4,
+                                marginBottom: 8,
+                              }}>
+                                {items.map((s) => (
+                                  <div
+                                    key={s.filename}
+                                    onClick={() => window.open(getDebugScreenshotFileUrl(s.filename), '_blank')}
+                                    style={{
+                                      background: '#0f172a',
+                                      borderRadius: 8,
+                                      padding: '10px 14px',
+                                      cursor: 'pointer',
+                                      border: '1px solid #1e293b',
+                                      transition: 'border-color 0.2s',
+                                    }}
+                                    onMouseEnter={(e) => e.currentTarget.style.borderColor = chainColor}
+                                    onMouseLeave={(e) => e.currentTarget.style.borderColor = '#1e293b'}
+                                  >
+                                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}>
+                                      <span style={{ fontSize: 13, fontWeight: 600, color: '#e2e8f0' }}>
+                                        {getStepLabel(s.parsed.step)}
+                                      </span>
+                                      {s.parsed.time && (
+                                        <span style={{
+                                          fontSize: 12,
+                                          color: '#94a3b8',
+                                          fontFamily: 'monospace',
+                                        }}>
+                                          {s.parsed.time}
+                                        </span>
+                                      )}
+                                    </div>
+                                    {s.parsed.branch && (
+                                      <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 2 }}>
+                                        {s.parsed.branch}
+                                      </div>
+                                    )}
+                                    <div style={{ fontSize: 11, color: '#475569', marginTop: 4 }}>
+                                      {s.size_kb} KB · {new Date(s.created_at * 1000).toLocaleTimeString('he-IL')}
+                                    </div>
+                                  </div>
+                                ))}
+                              </div>
+                            )}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
                 </div>
-              ))}
-            </div>
+              );
+            })
           )}
         </div>
       )}
@@ -359,7 +593,7 @@ function DebugScreenshotsGallery() {
 }
 
 
-function ProgressCard({ progress }) {
+function ProgressCard({ progress, chainName }) {
   const { phase, current, total, detail } = progress;
   const pct = total > 0 ? Math.round((current / total) * 100) : null;
 
@@ -383,6 +617,17 @@ function ProgressCard({ progress }) {
             animation: 'pulse-dot 1.5s ease-in-out infinite',
           }} />
           <span style={{ fontSize: 16, fontWeight: 700, color: '#e2e8f0' }}>{phase}</span>
+          {chainName && (
+            <span style={{
+              fontSize: 12,
+              color: '#94a3b8',
+              background: '#334155',
+              padding: '2px 8px',
+              borderRadius: 6,
+            }}>
+              {chainName}
+            </span>
+          )}
         </div>
         {pct !== null && (
           <span style={{ fontSize: 22, fontWeight: 800, color: '#60a5fa' }}>
@@ -434,6 +679,17 @@ function ProgressCard({ progress }) {
   );
 }
 
+
+const triggerBtnStyle = {
+  padding: '12px 24px',
+  borderRadius: 8,
+  border: 'none',
+  fontSize: 15,
+  fontWeight: 600,
+  fontFamily: 'Heebo, sans-serif',
+  color: '#fff',
+  transition: 'all 0.2s',
+};
 
 const screenshotBtnStyle = {
   padding: '10px 20px',

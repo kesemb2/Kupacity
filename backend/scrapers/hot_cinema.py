@@ -67,20 +67,26 @@ _TICKET_DEBUG_SCREENSHOT = os.path.join(os.path.dirname(os.path.abspath(__file__
 _DEBUG_SCREENSHOTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "debug_screenshots")
 
 
-def _debug_screenshot_path(step: str, movie_title: str = "", screening_time: str = "") -> str:
-    """Generate a unique debug screenshot path."""
+def _debug_screenshot_path(step: str, movie_title: str = "", screening_time: str = "",
+                           branch: str = "") -> str:
+    """Generate a unique debug screenshot path.
+
+    Format: hot_{branch}_{movie}_{time}_{step}_{timestamp}.png
+    """
     os.makedirs(_DEBUG_SCREENSHOTS_DIR, exist_ok=True)
     ts = datetime.now().strftime("%H%M%S")
-    # Sanitize movie title for filename
-    safe_title = re.sub(r'[^\w\u0590-\u05FF -]', '', movie_title)[:30].strip().replace(' ', '_')
+    safe = lambda s: re.sub(r'[^\w\u0590-\u05FF -]', '', s)[:20].strip().replace(' ', '_')
     safe_time = screening_time.replace(':', '').replace(' ', '_')[:10]
-    parts = [step]
-    if safe_title:
-        parts.append(safe_title)
+    parts = ["hot"]
+    if branch:
+        parts.append(safe(branch))
+    if movie_title:
+        parts.append(safe(movie_title))
     if safe_time:
         parts.append(safe_time)
+    parts.append(step)
     parts.append(ts)
-    filename = "_".join(parts) + ".png"
+    filename = "_".join(p for p in parts if p) + ".png"
     return os.path.join(_DEBUG_SCREENSHOTS_DIR, filename)
 
 _BRANCH_KEYWORDS = [

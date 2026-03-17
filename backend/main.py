@@ -81,6 +81,7 @@ async def lifespan(app: FastAPI):
             movieland_update_tickets,
             close_expired_screenings,
             run_initial_scrape,
+            run_movieland_initial_scrape,
         )
 
         scheduler = AsyncIOScheduler()
@@ -173,16 +174,25 @@ async def lifespan(app: FastAPI):
         logger.info("Scheduler started: hot_weekly(Sun 03:00), hot_daily(06:00), hot_tickets(5h), "
                      "mvl_weekly(Sun 04:00), mvl_daily(07:00), mvl_tickets(5h+2.5h), close_expired(1m)")
 
-        # Run initial scrape if DB is empty
+        # Run initial scrape if DB is empty — both chains concurrently
         async def initial_scrape():
             from models.models import Movie
-            db = SessionLocal()
+            db_check = SessionLocal()
             try:
-                if db.query(Movie).count() == 0:
-                    logger.info("Database empty - running initial Hot Cinema scrape...")
-                    await run_initial_scrape(db)
+                if db_check.query(Movie).count() == 0:
+                    logger.info("Database empty - running initial scrape for both chains concurrently...")
+                    db_hot = SessionLocal()
+                    db_mvl = SessionLocal()
+                    try:
+                        await asyncio.gather(
+                            run_initial_scrape(db_hot),
+                            run_movieland_initial_scrape(db_mvl),
+                        )
+                    finally:
+                        db_hot.close()
+                        db_mvl.close()
             finally:
-                db.close()
+                db_check.close()
 
         import asyncio
         asyncio.create_task(initial_scrape())

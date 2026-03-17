@@ -2,12 +2,18 @@
 Scraper for Movieland cinema chain using Playwright.
 
 Movieland uses the BiggerPicture (ecom.biggerpicture.ai) platform for ticket
-booking.  Clicking a showtime on movieland.co.il opens the seat-map page
+booking.  Clicking a showtime on a branch page opens the seat-map page
 directly — no intermediate quantity / continue steps.
+
+Navigation flow:
+1. Open movieland.co.il
+2. Hover over "סניפים" in header → dropdown with branch links
+3. Visit each branch page → shows movies with showtimes for that branch
+4. Each showtime link → ecom.biggerpicture.ai seat map directly
 
 URL patterns:
 - Main site:     https://movieland.co.il/
-- Movie page:    https://movieland.co.il/{slug}/  (Hebrew slug)
+- Branch page:   https://movieland.co.il/{branch-slug}/  (e.g. /tel-aviv/)
 - Seat map:      https://ecom.biggerpicture.ai/...  (random ID per screening)
 
 Seat image patterns (all under /mvl-seat/):
@@ -112,15 +118,22 @@ def _resolve_cinema(text: str) -> tuple[str, str]:
     return f"Movieland {clean}", clean
 
 
-def _debug_screenshot_path(step: str, detail: str = "") -> str:
+def _debug_screenshot_path(step: str, detail: str = "",
+                           branch: str = "", movie: str = "",
+                           time_str: str = "") -> str:
     os.makedirs(_DEBUG_SCREENSHOTS_DIR, exist_ok=True)
     ts = datetime.now().strftime("%H%M%S")
-    safe = re.sub(r'[^\w\u0590-\u05FF -]', '', detail)[:30].strip().replace(' ', '_')
-    parts = ["mvl", step]
-    if safe:
-        parts.append(safe)
+    safe = lambda s: re.sub(r'[^\w\u0590-\u05FF -]', '', s)[:20].strip().replace(' ', '_')
+    parts = ["mvl"]
+    if branch:
+        parts.append(safe(branch))
+    if movie:
+        parts.append(safe(movie))
+    if time_str:
+        parts.append(time_str.replace(':', ''))
+    parts.append(step)
     parts.append(ts)
-    return os.path.join(_DEBUG_SCREENSHOTS_DIR, "_".join(parts) + ".png")
+    return os.path.join(_DEBUG_SCREENSHOTS_DIR, "_".join(p for p in parts if p) + ".png")
 
 
 # ── Scraper class ────────────────────────────────────────────────────────────
@@ -196,29 +209,590 @@ class MovielandScraper(BaseScraper):
         await asyncio.sleep(random.uniform(lo, hi))
 
     async def _open_url(self, page: Page, url: str, *,
-                        take_debug_screenshot: bool = False,
-                        wait_for_network: bool = False):
+                        wait_for_network: bool = False,
+                        timeout: int = 45000):
         await self._human_delay()
         try:
             wait_until = "networkidle" if wait_for_network else "domcontentloaded"
-            await page.goto(url, wait_until=wait_until, timeout=45000)
+            await page.goto(url, wait_until=wait_until, timeout=timeout)
         except Exception as e:
             logger.warning(f"[Movieland] Page load timeout for {url}: {e}")
 
         await asyncio.sleep(2)
 
-        if take_debug_screenshot:
+    # ── Branch discovery ─────────────────────────────────────────────────
+
+    async def _discover_branch_urls(self, page: Page) -> dict[str, str]:
+        """Discover branch page URLs from the site header dropdown.
+
+        Returns {branch_key: full_url} for each known branch.
+        """
+        branch_urls: dict[str, str] = {}
+
+        # Navigate to homepage first
+        await self._open_url(page, BASE_URL, wait_for_network=True)
+
+        try:
+            await page.screenshot(
+                path=_debug_screenshot_path("page", branch="home")
+            )
+        except Exception:
+            pass
+
+        # Strategy 1: Hover over "סניפים" to reveal dropdown
+        try:
+            # Look for navigation items containing "סניפים" (branches)
+            nav_items = await page.query_selector_all(
+                'nav a, header a, [class*="menu"] a, [class*="nav"] a, '
+                'li a, .menu-item a'
+            )
+            snifim_el = None
+            for item in nav_items:
+                text = (await item.inner_text()).strip()
+                if "סניפים" in text or "סניף" in text:
+                    snifim_el = item
+                    break
+
+            if snifim_el:
+                await snifim_el.hover()
+                await asyncio.sleep(1.5)
+                logger.info("[Movieland] Hovered on 'סניפים' menu item")
+
+                try:
+                    await page.screenshot(
+                        path=_debug_screenshot_path("dropdown", branch="snifim")
+                    )
+                except Exception:
+                    pass
+
+                # Now look for branch links in the dropdown
+                all_links = await page.query_selector_all('a[href]')
+                for link in all_links:
+                    try:
+                        href = await link.get_attribute("href") or ""
+                        text = (await link.inner_text()).strip()
+
+                        for bid, binfo in MOVIELAND_BRANCHES.items():
+                            slug = binfo["slug"]
+                            # Check if link goes to this branch's page
+                            if (slug in href.lower() or
+                                    binfo["city_he"] in text or
+                                    binfo["name_he"] in text):
+                                if href.startswith("/"):
+                                    href = f"{BASE_URL}{href}"
+                                if href.startswith("http"):
+                                    branch_urls[bid] = href
+                                    logger.info(f"[Movieland] Found branch URL: {binfo['name']} -> {href}")
+                    except Exception:
+                        continue
+        except Exception as e:
+            logger.warning(f"[Movieland] Dropdown discovery failed: {e}")
+
+        # Strategy 2: Try known URL patterns for missing branches
+        for bid, binfo in MOVIELAND_BRANCHES.items():
+            if bid in branch_urls:
+                continue
+            # Try common patterns
+            for pattern in [
+                f"{BASE_URL}/{binfo['slug']}/",
+                f"{BASE_URL}/branch/{binfo['slug']}/",
+                f"{BASE_URL}/snif/{binfo['slug']}/",
+                f"{BASE_URL}/{binfo['slug']}",
+            ]:
+                try:
+                    resp = await page.goto(pattern, wait_until="domcontentloaded", timeout=10000)
+                    if resp and resp.ok:
+                        # Check it's actually a branch page (has movie/showtime content)
+                        content = await page.content()
+                        if any(kw in content for kw in [
+                            "showtime", "הקרנ", "שעת", BOOKING_DOMAIN,
+                            "movie", "סרט", binfo["city_he"],
+                        ]):
+                            branch_urls[bid] = pattern.rstrip("/")
+                            logger.info(f"[Movieland] Found branch URL by pattern: {binfo['name']} -> {pattern}")
+                            break
+                except Exception:
+                    continue
+
+        # Strategy 3: Search page content for branch page links
+        if len(branch_urls) < len(MOVIELAND_BRANCHES):
+            await self._open_url(page, BASE_URL, wait_for_network=True)
+            all_links = await page.query_selector_all('a[href]')
+            for link in all_links:
+                try:
+                    href = await link.get_attribute("href") or ""
+                    text = (await link.inner_text()).strip()
+                    for bid, binfo in MOVIELAND_BRANCHES.items():
+                        if bid in branch_urls:
+                            continue
+                        if binfo["city_he"] in text or binfo["slug"] in href.lower():
+                            if href.startswith("/"):
+                                href = f"{BASE_URL}{href}"
+                            if href.startswith("http"):
+                                branch_urls[bid] = href
+                except Exception:
+                    continue
+
+        logger.info(f"[Movieland] Discovered {len(branch_urls)}/{len(MOVIELAND_BRANCHES)} branch URLs")
+        return branch_urls
+
+    # ── Parse movies & showtimes from a branch page ──────────────────────
+
+    async def _scrape_branch_page(self, page: Page, branch_url: str,
+                                   binfo: dict,
+                                   collect_booking_urls: bool = False,
+                                   ) -> tuple[list[ScrapedMovie], list[ScrapedScreening], list[dict]]:
+        """Scrape movies and showtimes from a single branch page.
+
+        Returns (movies, screenings, booking_items).
+        booking_items is populated only when collect_booking_urls=True.
+        """
+        movies: list[ScrapedMovie] = []
+        screenings: list[ScrapedScreening] = []
+        booking_items: list[dict] = []
+        seen_titles: set[str] = set()
+
+        await self._open_url(page, branch_url, wait_for_network=True)
+        await asyncio.sleep(2)
+
+        try:
+            await page.screenshot(
+                path=_debug_screenshot_path("branch", branch=binfo["city_he"])
+            )
+        except Exception:
+            pass
+
+        # Scroll to load lazy content
+        for _ in range(3):
+            await page.evaluate("window.scrollBy(0, 600)")
+            await asyncio.sleep(0.8)
+        # Scroll back to top
+        await page.evaluate("window.scrollTo(0, 0)")
+        await asyncio.sleep(0.5)
+
+        # ── Collect movies ────────────────────────────────────────────
+        # Look for movie sections on the branch page
+        movie_sections = await page.query_selector_all(
+            '[class*="movie"], [class*="Movie"], [class*="film"], [class*="Film"], '
+            '[class*="event"], [class*="Event"], '
+            'article, .movie-item, .film-item, .event-item'
+        )
+
+        if not movie_sections:
+            # Fallback: look for headings that might be movie titles
+            movie_sections = await page.query_selector_all(
+                'h2, h3, h4'
+            )
+
+        # Also get all links to find booking URLs
+        all_page_links = await page.query_selector_all('a[href]')
+        page_html = await page.content()
+
+        # Try to find movie cards with showtimes
+        # Each movie section may contain: title, poster, showtime buttons/links
+        for section in movie_sections:
             try:
-                await page.screenshot(path=_debug_screenshot_path("page", url[:40]))
-                logger.info("[Movieland] Debug screenshot saved")
-            except Exception:
-                pass
+                section_text = (await section.inner_text()).strip()
+                if not section_text or len(section_text) < 3:
+                    continue
+
+                # Find title - first heading or prominent text
+                title = ""
+                title_el = await section.query_selector(
+                    'h2, h3, h4, [class*="title"], [class*="Title"], '
+                    '[class*="name"], [class*="Name"]'
+                )
+                if title_el:
+                    title = (await title_el.inner_text()).strip()
+
+                if not title:
+                    # Use section's own tag if it's a heading
+                    tag = await section.evaluate("el => el.tagName")
+                    if tag in ("H2", "H3", "H4"):
+                        title = section_text.split('\n')[0].strip()
+
+                if not title or len(title) < 2 or title in seen_titles:
+                    continue
+
+                # Skip navigation/branch labels
+                if any(binfo2["city_he"] in title for binfo2 in MOVIELAND_BRANCHES.values()):
+                    continue
+                skip_words = ["סניפים", "תקנון", "צור קשר", "אודות", "FAQ", "שאלות"]
+                if any(w in title for w in skip_words):
+                    continue
+
+                seen_titles.add(title)
+
+                # Get poster
+                poster_url = ""
+                img = await section.query_selector("img")
+                if img:
+                    poster_url = (await img.get_attribute("src")
+                                  or await img.get_attribute("data-src")
+                                  or "")
+                    if poster_url and not poster_url.startswith("http"):
+                        poster_url = f"{BASE_URL}{poster_url}"
+
+                movies.append(ScrapedMovie(
+                    title=title, title_he=title,
+                    poster_url=poster_url,
+                    detail_url=branch_url,
+                ))
+
+                # ── Collect showtimes for this movie ─────────────────
+                # Look for time patterns and booking links within/near the section
+                section_links = await section.query_selector_all('a[href]')
+                showtime_buttons = await section.query_selector_all(
+                    'button, [class*="time"], [class*="hour"], [class*="show"]'
+                )
+
+                found_times: set[str] = set()
+
+                for link in section_links:
+                    try:
+                        href = await link.get_attribute("href") or ""
+                        link_text = (await link.inner_text()).strip()
+
+                        # Extract time
+                        time_match = re.search(r'(\d{1,2}:\d{2})', link_text)
+                        if not time_match:
+                            continue
+
+                        time_str = time_match.group(1)
+                        if time_str in found_times:
+                            continue
+                        found_times.add(time_str)
+
+                        # Parse datetime
+                        try:
+                            today = datetime.now().date()
+                            h, m = map(int, time_str.split(":"))
+                            showtime = datetime.combine(
+                                today, datetime.min.time().replace(hour=h, minute=m)
+                            )
+                        except Exception:
+                            continue
+
+                        # Extract hall
+                        hall = ""
+                        parent_text = section_text
+                        hall_match = re.search(r'אולם\s*(\d+|[A-Za-z]+)', parent_text)
+                        if hall_match:
+                            hall = hall_match.group(1)
+
+                        # Extract format
+                        fmt = "2D"
+                        upper_text = parent_text.upper()
+                        if "IMAX" in upper_text:
+                            fmt = "IMAX"
+                        elif "4DX" in upper_text:
+                            fmt = "4DX"
+                        elif "3D" in upper_text:
+                            fmt = "3D"
+                        elif "VIP" in upper_text:
+                            fmt = "VIP"
+
+                        screenings.append(ScrapedScreening(
+                            movie_title=title,
+                            cinema_name=binfo["name"],
+                            city=binfo["city"],
+                            showtime=showtime,
+                            hall=hall,
+                            format=fmt,
+                        ))
+
+                        # Collect booking URL for ticket updates
+                        if collect_booking_urls and BOOKING_DOMAIN in href:
+                            booking_items.append({
+                                "movie_title": title,
+                                "booking_url": href,
+                                "cinema_name": binfo["name"],
+                                "city": binfo["city"],
+                                "showtime": showtime,
+                                "hall": hall,
+                                "format": fmt,
+                                "branch_he": binfo["city_he"],
+                                "time_str": time_str,
+                            })
+
+                    except Exception:
+                        continue
+
+                # Also check showtime buttons without links
+                for btn in showtime_buttons:
+                    try:
+                        btn_text = (await btn.inner_text()).strip()
+                        time_match = re.search(r'(\d{1,2}:\d{2})', btn_text)
+                        if not time_match:
+                            continue
+                        time_str = time_match.group(1)
+                        if time_str in found_times:
+                            continue
+                        found_times.add(time_str)
+
+                        try:
+                            today = datetime.now().date()
+                            h, m = map(int, time_str.split(":"))
+                            showtime = datetime.combine(
+                                today, datetime.min.time().replace(hour=h, minute=m)
+                            )
+                        except Exception:
+                            continue
+
+                        screenings.append(ScrapedScreening(
+                            movie_title=title,
+                            cinema_name=binfo["name"],
+                            city=binfo["city"],
+                            showtime=showtime,
+                        ))
+                    except Exception:
+                        continue
+
+            except Exception as e:
+                logger.debug(f"[Movieland] Section parse error: {e}")
+                continue
+
+        # ── Fallback: scan ALL links on the page for booking URLs ────
+        if collect_booking_urls and not booking_items:
+            for link in all_page_links:
+                try:
+                    href = await link.get_attribute("href") or ""
+                    if BOOKING_DOMAIN not in href:
+                        continue
+
+                    link_text = (await link.inner_text()).strip()
+                    time_match = re.search(r'(\d{1,2}:\d{2})', link_text)
+                    time_str = time_match.group(1) if time_match else ""
+
+                    # Try to find nearby movie title
+                    movie_title = ""
+                    try:
+                        # Walk up to find movie context
+                        parent_text = await link.evaluate("""el => {
+                            let p = el.parentElement;
+                            for (let i = 0; i < 5 && p; i++) {
+                                const h = p.querySelector('h2, h3, h4, [class*="title"]');
+                                if (h) return h.textContent.trim();
+                                p = p.parentElement;
+                            }
+                            return '';
+                        }""")
+                        movie_title = parent_text
+                    except Exception:
+                        pass
+
+                    showtime = None
+                    if time_str:
+                        try:
+                            today = datetime.now().date()
+                            h, m = map(int, time_str.split(":"))
+                            showtime = datetime.combine(
+                                today, datetime.min.time().replace(hour=h, minute=m)
+                            )
+                        except Exception:
+                            pass
+
+                    booking_items.append({
+                        "movie_title": movie_title or "Unknown",
+                        "booking_url": href,
+                        "cinema_name": binfo["name"],
+                        "city": binfo["city"],
+                        "showtime": showtime,
+                        "hall": "",
+                        "format": "2D",
+                        "branch_he": binfo["city_he"],
+                        "time_str": time_str,
+                    })
+
+                except Exception:
+                    continue
+
+        # ── Also try to find booking links in page (may be outside sections)
+        if not screenings:
+            for link in all_page_links:
+                try:
+                    href = await link.get_attribute("href") or ""
+                    if BOOKING_DOMAIN not in href:
+                        continue
+                    link_text = (await link.inner_text()).strip()
+                    time_match = re.search(r'(\d{1,2}:\d{2})', link_text)
+                    if not time_match:
+                        continue
+                    time_str = time_match.group(1)
+
+                    try:
+                        today = datetime.now().date()
+                        h, m = map(int, time_str.split(":"))
+                        showtime = datetime.combine(
+                            today, datetime.min.time().replace(hour=h, minute=m)
+                        )
+                    except Exception:
+                        continue
+
+                    # Try to get movie title from context
+                    movie_title = await link.evaluate("""el => {
+                        let p = el.parentElement;
+                        for (let i = 0; i < 5 && p; i++) {
+                            const h = p.querySelector('h2, h3, h4, [class*="title"]');
+                            if (h) return h.textContent.trim();
+                            p = p.parentElement;
+                        }
+                        return '';
+                    }""")
+
+                    if movie_title and movie_title not in seen_titles:
+                        seen_titles.add(movie_title)
+                        movies.append(ScrapedMovie(
+                            title=movie_title, title_he=movie_title,
+                            detail_url=branch_url,
+                        ))
+
+                    screenings.append(ScrapedScreening(
+                        movie_title=movie_title or "Unknown",
+                        cinema_name=binfo["name"],
+                        city=binfo["city"],
+                        showtime=showtime,
+                    ))
+
+                    if collect_booking_urls:
+                        booking_items.append({
+                            "movie_title": movie_title or "Unknown",
+                            "booking_url": href,
+                            "cinema_name": binfo["name"],
+                            "city": binfo["city"],
+                            "showtime": showtime,
+                            "hall": "",
+                            "format": "2D",
+                            "branch_he": binfo["city_he"],
+                            "time_str": time_str,
+                        })
+
+                except Exception:
+                    continue
+
+        logger.info(
+            f"[Movieland] Branch '{binfo['name']}': "
+            f"{len(movies)} movies, {len(screenings)} screenings"
+            + (f", {len(booking_items)} booking URLs" if collect_booking_urls else "")
+        )
+
+        return movies, screenings, booking_items
+
+    # ── Navigate calendar days on a branch page ──────────────────────────
+
+    async def _navigate_branch_calendar(self, page: Page, branch_url: str,
+                                         binfo: dict, days: int = 7,
+                                         collect_booking_urls: bool = False,
+                                         ) -> tuple[list[ScrapedMovie], list[ScrapedScreening], list[dict]]:
+        """Scrape a branch page across multiple days using calendar navigation."""
+        all_movies: list[ScrapedMovie] = []
+        all_screenings: list[ScrapedScreening] = []
+        all_booking_items: list[dict] = []
+        seen_titles: set[str] = set()
+
+        # First, scrape the current day (default view)
+        movies, screenings, bookings = await self._scrape_branch_page(
+            page, branch_url, binfo, collect_booking_urls
+        )
+        all_movies.extend(movies)
+        all_screenings.extend(screenings)
+        all_booking_items.extend(bookings)
+        for m in movies:
+            seen_titles.add(m.title)
+
+        # Try to navigate to subsequent days via calendar/date selectors
+        for day_offset in range(1, days):
+            target_date = datetime.now().date() + timedelta(days=day_offset)
+
+            try:
+                # Look for date/calendar navigation elements
+                date_buttons = await page.query_selector_all(
+                    '[class*="date"], [class*="day"], [class*="calendar"], '
+                    '[class*="Date"], [class*="Day"], [class*="Calendar"], '
+                    'button[data-date], a[data-date]'
+                )
+
+                clicked = False
+                target_str = target_date.strftime("%d/%m")
+                target_str2 = target_date.strftime("%d.%m")
+                target_day = str(target_date.day)
+
+                for btn in date_buttons:
+                    try:
+                        btn_text = (await btn.inner_text()).strip()
+                        data_date = await btn.get_attribute("data-date") or ""
+
+                        if (target_str in btn_text or target_str2 in btn_text or
+                                target_date.isoformat() in data_date or
+                                (btn_text.isdigit() and btn_text == target_day)):
+                            await btn.click()
+                            await asyncio.sleep(2)
+                            clicked = True
+                            logger.info(f"[Movieland] Clicked calendar day {target_date}")
+                            break
+                    except Exception:
+                        continue
+
+                if not clicked:
+                    # Try clicking "next day" arrow/button
+                    next_btns = await page.query_selector_all(
+                        '[class*="next"], [class*="arrow"], [class*="forward"], '
+                        'button[aria-label*="next"], button[aria-label*="הבא"]'
+                    )
+                    for btn in next_btns:
+                        try:
+                            await btn.click()
+                            await asyncio.sleep(2)
+                            clicked = True
+                            break
+                        except Exception:
+                            continue
+
+                if not clicked:
+                    break  # No more calendar navigation possible
+
+                # Scrape this day's content
+                day_movies, day_screenings, day_bookings = await self._scrape_branch_page(
+                    page, page.url, binfo, collect_booking_urls
+                )
+
+                # Adjust showtimes to the target date
+                for scr in day_screenings:
+                    if scr.showtime:
+                        scr.showtime = scr.showtime.replace(
+                            year=target_date.year,
+                            month=target_date.month,
+                            day=target_date.day,
+                        )
+                for bi in day_bookings:
+                    if bi.get("showtime"):
+                        bi["showtime"] = bi["showtime"].replace(
+                            year=target_date.year,
+                            month=target_date.month,
+                            day=target_date.day,
+                        )
+
+                # Add new movies (skip duplicates)
+                for m in day_movies:
+                    if m.title not in seen_titles:
+                        seen_titles.add(m.title)
+                        all_movies.append(m)
+
+                all_screenings.extend(day_screenings)
+                all_booking_items.extend(day_bookings)
+
+            except Exception as e:
+                logger.debug(f"[Movieland] Calendar navigation failed for day {day_offset}: {e}")
+                break
+
+        return all_movies, all_screenings, all_booking_items
 
     # ── Seat counting (BiggerPicture seat map) ───────────────────────────
 
     async def _count_seats_on_page(self, page: Page,
                                     movie_title: str = "",
-                                    screening_time: str = "") -> tuple[int, int, list]:
+                                    screening_time: str = "",
+                                    branch_he: str = "") -> tuple[int, int, list]:
         """Count seats on a BiggerPicture seat-map page.
 
         Primary detection: image href matching /mvl-seat/(available|unavailable)/
@@ -232,14 +806,12 @@ class MovielandScraper(BaseScraper):
 
         seat_data = await page.evaluate("""() => {
             // ===== METHOD A: IMAGE-BASED DETECTION (Movieland specific) =====
-            // Movieland uses <image> elements with href containing /mvl-seat/
             const imgTotal = { count: 0 };
             const imgSold = { count: 0 };
             const imgSoldPositions = [];
             const imgSamples = [];
             const seen = new Set();
 
-            // Check all <image> elements in SVG
             const images = document.querySelectorAll('image, [style*="mvl-seat"]');
             for (const el of images) {
                 const href = el.getAttribute('href')
@@ -254,7 +826,6 @@ class MovielandScraper(BaseScraper):
                 const bbox = el.getBoundingClientRect();
                 if (bbox.width < 5 || bbox.height < 5) continue;
 
-                // Deduplicate by position
                 const posKey = Math.round(bbox.left / 5) + ',' + Math.round(bbox.top / 5);
                 if (seen.has(posKey)) continue;
                 seen.add(posKey);
@@ -286,7 +857,7 @@ class MovielandScraper(BaseScraper):
             // Also check all elements for background-image containing mvl-seat
             const allEls = document.querySelectorAll('*');
             for (const el of allEls) {
-                if (el.tagName === 'image' || el.tagName === 'IMAGE') continue; // already checked
+                if (el.tagName === 'image' || el.tagName === 'IMAGE') continue;
                 const style = window.getComputedStyle(el);
                 const bgImg = style.backgroundImage || '';
                 if (!bgImg.includes('mvl-seat')) continue;
@@ -365,7 +936,15 @@ class MovielandScraper(BaseScraper):
                 }
             }
 
-            // Debug: get page HTML snippet
+            // Try to extract hall info from the page
+            const hallInfo = { hall: '' };
+            const pageText = document.body ? document.body.textContent : '';
+            const hallMatch = pageText.match(/אולם\s*(\d+|[A-Za-z]+)/);
+            if (hallMatch) hallInfo.hall = hallMatch[1];
+            // Also check for "Hall X" pattern
+            const hallMatch2 = pageText.match(/Hall\s*(\d+|[A-Za-z]+)/i);
+            if (!hallInfo.hall && hallMatch2) hallInfo.hall = hallMatch2[1];
+
             const bodyHTML = document.body ? document.body.innerHTML.substring(0, 3000) : '';
 
             return {
@@ -381,27 +960,32 @@ class MovielandScraper(BaseScraper):
                     soldPositions: classSoldPositions,
                     samples: classSamples,
                 },
+                hallInfo,
                 bodyHTML,
             };
         }""")
 
         # Take debug screenshot
         try:
-            await page.screenshot(path=_debug_screenshot_path("seats", movie_title))
+            await page.screenshot(path=_debug_screenshot_path(
+                "seats", movie=movie_title, branch=branch_he,
+                time_str=screening_time,
+            ))
         except Exception:
             pass
+
+        hall_from_page = ""
 
         if seat_data:
             img = seat_data.get("imageMethod", {})
             cls = seat_data.get("classMethod", {})
+            hall_from_page = seat_data.get("hallInfo", {}).get("hall", "")
 
-            logger.warning(
+            logger.info(
                 f"[Movieland] Seats IMAGE method: {img.get('total', 0)} total, "
-                f"{img.get('sold', 0)} sold | samples: {img.get('samples', [])[:3]}"
-            )
-            logger.warning(
-                f"[Movieland] Seats CLASS method: {cls.get('total', 0)} total, "
-                f"{cls.get('sold', 0)} sold | samples: {cls.get('samples', [])[:3]}"
+                f"{img.get('sold', 0)} sold | CLASS: {cls.get('total', 0)} total, "
+                f"{cls.get('sold', 0)} sold"
+                + (f" | Hall: {hall_from_page}" if hall_from_page else "")
             )
 
             img_total = img.get("total", 0)
@@ -425,157 +1009,54 @@ class MovielandScraper(BaseScraper):
                 )
                 html = seat_data.get("bodyHTML", "")
                 if html:
-                    logger.warning(f"[Movieland] Page HTML (first 1000): {html[:1000]}")
+                    logger.warning(f"[Movieland] Page HTML (first 500): {html[:500]}")
 
         return total, sold, sold_positions
 
     # ── Movie discovery ──────────────────────────────────────────────────
 
     async def scrape_movies(self, on_progress=None) -> list[ScrapedMovie]:
-        """Scrape movie catalog from movieland.co.il."""
+        """Scrape movie catalog by visiting each branch page."""
         pw, browser, context = await self._launch_browser()
-        movies: list[ScrapedMovie] = []
+        all_movies: list[ScrapedMovie] = []
         seen_titles: set[str] = set()
 
         try:
             page = await context.new_page()
 
             if on_progress:
-                on_progress("סריקת סרטים - מובילנד", 0, 1, "טוען אתר")
+                on_progress("סריקת סרטים - מובילנד", 0, len(MOVIELAND_BRANCHES), "מחפש סניפים")
 
-            await self._open_url(page, BASE_URL, take_debug_screenshot=True,
-                                 wait_for_network=True)
+            branch_urls = await self._discover_branch_urls(page)
 
-            # Try to find movie listings - look for common patterns
-            # Strategy 1: Look for links to movie pages
-            movie_links = await page.query_selector_all(
-                'a[href*="/movie/"], a[href*="/seret/"], a[href*="/film/"]'
-            )
+            for idx, (bid, binfo) in enumerate(MOVIELAND_BRANCHES.items()):
+                if on_progress:
+                    on_progress("סריקת סרטים - מובילנד", idx + 1,
+                                len(MOVIELAND_BRANCHES), binfo["name_he"])
 
-            # Strategy 2: Look for movie cards/items with links
-            if not movie_links:
-                movie_links = await page.query_selector_all(
-                    '[class*="movie"] a, [class*="film"] a, '
-                    '[class*="Movie"] a, [class*="Film"] a'
-                )
-
-            # Strategy 3: Broader search - any link that looks like a movie page
-            if not movie_links:
-                all_links = await page.query_selector_all('a[href]')
-                movie_links = []
-                for link in all_links:
-                    href = await link.get_attribute("href") or ""
-                    # Exclude common non-movie paths
-                    if any(skip in href.lower() for skip in [
-                        '/contact', '/about', '/faq', '/terms', '/privacy',
-                        '/branch', '/snif', '#', 'javascript:', 'mailto:',
-                        '/login', '/register', '/cart',
-                    ]):
-                        continue
-                    # Look for internal paths that could be movie pages
-                    if href.startswith("/") and len(href) > 3 and href.count("/") <= 2:
-                        movie_links.append(link)
-
-            logger.info(f"[Movieland] Found {len(movie_links)} potential movie links")
-
-            for link in movie_links:
-                try:
-                    href = await link.get_attribute("href") or ""
-                    if not href:
-                        continue
-
-                    if href.startswith("/"):
-                        full_url = f"{BASE_URL}{href}"
-                    elif href.startswith("http"):
-                        full_url = href
-                    else:
-                        continue
-
-                    # Try to get title
-                    title = ""
-                    title_el = await link.query_selector(
-                        'h2, h3, h4, [class*="title"], [class*="name"], '
-                        '[class*="Title"], [class*="Name"]'
-                    )
-                    if title_el:
-                        title = (await title_el.inner_text()).strip()
-                    if not title:
-                        title = (await link.inner_text()).strip()
-                    if not title or len(title) < 2:
-                        continue
-
-                    # Skip duplicates and non-movie items
-                    if title in seen_titles:
-                        continue
-                    # Skip branch names
-                    if any(b["city_he"] in title for b in MOVIELAND_BRANCHES.values()):
-                        continue
-                    seen_titles.add(title)
-
-                    # Try to get poster
-                    poster_url = ""
-                    img = await link.query_selector("img")
-                    if img:
-                        poster_url = await img.get_attribute("src") or ""
-                        if poster_url and not poster_url.startswith("http"):
-                            poster_url = f"{BASE_URL}{poster_url}"
-
-                    movies.append(ScrapedMovie(
-                        title=title, title_he=title,
-                        poster_url=poster_url, detail_url=full_url,
-                    ))
-                except Exception:
+                url = branch_urls.get(bid)
+                if not url:
+                    logger.warning(f"[Movieland] No URL for branch {binfo['name']}, skipping")
                     continue
 
-            logger.info(f"[Movieland] Scraped {len(movies)} movies from homepage")
-
-            # Visit "now showing" or "movies" page if exists
-            for movies_path in ["/now-showing", "/movies", "/סרטים", "/nowshowing"]:
                 try:
-                    await self._open_url(page, f"{BASE_URL}{movies_path}",
-                                         wait_for_network=True)
-                    page_movie_links = await page.query_selector_all(
-                        'a[href*="/movie/"], a[href*="/seret/"], a[href*="/film/"], '
-                        '[class*="movie"] a, [class*="film"] a'
-                    )
-                    for link in page_movie_links:
-                        try:
-                            href = await link.get_attribute("href") or ""
-                            if not href:
-                                continue
-                            full_url = f"{BASE_URL}{href}" if href.startswith("/") else href
+                    movies, _, _ = await self._scrape_branch_page(page, url, binfo)
 
-                            title = ""
-                            title_el = await link.query_selector('h2, h3, h4, [class*="title"]')
-                            if title_el:
-                                title = (await title_el.inner_text()).strip()
-                            if not title:
-                                title = (await link.inner_text()).strip()
-                            if not title or len(title) < 2 or title in seen_titles:
-                                continue
-                            seen_titles.add(title)
-
-                            poster_url = ""
-                            img = await link.query_selector("img")
-                            if img:
-                                poster_url = await img.get_attribute("src") or ""
-                                if poster_url and not poster_url.startswith("http"):
-                                    poster_url = f"{BASE_URL}{poster_url}"
-
-                            movies.append(ScrapedMovie(
-                                title=title, title_he=title,
-                                poster_url=poster_url, detail_url=full_url,
-                            ))
-                        except Exception:
-                            continue
-                    if page_movie_links:
-                        logger.info(f"[Movieland] Found additional movies from {movies_path}")
-                        break  # found a working movies page
-                except Exception:
+                    for m in movies:
+                        if m.title not in seen_titles:
+                            seen_titles.add(m.title)
+                            all_movies.append(m)
+                except Exception as e:
+                    logger.warning(f"[Movieland] Branch {binfo['name']} failed: {e}")
                     continue
+
+                await self._human_delay(0.5, 1.0)
 
             if on_progress:
-                on_progress("סריקת סרטים - מובילנד", 1, 1, f"נמצאו {len(movies)} סרטים")
+                on_progress("סריקת סרטים - מובילנד", len(MOVIELAND_BRANCHES),
+                            len(MOVIELAND_BRANCHES), f"נמצאו {len(all_movies)} סרטים")
+
+            logger.info(f"[Movieland] Total movies found: {len(all_movies)}")
 
         except Exception as e:
             logger.error(f"[Movieland] scrape_movies failed: {e}")
@@ -583,215 +1064,48 @@ class MovielandScraper(BaseScraper):
             await browser.close()
             await pw.stop()
 
-        return movies
+        return all_movies
 
     # ── Screening discovery ──────────────────────────────────────────────
 
     async def scrape_screenings(self, on_progress=None) -> list[ScrapedScreening]:
-        """Scrape screening schedule from movie pages on movieland.co.il."""
+        """Scrape screening schedule from all branch pages with calendar navigation."""
         pw, browser, context = await self._launch_browser()
         all_screenings: list[ScrapedScreening] = []
 
         try:
             page = await context.new_page()
 
-            # First get movie list
             if on_progress:
-                on_progress("סריקת הקרנות - מובילנד", 0, 1, "אוסף סרטים")
+                on_progress("סריקת הקרנות - מובילנד", 0, len(MOVIELAND_BRANCHES), "מחפש סניפים")
 
-            movies = await self.scrape_movies(on_progress=None)
-            if not movies:
-                logger.warning("[Movieland] No movies found, cannot scrape screenings")
-                return all_screenings
+            branch_urls = await self._discover_branch_urls(page)
 
-            # Also capture API responses while browsing
-            api_responses: list[dict] = []
-
-            async def capture_response(response):
-                url = response.url
-                # Look for API endpoints that return screening data
-                if any(kw in url.lower() for kw in [
-                    'screening', 'showtime', 'schedule', 'event',
-                    'biggerpicture', 'session',
-                ]):
-                    try:
-                        ct = response.headers.get("content-type", "")
-                        if "json" in ct or "javascript" in ct:
-                            body = await response.json()
-                            api_responses.append({"url": url, "data": body})
-                            logger.info(f"[Movieland] Captured API: {url[:100]}")
-                    except Exception:
-                        pass
-
-            page.on("response", capture_response)
-
-            for idx, movie in enumerate(movies):
-                if not movie.detail_url:
-                    continue
-
+            for idx, (bid, binfo) in enumerate(MOVIELAND_BRANCHES.items()):
                 if on_progress:
-                    on_progress("סריקת הקרנות - מובילנד", idx + 1, len(movies),
-                                movie.title_he or movie.title)
+                    on_progress("סריקת הקרנות - מובילנד", idx + 1,
+                                len(MOVIELAND_BRANCHES), binfo["name_he"])
+
+                url = branch_urls.get(bid)
+                if not url:
+                    logger.warning(f"[Movieland] No URL for branch {binfo['name']}, skipping")
+                    continue
 
                 try:
-                    await self._open_url(page, movie.detail_url, wait_for_network=True)
-                    await asyncio.sleep(2)
-
-                    # Scroll to load showtimes
-                    await page.evaluate("window.scrollBy(0, 600)")
-                    await asyncio.sleep(1)
-
-                    # Look for booking links (ecom.biggerpicture.ai)
-                    booking_links = await page.query_selector_all(
-                        f'a[href*="{BOOKING_DOMAIN}"], '
-                        f'a[href*="biggerpicture"], '
-                        f'[onclick*="{BOOKING_DOMAIN}"], '
-                        f'[data-url*="{BOOKING_DOMAIN}"]'
+                    _, screenings, _ = await self._navigate_branch_calendar(
+                        page, url, binfo, days=7
                     )
-
-                    # Also look for showtime elements that might have data attributes
-                    showtime_els = await page.query_selector_all(
-                        '[class*="showtime"], [class*="time"], [class*="session"], '
-                        '[class*="Showtime"], [class*="Time"], [class*="Session"], '
-                        'button[class*="hour"], a[class*="hour"]'
-                    )
-
-                    logger.info(
-                        f"[Movieland] '{movie.title}': {len(booking_links)} booking links, "
-                        f"{len(showtime_els)} showtime elements"
-                    )
-
-                    # Extract booking URLs and showtimes
-                    found_urls: set[str] = set()
-
-                    for link in booking_links:
-                        try:
-                            href = (
-                                await link.get_attribute("href")
-                                or await link.get_attribute("data-url")
-                                or ""
-                            )
-                            if not href:
-                                onclick = await link.get_attribute("onclick") or ""
-                                match = re.search(r'https?://[^"\']+biggerpicture[^"\']*', onclick)
-                                if match:
-                                    href = match.group(0)
-
-                            if not href or BOOKING_DOMAIN not in href:
-                                continue
-                            if href in found_urls:
-                                continue
-                            found_urls.add(href)
-
-                            # Try to extract context (time, branch) from nearby elements
-                            link_text = (await link.inner_text()).strip()
-                            parent = await link.evaluate_handle("el => el.parentElement")
-                            parent_text = ""
-                            try:
-                                parent_text = await parent.evaluate("el => el.textContent")
-                                parent_text = parent_text.strip()[:200]
-                            except Exception:
-                                pass
-
-                            # Try to find time pattern
-                            time_match = re.search(r'(\d{1,2}:\d{2})', link_text or parent_text)
-                            time_str = time_match.group(1) if time_match else ""
-
-                            # Try to find branch/cinema name
-                            cinema_name = "Movieland"
-                            city = ""
-                            for binfo in MOVIELAND_BRANCHES.values():
-                                if binfo["city_he"] in parent_text or binfo["name_he"] in parent_text:
-                                    cinema_name = binfo["name"]
-                                    city = binfo["city"]
-                                    break
-
-                            # Parse showtime
-                            showtime = None
-                            if time_str:
-                                try:
-                                    today = datetime.now().date()
-                                    h, m = map(int, time_str.split(":"))
-                                    showtime = datetime.combine(today, datetime.min.time().replace(hour=h, minute=m))
-                                except Exception:
-                                    pass
-
-                            if showtime:
-                                all_screenings.append(ScrapedScreening(
-                                    movie_title=movie.title,
-                                    cinema_name=cinema_name,
-                                    city=city,
-                                    showtime=showtime,
-                                    hall="",
-                                    format="2D",
-                                    language="",
-                                ))
-
-                        except Exception as e:
-                            logger.debug(f"[Movieland] Booking link extraction error: {e}")
-                            continue
-
-                    # If no booking links found, try to extract from showtime elements
-                    if not found_urls and showtime_els:
-                        for el in showtime_els:
-                            try:
-                                text = (await el.inner_text()).strip()
-                                time_match = re.search(r'(\d{1,2}:\d{2})', text)
-                                if not time_match:
-                                    continue
-
-                                time_str = time_match.group(1)
-                                today = datetime.now().date()
-                                h, m = map(int, time_str.split(":"))
-                                showtime = datetime.combine(
-                                    today, datetime.min.time().replace(hour=h, minute=m)
-                                )
-
-                                # Try clicking to discover booking URL
-                                booking_url = ""
-                                try:
-                                    async with page.expect_popup(timeout=5000) as popup_info:
-                                        await el.click()
-                                    popup = await popup_info.value
-                                    if BOOKING_DOMAIN in popup.url:
-                                        booking_url = popup.url
-                                    await popup.close()
-                                except Exception:
-                                    # Check if navigation happened
-                                    if BOOKING_DOMAIN in page.url:
-                                        booking_url = page.url
-                                        await page.go_back()
-                                        await asyncio.sleep(1)
-
-                                all_screenings.append(ScrapedScreening(
-                                    movie_title=movie.title,
-                                    cinema_name="Movieland",
-                                    city="",
-                                    showtime=showtime,
-                                ))
-
-                            except Exception:
-                                continue
-
+                    all_screenings.extend(screenings)
                 except Exception as e:
-                    logger.warning(f"[Movieland] Movie page failed for '{movie.title}': {e}")
+                    logger.warning(f"[Movieland] Screenings failed for {binfo['name']}: {e}")
                     continue
 
-                await self._human_delay(0.3, 0.8)
+                await self._human_delay(0.5, 1.0)
 
-            page.remove_listener("response", capture_response)
-
-            # Process any captured API responses
-            if api_responses:
-                logger.info(f"[Movieland] Captured {len(api_responses)} API responses")
-                for resp in api_responses[:5]:
-                    logger.warning(f"[Movieland] API URL: {resp['url'][:150]}")
-                    data = resp.get("data")
-                    if isinstance(data, dict):
-                        logger.warning(f"[Movieland] API keys: {list(data.keys())[:10]}")
-                    elif isinstance(data, list) and data:
-                        logger.warning(f"[Movieland] API list len={len(data)}, "
-                                       f"first keys: {list(data[0].keys()) if isinstance(data[0], dict) else 'not dict'}")
+            if on_progress:
+                on_progress("סריקת הקרנות - מובילנד", len(MOVIELAND_BRANCHES),
+                            len(MOVIELAND_BRANCHES),
+                            f"נמצאו {len(all_screenings)} הקרנות")
 
             logger.info(f"[Movieland] Total screenings found: {len(all_screenings)}")
 
@@ -819,139 +1133,82 @@ class MovielandScraper(BaseScraper):
             page = await context.new_page()
 
             if on_progress:
-                on_progress("סורק כיסאות - מובילנד", 0, 1, "אוסף הקרנות")
+                on_progress("סורק כיסאות - מובילנד", 0, 1, "אוסף הקרנות מסניפים")
 
-            # Collect screenings with booking URLs
-            movies = await self.scrape_movies(on_progress=None)
-            if not movies:
-                logger.warning("[Movieland] No movies found")
-                return results
+            # Collect booking URLs from all branch pages
+            branch_urls = await self._discover_branch_urls(page)
+            all_booking_items: list[dict] = []
 
-            # Collect all booking URLs from movie pages
-            booking_items: list[dict] = []  # {movie_title, booking_url, cinema_name, city, showtime, ...}
-
-            for movie in movies:
-                if not movie.detail_url:
+            for bid, binfo in MOVIELAND_BRANCHES.items():
+                url = branch_urls.get(bid)
+                if not url:
                     continue
+
                 try:
-                    await self._open_url(page, movie.detail_url, wait_for_network=True)
-                    await asyncio.sleep(2)
-                    await page.evaluate("window.scrollBy(0, 600)")
-                    await asyncio.sleep(1)
-
-                    # Find all booking links
-                    links = await page.query_selector_all(
-                        f'a[href*="{BOOKING_DOMAIN}"]'
+                    _, _, booking_items = await self._scrape_branch_page(
+                        page, url, binfo, collect_booking_urls=True
                     )
-
-                    seen_urls: set[str] = set()
-                    for link in links:
-                        try:
-                            href = await link.get_attribute("href") or ""
-                            if not href or href in seen_urls:
-                                continue
-                            seen_urls.add(href)
-
-                            # Get context
-                            link_text = (await link.inner_text()).strip()
-                            parent = await link.evaluate_handle("el => el.parentElement")
-                            parent_text = ""
-                            try:
-                                parent_text = await parent.evaluate("el => el.textContent")
-                                parent_text = parent_text.strip()[:300]
-                            except Exception:
-                                pass
-
-                            # Extract time
-                            time_match = re.search(r'(\d{1,2}:\d{2})', link_text or parent_text)
-                            time_str = time_match.group(1) if time_match else ""
-
-                            # Extract branch
-                            cinema_name = "Movieland"
-                            city = ""
-                            for binfo in MOVIELAND_BRANCHES.values():
-                                if binfo["city_he"] in parent_text or binfo["name_he"] in parent_text:
-                                    cinema_name = binfo["name"]
-                                    city = binfo["city"]
-                                    break
-
-                            # Parse showtime
-                            showtime = None
-                            if time_str:
-                                try:
-                                    today = datetime.now().date()
-                                    h, m = map(int, time_str.split(":"))
-                                    showtime = datetime.combine(
-                                        today, datetime.min.time().replace(hour=h, minute=m)
-                                    )
-                                except Exception:
-                                    pass
-
-                            # Try to extract hall from parent text
-                            hall = ""
-                            hall_match = re.search(r'אולם\s*(\d+|[A-Za-z]+)', parent_text)
-                            if hall_match:
-                                hall = hall_match.group(1)
-
-                            # Try to extract format
-                            fmt = "2D"
-                            upper_text = parent_text.upper()
-                            if "IMAX" in upper_text:
-                                fmt = "IMAX"
-                            elif "4DX" in upper_text:
-                                fmt = "4DX"
-                            elif "3D" in upper_text:
-                                fmt = "3D"
-                            elif "VIP" in upper_text:
-                                fmt = "VIP"
-
-                            booking_items.append({
-                                "movie_title": movie.title,
-                                "booking_url": href,
-                                "cinema_name": cinema_name,
-                                "city": city,
-                                "showtime": showtime,
-                                "hall": hall,
-                                "format": fmt,
-                            })
-
-                        except Exception:
-                            continue
-
+                    all_booking_items.extend(booking_items)
                 except Exception as e:
-                    logger.debug(f"[Movieland] Booking URL collection failed for {movie.title}: {e}")
+                    logger.warning(f"[Movieland] Booking URL collection failed for {binfo['name']}: {e}")
                     continue
 
                 await self._human_delay(0.3, 0.8)
 
-            logger.info(f"[Movieland] Collected {len(booking_items)} booking URLs")
+            # Deduplicate by booking URL
+            seen_urls: set[str] = set()
+            unique_items: list[dict] = []
+            for item in all_booking_items:
+                url = item["booking_url"]
+                if url not in seen_urls:
+                    seen_urls.add(url)
+                    unique_items.append(item)
+
+            logger.info(f"[Movieland] Collected {len(unique_items)} unique booking URLs from {len(branch_urls)} branches")
 
             if on_progress:
-                on_progress("סורק כיסאות - מובילנד", 0, len(booking_items), "מתחיל סריקת כיסאות")
+                on_progress("סורק כיסאות - מובילנד", 0, len(unique_items), "מתחיל סריקת כיסאות")
 
             # Navigate to each booking URL and count seats
-            for idx, item in enumerate(booking_items):
+            for idx, item in enumerate(unique_items):
                 if on_progress:
-                    on_progress("סורק כיסאות - מובילנד", idx + 1, len(booking_items),
-                                item["movie_title"])
+                    on_progress("סורק כיסאות - מובילנד", idx + 1, len(unique_items),
+                                f"{item['movie_title']} @ {item.get('branch_he', '')}")
 
                 try:
-                    # Navigate directly to seat map (BiggerPicture opens it directly!)
                     await self._open_url(page, item["booking_url"], wait_for_network=True)
-                    await asyncio.sleep(3)  # extra wait for SPA
+                    await asyncio.sleep(3)
 
                     total, sold, sold_positions = await self._count_seats_on_page(
                         page,
                         movie_title=item["movie_title"],
-                        screening_time=str(item.get("showtime", "")),
+                        screening_time=item.get("time_str", ""),
+                        branch_he=item.get("branch_he", ""),
                     )
+
+                    # Try to get hall from seat map page if not already known
+                    hall = item["hall"]
+                    if not hall:
+                        try:
+                            hall_text = await page.evaluate("""() => {
+                                const text = document.body ? document.body.textContent : '';
+                                const m = text.match(/אולם\\s*(\\d+|[A-Za-z]+)/);
+                                if (m) return m[1];
+                                const m2 = text.match(/Hall\\s*(\\d+|[A-Za-z]+)/i);
+                                if (m2) return m2[1];
+                                return '';
+                            }""")
+                            if hall_text:
+                                hall = hall_text
+                        except Exception:
+                            pass
 
                     screening = ScrapedScreening(
                         movie_title=item["movie_title"],
                         cinema_name=item["cinema_name"],
                         city=item["city"],
                         showtime=item["showtime"] or datetime.now(),
-                        hall=item["hall"],
+                        hall=hall,
                         format=item["format"],
                         tickets_sold=sold,
                         total_seats=total,
@@ -965,6 +1222,7 @@ class MovielandScraper(BaseScraper):
                     logger.info(
                         f"[Movieland] '{item['movie_title']}' @ {item['cinema_name']}: "
                         f"{sold}/{total} seats sold"
+                        + (f" (hall {hall})" if hall else "")
                     )
 
                 except Exception as e:
