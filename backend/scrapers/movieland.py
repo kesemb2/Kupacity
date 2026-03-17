@@ -443,7 +443,7 @@ class MovielandScraper(BaseScraper):
 
         try:
             await page.screenshot(
-                path=_debug_screenshot_path("branch", branch=binfo["city_he"])
+                path=_debug_screenshot_path("step1_branch", branch=binfo["city_he"])
             )
         except Exception:
             pass
@@ -456,51 +456,175 @@ class MovielandScraper(BaseScraper):
         await page.evaluate("window.scrollTo(0, 0)")
         await asyncio.sleep(0.5)
 
-        # ── Collect movies ────────────────────────────────────────────
-        # Look for movie sections on the branch page
-        movie_sections = await page.query_selector_all(
-            '[class*="movie"], [class*="Movie"], [class*="film"], [class*="Film"], '
-            '[class*="event"], [class*="Event"], '
-            'article, .movie-item, .film-item, .event-item'
-        )
-
-        if not movie_sections:
-            # Fallback: look for headings that might be movie titles
-            movie_sections = await page.query_selector_all(
-                'h2, h3, h4'
+        try:
+            await page.screenshot(
+                path=_debug_screenshot_path("step2_scrolled", branch=binfo["city_he"]),
+                full_page=True,
             )
+        except Exception:
+            pass
 
-        # Also get all links to find booking URLs
-        all_page_links = await page.query_selector_all('a[href]')
+        # ── Dump page HTML for debugging ──────────────────────────────
         page_html = await page.content()
+        try:
+            html_dump_path = os.path.join(
+                _DEBUG_SCREENSHOTS_DIR,
+                f"mvl_{re.sub(r'[^a-zA-Z0-9]', '_', binfo.get('city', ''))}_{datetime.now().strftime('%H%M%S')}.html"
+            )
+            os.makedirs(_DEBUG_SCREENSHOTS_DIR, exist_ok=True)
+            with open(html_dump_path, "w", encoding="utf-8") as f:
+                f.write(page_html)
+            logger.info(f"[Movieland] Saved branch page HTML to {html_dump_path}")
+        except Exception as e:
+            logger.warning(f"[Movieland] Failed to save HTML dump: {e}")
 
-        # Try to find movie cards with showtimes
-        # Each movie section may contain: title, poster, showtime buttons/links
-        for section in movie_sections:
-            try:
-                section_text = (await section.inner_text()).strip()
-                if not section_text or len(section_text) < 3:
-                    continue
+        # ── Analyze page structure via JS for movie section detection ──
+        page_structure = await page.evaluate("""() => {
+            const result = {
+                orderLinks: [],
+                movieContainers: [],
+                headings: [],
+                allClassNames: new Set(),
+            };
 
-                # Find title - first heading or prominent text
+            // Find all /order/ links and their context
+            const links = document.querySelectorAll('a[href]');
+            for (const a of links) {
+                const href = a.getAttribute('href') || '';
+                if (href.includes('/order/') && href.includes('eventID')) {
+                    // Walk up to find movie context
+                    let movieTitle = '';
+                    let containerClasses = [];
+                    let parentInfo = [];
+                    let p = a.parentElement;
+                    for (let i = 0; i < 8 && p; i++) {
+                        const cls = p.getAttribute('class') || '';
+                        const tag = p.tagName;
+                        parentInfo.push(tag + (cls ? '.' + cls.replace(/\\s+/g, '.') : ''));
+                        if (cls) containerClasses.push(cls);
+
+                        // Check for headings inside this parent
+                        const headings = p.querySelectorAll('h1, h2, h3, h4, h5, h6, [class*="title"], [class*="Title"], [class*="name"], [class*="Name"]');
+                        for (const h of headings) {
+                            const txt = h.textContent.trim();
+                            if (txt.length > 2 && txt.length < 80 && !movieTitle) {
+                                movieTitle = txt;
+                            }
+                        }
+                        p = p.parentElement;
+                    }
+
+                    result.orderLinks.push({
+                        href: href,
+                        text: a.textContent.trim().substring(0, 50),
+                        movieTitle: movieTitle,
+                        parents: parentInfo,
+                        containerClasses: containerClasses,
+                    });
+                }
+            }
+
+            // Collect all unique class names on the page for analysis
+            const allEls = document.querySelectorAll('*');
+            const classCounts = {};
+            for (const el of allEls) {
+                const cls = el.getAttribute('class') || '';
+                if (cls) {
+                    for (const c of cls.split(/\\s+/)) {
+                        if (c.length > 2) {
+                            classCounts[c] = (classCounts[c] || 0) + 1;
+                        }
+                    }
+                }
+            }
+
+            // Find classes that appear multiple times (likely movie containers)
+            const repeatedClasses = {};
+            for (const [cls, count] of Object.entries(classCounts)) {
+                if (count >= 3 && count <= 50) {
+                    repeatedClasses[cls] = count;
+                }
+            }
+
+            // Collect all headings
+            const headings = document.querySelectorAll('h1, h2, h3, h4, h5, h6');
+            for (const h of headings) {
+                result.headings.push({
+                    tag: h.tagName,
+                    text: h.textContent.trim().substring(0, 80),
+                    class: h.getAttribute('class') || '',
+                    parentClass: h.parentElement ? (h.parentElement.getAttribute('class') || '') : '',
+                });
+            }
+
+            return {
+                orderLinksCount: result.orderLinks.length,
+                orderLinks: result.orderLinks.slice(0, 20),
+                headings: result.headings.slice(0, 30),
+                repeatedClasses: repeatedClasses,
+            };
+        }""")
+
+        if page_structure:
+            logger.info(
+                f"[Movieland] Page structure analysis for {binfo['name']}: "
+                f"{page_structure.get('orderLinksCount', 0)} order links, "
+                f"{len(page_structure.get('headings', []))} headings"
+            )
+            if page_structure.get("orderLinks"):
+                for ol in page_structure["orderLinks"][:5]:
+                    logger.info(
+                        f"[Movieland]   Order link: text='{ol.get('text', '')}' "
+                        f"movie='{ol.get('movieTitle', '')}' "
+                        f"parents={ol.get('parents', [])[:3]}"
+                    )
+            if page_structure.get("repeatedClasses"):
+                logger.info(f"[Movieland]   Repeated classes: {page_structure['repeatedClasses']}")
+
+        # ── Collect movies via smart order-link parent traversal ───────
+        # Instead of guessing CSS selectors, find all /order/ links and
+        # walk up the DOM to find their movie container + title
+        order_links_data = page_structure.get("orderLinks", []) if page_structure else []
+
+        # Group order links by movie title
+        movie_groups: dict[str, list[dict]] = {}
+        for ol_data in order_links_data:
+            title = ol_data.get("movieTitle", "").strip()
+            if not title:
                 title = ""
-                title_el = await section.query_selector(
-                    'h2, h3, h4, [class*="title"], [class*="Title"], '
-                    '[class*="name"], [class*="Name"]'
-                )
-                if title_el:
-                    title = (await title_el.inner_text()).strip()
+            if title not in movie_groups:
+                movie_groups[title] = []
+            movie_groups[title].append(ol_data)
 
-                if not title:
-                    # Use section's own tag if it's a heading
-                    tag = await section.evaluate("el => el.tagName")
-                    if tag in ("H2", "H3", "H4"):
-                        title = section_text.split('\n')[0].strip()
+        # Also get all links from the page for fallback
+        all_page_links = await page.query_selector_all('a[href]')
 
-                if not title or len(title) < 2 or title in seen_titles:
+        # Now use the JS-discovered structure to find movie containers
+        # Try to determine the common container class from the order links
+        container_class = ""
+        if order_links_data:
+            # Find the most common parent class that appears across multiple order links
+            parent_class_counts: dict[str, int] = {}
+            for ol_data in order_links_data:
+                for cls_str in ol_data.get("containerClasses", []):
+                    for cls in cls_str.split():
+                        if len(cls) > 2:
+                            parent_class_counts[cls] = parent_class_counts.get(cls, 0) + 1
+            # Pick class that appears most (likely the movie container class)
+            if parent_class_counts:
+                container_class = max(parent_class_counts, key=parent_class_counts.get)
+                logger.info(f"[Movieland] Detected container class: '{container_class}' "
+                            f"(appears {parent_class_counts[container_class]} times)")
+
+        # Strategy 1: Use JS-extracted movie titles from order link parents
+        if movie_groups:
+            for title, links_data in movie_groups.items():
+                if not title or len(title) < 2:
+                    continue
+                if title in seen_titles:
                     continue
 
-                # Skip navigation/branch labels and junk titles
+                # Skip navigation/junk titles
                 if any(binfo2["city_he"] in title for binfo2 in MOVIELAND_BRANCHES.values()):
                     continue
                 skip_words = [
@@ -513,155 +637,262 @@ class MovielandScraper(BaseScraper):
                 ]
                 if any(w.lower() in title.lower() for w in skip_words):
                     continue
-                # Skip very long strings (likely not movie titles)
                 if len(title) > 80:
                     continue
-                # Skip if title is just numbers/punctuation
                 if re.match(r'^[\d\s\-_.,:;!?]+$', title):
                     continue
 
                 seen_titles.add(title)
-
-                # Get poster
-                poster_url = ""
-                img = await section.query_selector("img")
-                if img:
-                    poster_url = (await img.get_attribute("src")
-                                  or await img.get_attribute("data-src")
-                                  or "")
-                    if poster_url and not poster_url.startswith("http"):
-                        poster_url = f"{BASE_URL}{poster_url}"
-
                 movies.append(ScrapedMovie(
                     title=title, title_he=title,
-                    poster_url=poster_url,
                     detail_url=branch_url,
                 ))
 
-                # ── Collect showtimes for this movie ─────────────────
-                # Look for time patterns and booking links within/near the section
-                section_links = await section.query_selector_all('a[href]')
-                showtime_buttons = await section.query_selector_all(
-                    'button, [class*="time"], [class*="hour"], [class*="show"]'
-                )
+                # Extract showtimes from links
+                for ol_data in links_data:
+                    link_text = ol_data.get("text", "")
+                    time_match = re.search(r'(\d{1,2}:\d{2})', link_text)
+                    if not time_match:
+                        continue
 
-                found_times: set[str] = set()
-
-                for link in section_links:
+                    time_str = time_match.group(1)
                     try:
-                        href = await link.get_attribute("href") or ""
-                        link_text = (await link.inner_text()).strip()
-
-                        # Extract time from link text
-                        time_match = re.search(r'(\d{1,2}:\d{2})', link_text)
-                        if not time_match:
-                            continue
-
-                        time_str = time_match.group(1)
-                        if time_str in found_times:
-                            continue
-                        found_times.add(time_str)
-
-                        # Parse datetime
-                        try:
-                            today = datetime.now().date()
-                            h, m = map(int, time_str.split(":"))
-                            showtime = datetime.combine(
-                                today, datetime.min.time().replace(hour=h, minute=m)
-                            )
-                        except Exception:
-                            continue
-
-                        # Extract hall
-                        hall = ""
-                        parent_text = section_text
-                        hall_match = re.search(r'אולם\s*(\d+|[A-Za-z]+)', parent_text)
-                        if hall_match:
-                            hall = hall_match.group(1)
-
-                        # Extract format
-                        fmt = "2D"
-                        upper_text = parent_text.upper()
-                        if "IMAX" in upper_text:
-                            fmt = "IMAX"
-                        elif "4DX" in upper_text:
-                            fmt = "4DX"
-                        elif "3D" in upper_text:
-                            fmt = "3D"
-                        elif "VIP" in upper_text:
-                            fmt = "VIP"
-
-                        screenings.append(ScrapedScreening(
-                            movie_title=title,
-                            cinema_name=binfo["name"],
-                            city=binfo["city"],
-                            showtime=showtime,
-                            hall=hall,
-                            format=fmt,
-                        ))
-
-                        # Collect booking URL for ticket updates
-                        # Links can be either:
-                        # - /order/?eventID=X&theaterId=Y (movieland.co.il order page → redirects to biggerpicture)
-                        # - ecom.biggerpicture.ai/... (direct seat map link)
-                        if collect_booking_urls:
-                            is_order_link = "/order/" in href and "eventID" in href
-                            is_booking_link = BOOKING_DOMAIN in href
-
-                            if is_order_link or is_booking_link:
-                                # Normalize order URLs to full path
-                                booking_url = href
-                                if booking_url.startswith("/"):
-                                    booking_url = f"{BASE_URL}{booking_url}"
-
-                                booking_items.append({
-                                    "movie_title": title,
-                                    "booking_url": booking_url,
-                                    "cinema_name": binfo["name"],
-                                    "city": binfo["city"],
-                                    "showtime": showtime,
-                                    "hall": hall,
-                                    "format": fmt,
-                                    "branch_he": binfo["city_he"],
-                                    "time_str": time_str,
-                                })
-
+                        today = datetime.now().date()
+                        h, m = map(int, time_str.split(":"))
+                        showtime = datetime.combine(
+                            today, datetime.min.time().replace(hour=h, minute=m)
+                        )
                     except Exception:
                         continue
 
-                # Also check showtime buttons without links
-                for btn in showtime_buttons:
-                    try:
-                        btn_text = (await btn.inner_text()).strip()
-                        time_match = re.search(r'(\d{1,2}:\d{2})', btn_text)
-                        if not time_match:
-                            continue
-                        time_str = time_match.group(1)
-                        if time_str in found_times:
-                            continue
-                        found_times.add(time_str)
+                    # Extract hall/format from link text or parents
+                    hall = ""
+                    fmt = "2D"
+                    context_text = " ".join(ol_data.get("parents", []))
+                    hall_match = re.search(r'אולם\s*(\d+|[A-Za-z]+)', context_text + " " + link_text)
+                    if hall_match:
+                        hall = hall_match.group(1)
+                    upper = (context_text + " " + link_text).upper()
+                    if "IMAX" in upper:
+                        fmt = "IMAX"
+                    elif "4DX" in upper:
+                        fmt = "4DX"
+                    elif "3D" in upper:
+                        fmt = "3D"
+                    elif "VIP" in upper:
+                        fmt = "VIP"
 
+                    screenings.append(ScrapedScreening(
+                        movie_title=title,
+                        cinema_name=binfo["name"],
+                        city=binfo["city"],
+                        showtime=showtime,
+                        hall=hall,
+                        format=fmt,
+                    ))
+
+                    if collect_booking_urls:
+                        href = ol_data.get("href", "")
+                        booking_url = href
+                        if booking_url.startswith("/"):
+                            booking_url = f"{BASE_URL}{booking_url}"
+                        booking_items.append({
+                            "movie_title": title,
+                            "booking_url": booking_url,
+                            "cinema_name": binfo["name"],
+                            "city": binfo["city"],
+                            "showtime": showtime,
+                            "hall": hall,
+                            "format": fmt,
+                            "branch_he": binfo["city_he"],
+                            "time_str": time_str,
+                        })
+
+            logger.info(f"[Movieland] Strategy 1 (JS order-link parents): {len(movies)} movies, {len(screenings)} screenings")
+
+        # Strategy 2: CSS selector-based movie section detection (fallback)
+        if not movies:
+            movie_sections = await page.query_selector_all(
+                '[class*="movie"], [class*="Movie"], [class*="film"], [class*="Film"], '
+                '[class*="event"], [class*="Event"], '
+                'article, .movie-item, .film-item, .event-item'
+            )
+
+            if not movie_sections:
+                movie_sections = await page.query_selector_all('h2, h3, h4')
+
+            for section in movie_sections:
+                try:
+                    section_text = (await section.inner_text()).strip()
+                    if not section_text or len(section_text) < 3:
+                        continue
+
+                    title = ""
+                    title_el = await section.query_selector(
+                        'h2, h3, h4, [class*="title"], [class*="Title"], '
+                        '[class*="name"], [class*="Name"]'
+                    )
+                    if title_el:
+                        title = (await title_el.inner_text()).strip()
+
+                    if not title:
+                        tag = await section.evaluate("el => el.tagName")
+                        if tag in ("H2", "H3", "H4"):
+                            title = section_text.split('\n')[0].strip()
+
+                    if not title or len(title) < 2 or title in seen_titles:
+                        continue
+
+                    # Skip navigation/branch labels and junk titles
+                    if any(binfo2["city_he"] in title for binfo2 in MOVIELAND_BRANCHES.values()):
+                        continue
+                    skip_words = [
+                        "סניפים", "תקנון", "צור קשר", "אודות", "FAQ", "שאלות",
+                        "whatsapp", "ווטסאפ", "ואטסאפ", "מובילנד", "movieland",
+                        "דרושים", "careers", "קניון", "mall",
+                        "הזמנת כרטיסים", "ביטול", "החזר", "תנאי",
+                        "כל הזכויות", "copyright", "powered by",
+                        "נגישות", "accessibility",
+                    ]
+                    if any(w.lower() in title.lower() for w in skip_words):
+                        continue
+                    if len(title) > 80:
+                        continue
+                    if re.match(r'^[\d\s\-_.,:;!?]+$', title):
+                        continue
+
+                    seen_titles.add(title)
+
+                    poster_url = ""
+                    img = await section.query_selector("img")
+                    if img:
+                        poster_url = (await img.get_attribute("src")
+                                      or await img.get_attribute("data-src")
+                                      or "")
+                        if poster_url and not poster_url.startswith("http"):
+                            poster_url = f"{BASE_URL}{poster_url}"
+
+                    movies.append(ScrapedMovie(
+                        title=title, title_he=title,
+                        poster_url=poster_url,
+                        detail_url=branch_url,
+                    ))
+
+                    # Collect showtimes for this movie
+                    section_links = await section.query_selector_all('a[href]')
+                    showtime_buttons = await section.query_selector_all(
+                        'button, [class*="time"], [class*="hour"], [class*="show"]'
+                    )
+
+                    found_times: set[str] = set()
+
+                    for link in section_links:
                         try:
-                            today = datetime.now().date()
-                            h, m = map(int, time_str.split(":"))
-                            showtime = datetime.combine(
-                                today, datetime.min.time().replace(hour=h, minute=m)
-                            )
+                            href = await link.get_attribute("href") or ""
+                            link_text = (await link.inner_text()).strip()
+
+                            time_match = re.search(r'(\d{1,2}:\d{2})', link_text)
+                            if not time_match:
+                                continue
+
+                            time_str = time_match.group(1)
+                            if time_str in found_times:
+                                continue
+                            found_times.add(time_str)
+
+                            try:
+                                today = datetime.now().date()
+                                h, m = map(int, time_str.split(":"))
+                                showtime = datetime.combine(
+                                    today, datetime.min.time().replace(hour=h, minute=m)
+                                )
+                            except Exception:
+                                continue
+
+                            hall = ""
+                            parent_text = section_text
+                            hall_match = re.search(r'אולם\s*(\d+|[A-Za-z]+)', parent_text)
+                            if hall_match:
+                                hall = hall_match.group(1)
+
+                            fmt = "2D"
+                            upper_text = parent_text.upper()
+                            if "IMAX" in upper_text:
+                                fmt = "IMAX"
+                            elif "4DX" in upper_text:
+                                fmt = "4DX"
+                            elif "3D" in upper_text:
+                                fmt = "3D"
+                            elif "VIP" in upper_text:
+                                fmt = "VIP"
+
+                            screenings.append(ScrapedScreening(
+                                movie_title=title,
+                                cinema_name=binfo["name"],
+                                city=binfo["city"],
+                                showtime=showtime,
+                                hall=hall,
+                                format=fmt,
+                            ))
+
+                            if collect_booking_urls:
+                                is_order_link = "/order/" in href and "eventID" in href
+                                is_booking_link = BOOKING_DOMAIN in href
+
+                                if is_order_link or is_booking_link:
+                                    booking_url = href
+                                    if booking_url.startswith("/"):
+                                        booking_url = f"{BASE_URL}{booking_url}"
+
+                                    booking_items.append({
+                                        "movie_title": title,
+                                        "booking_url": booking_url,
+                                        "cinema_name": binfo["name"],
+                                        "city": binfo["city"],
+                                        "showtime": showtime,
+                                        "hall": hall,
+                                        "format": fmt,
+                                        "branch_he": binfo["city_he"],
+                                        "time_str": time_str,
+                                    })
+
                         except Exception:
                             continue
 
-                        screenings.append(ScrapedScreening(
-                            movie_title=title,
-                            cinema_name=binfo["name"],
-                            city=binfo["city"],
-                            showtime=showtime,
-                        ))
-                    except Exception:
-                        continue
+                    for btn in showtime_buttons:
+                        try:
+                            btn_text = (await btn.inner_text()).strip()
+                            time_match = re.search(r'(\d{1,2}:\d{2})', btn_text)
+                            if not time_match:
+                                continue
+                            time_str = time_match.group(1)
+                            if time_str in found_times:
+                                continue
+                            found_times.add(time_str)
 
-            except Exception as e:
-                logger.debug(f"[Movieland] Section parse error: {e}")
-                continue
+                            try:
+                                today = datetime.now().date()
+                                h, m = map(int, time_str.split(":"))
+                                showtime = datetime.combine(
+                                    today, datetime.min.time().replace(hour=h, minute=m)
+                                )
+                            except Exception:
+                                continue
+
+                            screenings.append(ScrapedScreening(
+                                movie_title=title,
+                                cinema_name=binfo["name"],
+                                city=binfo["city"],
+                                showtime=showtime,
+                            ))
+                        except Exception:
+                            continue
+
+                except Exception as e:
+                    logger.debug(f"[Movieland] Section parse error: {e}")
+                    continue
+
+            logger.info(f"[Movieland] Strategy 2 (CSS selectors): {len(movies)} movies, {len(screenings)} screenings")
 
         # ── Fallback: scan ALL links on the page for booking URLs ────
         if collect_booking_urls and not booking_items:
@@ -1088,12 +1319,130 @@ class MovielandScraper(BaseScraper):
             };
         }""")
 
-        # Take debug screenshot
+        # Take pre-annotation debug screenshot
         try:
             await page.screenshot(path=_debug_screenshot_path(
-                "seats", movie=movie_title, branch=branch_he,
+                "step4_seats", movie=movie_title, branch=branch_he,
                 time_str=screening_time,
             ))
+        except Exception:
+            pass
+
+        # ── Annotate seats for visual debugging ──────────────────────
+        # Add colored borders: green=available, red=sold, orange=unknown
+        try:
+            await page.evaluate("""() => {
+                const seen = new Set();
+
+                // Find all mvl-seat image elements
+                const images = document.querySelectorAll('image, [style*="mvl-seat"]');
+                for (const el of images) {
+                    const href = el.getAttribute('href')
+                        || el.getAttributeNS('http://www.w3.org/1999/xlink', 'href')
+                        || '';
+                    const style = window.getComputedStyle(el);
+                    const bgImg = style.backgroundImage || '';
+                    const src = href + ' ' + bgImg;
+
+                    if (!src.includes('mvl-seat')) continue;
+
+                    const bbox = el.getBoundingClientRect();
+                    if (bbox.width < 5 || bbox.height < 5) continue;
+
+                    const posKey = Math.round(bbox.left) + ',' + Math.round(bbox.top);
+                    if (seen.has(posKey)) continue;
+                    seen.add(posKey);
+
+                    const isSold = src.includes('/unavailable/');
+                    const isAvail = src.includes('/available/');
+                    const borderColor = isSold ? '#ff0000' : (isAvail ? '#00ff00' : '#ff8800');
+
+                    const div = document.createElement('div');
+                    div.style.cssText = `position:fixed;left:${bbox.left}px;top:${bbox.top}px;`
+                        + `width:${bbox.width}px;height:${bbox.height}px;`
+                        + `border:2px solid ${borderColor};`
+                        + `pointer-events:none;z-index:99999;box-sizing:border-box;`;
+                    div.className = '_mvl_seat_debug_overlay';
+                    document.body.appendChild(div);
+                }
+
+                // Also check background-image elements
+                const allEls = document.querySelectorAll('*');
+                for (const el of allEls) {
+                    if (el.tagName === 'image' || el.tagName === 'IMAGE') continue;
+                    const style = window.getComputedStyle(el);
+                    const bgImg = style.backgroundImage || '';
+                    if (!bgImg.includes('mvl-seat')) continue;
+
+                    const bbox = el.getBoundingClientRect();
+                    if (bbox.width < 5 || bbox.height < 5) continue;
+
+                    const posKey = Math.round(bbox.left) + ',' + Math.round(bbox.top);
+                    if (seen.has(posKey)) continue;
+                    seen.add(posKey);
+
+                    const isSold = bgImg.includes('/unavailable/');
+                    const borderColor = isSold ? '#ff0000' : '#00ff00';
+
+                    const div = document.createElement('div');
+                    div.style.cssText = `position:fixed;left:${bbox.left}px;top:${bbox.top}px;`
+                        + `width:${bbox.width}px;height:${bbox.height}px;`
+                        + `border:2px solid ${borderColor};`
+                        + `pointer-events:none;z-index:99999;box-sizing:border-box;`;
+                    div.className = '_mvl_seat_debug_overlay';
+                    document.body.appendChild(div);
+                }
+
+                // Also annotate class-based seat elements
+                for (const el of allEls) {
+                    const cls = (typeof el.className === 'string' ? el.className
+                        : el.className && el.className.baseVal ? el.className.baseVal
+                        : el.getAttribute('class') || '').toLowerCase();
+
+                    if (!cls.includes('seat')) continue;
+
+                    const isAvailable = cls.includes('available') || cls.includes('free');
+                    const isSold = cls.includes('sold') || cls.includes('occupied')
+                        || cls.includes('taken') || cls.includes('unavailable')
+                        || cls.includes('reserved') || cls.includes('booked');
+
+                    if (!isAvailable && !isSold) continue;
+
+                    const bbox = el.getBoundingClientRect();
+                    if (bbox.width < 5 || bbox.height < 5) continue;
+
+                    const posKey = Math.round(bbox.left) + ',' + Math.round(bbox.top);
+                    if (seen.has(posKey)) continue;
+                    seen.add(posKey);
+
+                    const borderColor = isSold ? '#ff0000' : '#00ff00';
+                    const div = document.createElement('div');
+                    div.style.cssText = `position:fixed;left:${bbox.left}px;top:${bbox.top}px;`
+                        + `width:${bbox.width}px;height:${bbox.height}px;`
+                        + `border:2px solid ${borderColor};`
+                        + `pointer-events:none;z-index:99999;box-sizing:border-box;`;
+                    div.className = '_mvl_seat_debug_overlay';
+                    document.body.appendChild(div);
+                }
+            }""")
+        except Exception as e:
+            logger.debug(f"[Movieland] Seat annotation failed: {e}")
+
+        # Take annotated screenshot (step 5) - overlays show detected seats
+        try:
+            await page.screenshot(path=_debug_screenshot_path(
+                "step5_annotated", movie=movie_title, branch=branch_he,
+                time_str=screening_time,
+            ))
+            logger.info("[Movieland] Step 5 screenshot saved (annotated seats)")
+        except Exception:
+            pass
+
+        # Clean up overlay divs
+        try:
+            await page.evaluate("""() => {
+                document.querySelectorAll('._mvl_seat_debug_overlay').forEach(el => el.remove());
+            }""")
         except Exception:
             pass
 
@@ -1314,6 +1663,17 @@ class MovielandScraper(BaseScraper):
                         except Exception as e:
                             logger.warning(f"[Movieland] Order URL navigation: {e}")
 
+                        # Step 3: screenshot after order URL load (before redirect)
+                        try:
+                            await page.screenshot(path=_debug_screenshot_path(
+                                "step3_order",
+                                movie=item["movie_title"],
+                                branch=item.get("branch_he", ""),
+                                time_str=item.get("time_str", ""),
+                            ))
+                        except Exception:
+                            pass
+
                         # Wait for redirect to biggerpicture
                         for _ in range(10):
                             if BOOKING_DOMAIN in page.url:
@@ -1338,6 +1698,17 @@ class MovielandScraper(BaseScraper):
 
                         logger.info(f"[Movieland] Redirected to: {page.url}")
                         await asyncio.sleep(3)  # Wait for SPA to render
+
+                        # Step 3b: screenshot after successful redirect
+                        try:
+                            await page.screenshot(path=_debug_screenshot_path(
+                                "step3_redirect",
+                                movie=item["movie_title"],
+                                branch=item.get("branch_he", ""),
+                                time_str=item.get("time_str", ""),
+                            ))
+                        except Exception:
+                            pass
                     else:
                         # Direct biggerpicture URL
                         await self._open_url(page, booking_url, wait_for_network=True)
