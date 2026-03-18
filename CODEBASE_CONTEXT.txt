@@ -215,6 +215,12 @@ ANALYTICS:
         by_date: [{ date, tickets_sold, screenings_count }] }
     All-time stats for a movie across its entire cinema run.
 
+  GET /api/analytics/blocked-seats
+    → { summary: { halls_tracked, total_scans, total_blocked_seats },
+        halls: [{ cinema, city, hall, scan_count, blocked_count,
+                  tracked_seats, blocked_seats, updated_at }] }
+    Debug endpoint showing blocked seat learning progress per hall.
+
 SCRAPING:
   POST /api/scrape/trigger
     → Runs scrape in background via asyncio.create_task

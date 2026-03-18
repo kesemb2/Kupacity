@@ -82,6 +82,12 @@ def _finalize_blocked_seats(db: Session, hall_data: dict) -> None:
         A seat is "always-sold in this run" if it appears in >=75% of screenings
         of that hall (frequency-based).  scan_count increments once per run.
     """
+    if not hall_data:
+        logger.info("[Blocked Seats] No position data collected this run")
+        return
+
+    logger.info(f"[Blocked Seats] Processing {len(hall_data)} halls with position data")
+
     for (cinema_id, hall), position_sets in hall_data.items():
         if not position_sets:
             continue
@@ -93,6 +99,9 @@ def _finalize_blocked_seats(db: Session, hall_data: dict) -> None:
                 freq[key] = freq.get(key, 0) + 1
         min_count = max(1, int(len(position_sets) * 0.75))
         always_sold = {k for k, v in freq.items() if v >= min_count}
+        logger.info(f"[Blocked Seats] cinema={cinema_id} hall={hall}: "
+                     f"{len(position_sets)} screenings, {len(freq)} unique seats, "
+                     f"{len(always_sold)} always-sold (>={min_count}/{len(position_sets)})")
         if not always_sold:
             continue
 
@@ -110,10 +119,10 @@ def _finalize_blocked_seats(db: Session, hall_data: dict) -> None:
 
         stats.seat_sold_counts = json.dumps(sold_counts)
 
-        # Recompute blocked seats: >= 90% of scan runs, minimum 3 runs
+        # Recompute blocked seats: >= 80% of scan runs, minimum 2 runs
         blocked = []
-        if stats.scan_count >= 3:
-            threshold = 0.90
+        if stats.scan_count >= 2:
+            threshold = 0.80
             for key, count in sold_counts.items():
                 if count / stats.scan_count >= threshold:
                     blocked.append(key)
@@ -121,6 +130,10 @@ def _finalize_blocked_seats(db: Session, hall_data: dict) -> None:
         stats.blocked_seats = json.dumps(blocked)
         stats.blocked_count = len(blocked)
         stats.updated_at = datetime.utcnow()
+        logger.info(f"[Blocked Seats] cinema={cinema_id} hall={hall}: "
+                     f"scan_count={stats.scan_count}, "
+                     f"always_sold_this_run={len(always_sold)}, "
+                     f"blocked={len(blocked)}")
 
         # Update all active screenings in this hall with the new blocked count
         db.query(Screening).filter(
@@ -226,6 +239,8 @@ def _make_screening_callback(db: Session, chain: CinemaChain, log: ScrapeLog):
                 key = (cinema.id, hall)
                 pos_set = {f"{p[0]},{p[1]}" for p in screening.sold_positions}
                 hall_data.setdefault(key, []).append(pos_set)
+                logger.debug(f"[Blocked Seats] Collected {len(pos_set)} sold positions "
+                             f"for {screening.cinema_name} hall={hall}")
         except Exception:
             db.rollback()
     return on_screening_update, hall_data

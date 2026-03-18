@@ -8,7 +8,7 @@ from typing import Optional
 from datetime import datetime, timedelta
 
 from database import get_db, SessionLocal
-from models.models import CinemaChain, Cinema, Movie, Screening, ScrapeLog, TicketSnapshot
+from models.models import CinemaChain, Cinema, Movie, Screening, ScrapeLog, TicketSnapshot, HallSeatStats
 
 router = APIRouter(prefix="/api")
 logger = logging.getLogger(__name__)
@@ -728,5 +728,42 @@ def get_movie_lifetime(movie_id: int, db: Session = Depends(get_db)):
         "by_date": [
             {"date": str(d), "tickets_sold": t or 0, "screenings_count": s}
             for d, t, s in by_date
+        ],
+    }
+
+
+@router.get("/analytics/blocked-seats")
+def get_blocked_seats_stats(db: Session = Depends(get_db)):
+    """מעקב אחר זיהוי מושבים חסומים - מציג את מצב הלמידה"""
+    import json as _json2
+
+    stats = (
+        db.query(HallSeatStats, Cinema.name, Cinema.city)
+        .join(Cinema, HallSeatStats.cinema_id == Cinema.id)
+        .order_by(HallSeatStats.blocked_count.desc(), HallSeatStats.scan_count.desc())
+        .all()
+    )
+
+    total_blocked = sum(s.blocked_count for s, _, _ in stats)
+    total_scans = sum(s.scan_count for s, _, _ in stats)
+
+    return {
+        "summary": {
+            "halls_tracked": len(stats),
+            "total_scans": total_scans,
+            "total_blocked_seats": total_blocked,
+        },
+        "halls": [
+            {
+                "cinema": name,
+                "city": city,
+                "hall": s.hall,
+                "scan_count": s.scan_count,
+                "blocked_count": s.blocked_count,
+                "tracked_seats": len(_json2.loads(s.seat_sold_counts)) if s.seat_sold_counts else 0,
+                "blocked_seats": _json2.loads(s.blocked_seats) if s.blocked_seats else [],
+                "updated_at": s.updated_at.isoformat() if s.updated_at else None,
+            }
+            for s, name, city in stats
         ],
     }
