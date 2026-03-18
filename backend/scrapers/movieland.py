@@ -478,237 +478,148 @@ class MovielandScraper(BaseScraper):
         except Exception as e:
             logger.warning(f"[Movieland] Failed to save HTML dump: {e}")
 
-        # ── Analyze page structure via JS for movie section detection ──
-        page_structure = await page.evaluate("""() => {
-            const result = {
-                orderLinks: [],
-                movieContainers: [],
-                headings: [],
-                allClassNames: new Set(),
-            };
+        # ── Extract movies via date-cont sections ──────────────────────
+        # Movieland DOM structure: each movie is inside a .date-cont div
+        # containing a.bg-theater-c (title), .bg-genre (genre/duration),
+        # and order links inside .right-help > .bg-hours2
+        js_movies = await page.evaluate("""() => {
+            const containers = document.querySelectorAll('.date-cont');
+            const movies = [];
+            for (const cont of containers) {
+                const titleEl = cont.querySelector('a.bg-theater-c');
+                if (!titleEl) continue;
+                const title = titleEl.textContent.trim();
+                if (!title || title.length < 2) continue;
+                const movieUrl = titleEl.getAttribute('href') || '';
 
-            // Find all /order/ links and their context
-            const links = document.querySelectorAll('a[href]');
-            for (const a of links) {
-                const href = a.getAttribute('href') || '';
-                if (href.includes('/order/') && href.includes('eventID')) {
-                    // Walk up to find movie context
-                    let movieTitle = '';
-                    let containerClasses = [];
-                    let parentInfo = [];
-                    let p = a.parentElement;
-                    for (let i = 0; i < 8 && p; i++) {
-                        const cls = p.getAttribute('class') || '';
-                        const tag = p.tagName;
-                        parentInfo.push(tag + (cls ? '.' + cls.replace(/\\s+/g, '.') : ''));
-                        if (cls) containerClasses.push(cls);
-
-                        // Check for headings inside this parent
-                        const headings = p.querySelectorAll('h1, h2, h3, h4, h5, h6, [class*="title"], [class*="Title"], [class*="name"], [class*="Name"]');
-                        for (const h of headings) {
-                            const txt = h.textContent.trim();
-                            if (txt.length > 2 && txt.length < 80 && !movieTitle) {
-                                movieTitle = txt;
-                            }
-                        }
-                        p = p.parentElement;
-                    }
-
-                    result.orderLinks.push({
-                        href: href,
-                        text: a.textContent.trim().substring(0, 50),
-                        movieTitle: movieTitle,
-                        parents: parentInfo,
-                        containerClasses: containerClasses,
-                    });
+                // Genre, duration, rating from .bg-genre
+                const genreEl = cont.querySelector('.bg-genre');
+                let genre = '', duration = 0, rating = '';
+                if (genreEl) {
+                    const text = genreEl.textContent.trim();
+                    const parts = text.split('|').map(s => s.trim());
+                    genre = parts[0] || '';
+                    const durMatch = text.match(/(\\d+)\\s*ד/);
+                    if (durMatch) duration = parseInt(durMatch[1]);
+                    if (parts.length >= 3) rating = parts[parts.length - 1];
                 }
-            }
 
-            // Collect all unique class names on the page for analysis
-            const allEls = document.querySelectorAll('*');
-            const classCounts = {};
-            for (const el of allEls) {
-                const cls = el.getAttribute('class') || '';
-                if (cls) {
-                    for (const c of cls.split(/\\s+/)) {
-                        if (c.length > 2) {
-                            classCounts[c] = (classCounts[c] || 0) + 1;
-                        }
-                    }
+                // Language from .bg-heady
+                const headyEl = cont.querySelector('.bg-heady');
+                const langText = headyEl ? headyEl.textContent.trim() : '';
+
+                // Poster
+                const posterEl = cont.querySelector('img.img-fluid');
+                let posterUrl = posterEl ? (posterEl.getAttribute('src') || '') : '';
+
+                // Order links (screenings)
+                const orderLinks = cont.querySelectorAll('a[href*="/order/"]');
+                const screeningList = [];
+                for (const a of orderLinks) {
+                    const href = a.getAttribute('href') || '';
+                    if (!href.includes('eventID')) continue;
+                    const timeSpan = a.querySelector('span');
+                    const time = timeSpan ? timeSpan.textContent.trim() : '';
+                    screeningList.push({ href, time });
                 }
-            }
 
-            // Find classes that appear multiple times (likely movie containers)
-            const repeatedClasses = {};
-            for (const [cls, count] of Object.entries(classCounts)) {
-                if (count >= 3 && count <= 50) {
-                    repeatedClasses[cls] = count;
-                }
-            }
-
-            // Collect all headings
-            const headings = document.querySelectorAll('h1, h2, h3, h4, h5, h6');
-            for (const h of headings) {
-                result.headings.push({
-                    tag: h.tagName,
-                    text: h.textContent.trim().substring(0, 80),
-                    class: h.getAttribute('class') || '',
-                    parentClass: h.parentElement ? (h.parentElement.getAttribute('class') || '') : '',
+                movies.push({
+                    title, movieUrl, genre, duration, rating,
+                    langText, posterUrl, screenings: screeningList
                 });
             }
-
-            return {
-                orderLinksCount: result.orderLinks.length,
-                orderLinks: result.orderLinks.slice(0, 20),
-                headings: result.headings.slice(0, 30),
-                repeatedClasses: repeatedClasses,
-            };
+            return movies;
         }""")
 
-        if page_structure:
-            logger.info(
-                f"[Movieland] Page structure analysis for {binfo['name']}: "
-                f"{page_structure.get('orderLinksCount', 0)} order links, "
-                f"{len(page_structure.get('headings', []))} headings"
-            )
-            if page_structure.get("orderLinks"):
-                for ol in page_structure["orderLinks"][:5]:
-                    logger.info(
-                        f"[Movieland]   Order link: text='{ol.get('text', '')}' "
-                        f"movie='{ol.get('movieTitle', '')}' "
-                        f"parents={ol.get('parents', [])[:3]}"
+        logger.info(f"[Movieland] Branch '{binfo['name']}': {len(js_movies or [])} movies from date-cont sections")
+
+        # Process JS-extracted movies into ScrapedMovie/ScrapedScreening
+        for mv in (js_movies or []):
+            title = mv.get("title", "").strip()
+            if not title or title in seen_titles:
+                continue
+            if len(title) > 80 or len(title) < 2:
+                continue
+
+            seen_titles.add(title)
+
+            # Build movie detail URL
+            movie_url = mv.get("movieUrl", "")
+            if movie_url.startswith("/"):
+                movie_url = f"{BASE_URL}{movie_url}"
+
+            # Parse poster URL
+            poster_url = mv.get("posterUrl", "")
+            if poster_url and poster_url.startswith("/"):
+                poster_url = f"{BASE_URL}{poster_url}"
+
+            movies.append(ScrapedMovie(
+                title=title,
+                title_he=title,
+                genre=mv.get("genre", ""),
+                duration_minutes=mv.get("duration", 0),
+                rating=mv.get("rating", ""),
+                poster_url=poster_url,
+                detail_url=movie_url or branch_url,
+            ))
+
+            # Detect language from bg-heady
+            lang_text = mv.get("langText", "").lower()
+            language = "subtitled"
+            if "מדובב" in lang_text:
+                language = "dubbed"
+
+            # Process screenings
+            for scr in mv.get("screenings", []):
+                time_str = scr.get("time", "")
+                time_match = re.search(r'(\d{1,2}:\d{2})', time_str)
+                if not time_match:
+                    continue
+
+                time_str = time_match.group(1)
+                try:
+                    today = datetime.now().date()
+                    h, m = map(int, time_str.split(":"))
+                    showtime = datetime.combine(
+                        today, datetime.min.time().replace(hour=h, minute=m)
                     )
-            if page_structure.get("repeatedClasses"):
-                logger.info(f"[Movieland]   Repeated classes: {page_structure['repeatedClasses']}")
-
-        # ── Collect movies via smart order-link parent traversal ───────
-        # Instead of guessing CSS selectors, find all /order/ links and
-        # walk up the DOM to find their movie container + title
-        order_links_data = page_structure.get("orderLinks", []) if page_structure else []
-
-        # Group order links by movie title
-        movie_groups: dict[str, list[dict]] = {}
-        for ol_data in order_links_data:
-            title = ol_data.get("movieTitle", "").strip()
-            if not title:
-                title = ""
-            if title not in movie_groups:
-                movie_groups[title] = []
-            movie_groups[title].append(ol_data)
-
-        # Also get all links from the page for fallback
-        all_page_links = await page.query_selector_all('a[href]')
-
-        # Now use the JS-discovered structure to find movie containers
-        # Try to determine the common container class from the order links
-        container_class = ""
-        if order_links_data:
-            # Find the most common parent class that appears across multiple order links
-            parent_class_counts: dict[str, int] = {}
-            for ol_data in order_links_data:
-                for cls_str in ol_data.get("containerClasses", []):
-                    for cls in cls_str.split():
-                        if len(cls) > 2:
-                            parent_class_counts[cls] = parent_class_counts.get(cls, 0) + 1
-            # Pick class that appears most (likely the movie container class)
-            if parent_class_counts:
-                container_class = max(parent_class_counts, key=parent_class_counts.get)
-                logger.info(f"[Movieland] Detected container class: '{container_class}' "
-                            f"(appears {parent_class_counts[container_class]} times)")
-
-        # Strategy 1: Use JS-extracted movie titles from order link parents
-        if movie_groups:
-            for title, links_data in movie_groups.items():
-                if not title or len(title) < 2:
-                    continue
-                if title in seen_titles:
+                except Exception:
                     continue
 
-                # Skip navigation/junk titles
-                if any(binfo2["city_he"] in title for binfo2 in MOVIELAND_BRANCHES.values()):
-                    continue
-                skip_words = [
-                    "סניפים", "תקנון", "צור קשר", "אודות", "FAQ", "שאלות",
-                    "whatsapp", "ווטסאפ", "ואטסאפ", "מובילנד", "movieland",
-                    "דרושים", "careers", "קניון", "mall",
-                    "הזמנת כרטיסים", "ביטול", "החזר", "תנאי",
-                    "כל הזכויות", "copyright", "powered by",
-                    "נגישות", "accessibility",
-                ]
-                if any(w.lower() in title.lower() for w in skip_words):
-                    continue
-                if len(title) > 80:
-                    continue
-                if re.match(r'^[\d\s\-_.,:;!?]+$', title):
-                    continue
+                fmt = "2D"
+                hall = ""
 
-                seen_titles.add(title)
-                movies.append(ScrapedMovie(
-                    title=title, title_he=title,
-                    detail_url=branch_url,
+                screenings.append(ScrapedScreening(
+                    movie_title=title,
+                    cinema_name=binfo["name"],
+                    city=binfo["city"],
+                    showtime=showtime,
+                    hall=hall,
+                    format=fmt,
+                    language=language,
                 ))
 
-                # Extract showtimes from links
-                for ol_data in links_data:
-                    link_text = ol_data.get("text", "")
-                    time_match = re.search(r'(\d{1,2}:\d{2})', link_text)
-                    if not time_match:
-                        continue
+                if collect_booking_urls:
+                    href = scr.get("href", "")
+                    booking_url = href
+                    if booking_url.startswith("/"):
+                        booking_url = f"{BASE_URL}{booking_url}"
+                    booking_items.append({
+                        "movie_title": title,
+                        "booking_url": booking_url,
+                        "cinema_name": binfo["name"],
+                        "city": binfo["city"],
+                        "showtime": showtime,
+                        "hall": hall,
+                        "format": fmt,
+                        "branch_he": binfo["city_he"],
+                        "time_str": time_str,
+                    })
 
-                    time_str = time_match.group(1)
-                    try:
-                        today = datetime.now().date()
-                        h, m = map(int, time_str.split(":"))
-                        showtime = datetime.combine(
-                            today, datetime.min.time().replace(hour=h, minute=m)
-                        )
-                    except Exception:
-                        continue
-
-                    # Extract hall/format from link text or parents
-                    hall = ""
-                    fmt = "2D"
-                    context_text = " ".join(ol_data.get("parents", []))
-                    hall_match = re.search(r'אולם\s*(\d+|[A-Za-z]+)', context_text + " " + link_text)
-                    if hall_match:
-                        hall = hall_match.group(1)
-                    upper = (context_text + " " + link_text).upper()
-                    if "IMAX" in upper:
-                        fmt = "IMAX"
-                    elif "4DX" in upper:
-                        fmt = "4DX"
-                    elif "3D" in upper:
-                        fmt = "3D"
-                    elif "VIP" in upper:
-                        fmt = "VIP"
-
-                    screenings.append(ScrapedScreening(
-                        movie_title=title,
-                        cinema_name=binfo["name"],
-                        city=binfo["city"],
-                        showtime=showtime,
-                        hall=hall,
-                        format=fmt,
-                    ))
-
-                    if collect_booking_urls:
-                        href = ol_data.get("href", "")
-                        booking_url = href
-                        if booking_url.startswith("/"):
-                            booking_url = f"{BASE_URL}{booking_url}"
-                        booking_items.append({
-                            "movie_title": title,
-                            "booking_url": booking_url,
-                            "cinema_name": binfo["name"],
-                            "city": binfo["city"],
-                            "showtime": showtime,
-                            "hall": hall,
-                            "format": fmt,
-                            "branch_he": binfo["city_he"],
-                            "time_str": time_str,
-                        })
-
-            logger.info(f"[Movieland] Strategy 1 (JS order-link parents): {len(movies)} movies, {len(screenings)} screenings")
+        logger.info(
+            f"[Movieland] Branch '{binfo['name']}': "
+            f"{len(movies)} movies, {len(screenings)} screenings"
+        )
 
         # Strategy 2: CSS selector-based movie section detection (fallback)
         if not movies:
