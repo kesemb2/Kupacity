@@ -99,12 +99,22 @@ async def lifespan(app: FastAPI):
                           max_instances=1, coalesce=True)
 
         # --- Hot Cinema: daily screenings refresh (every day at 06:00) ---
+        # After daily screenings finish, automatically trigger ticket updates.
         async def scheduled_hot_daily():
             db = SessionLocal()
             try:
                 await hot_cinema_daily_screenings(db)
             finally:
                 db.close()
+            # Chain: run ticket update right after daily screenings
+            logger.info("[Scheduler] Hot Cinema daily done → triggering ticket update")
+            db2 = SessionLocal()
+            try:
+                await hot_cinema_update_tickets(db2)
+            except Exception:
+                logger.exception("[Scheduler] Post-daily Hot Cinema ticket update failed")
+            finally:
+                db2.close()
 
         scheduler.add_job(scheduled_hot_daily, "cron", hour=6, minute=0,
                           id="hot_daily_screenings",
@@ -135,12 +145,22 @@ async def lifespan(app: FastAPI):
                           max_instances=1, coalesce=True)
 
         # --- Movieland: daily screenings refresh (every day at 07:00) ---
+        # After daily screenings finish, automatically trigger ticket updates.
         async def scheduled_mvl_daily():
             db = SessionLocal()
             try:
                 await movieland_daily_screenings(db)
             finally:
                 db.close()
+            # Chain: run ticket update right after daily screenings
+            logger.info("[Scheduler] Movieland daily done → triggering ticket update")
+            db2 = SessionLocal()
+            try:
+                await movieland_update_tickets(db2)
+            except Exception:
+                logger.exception("[Scheduler] Post-daily Movieland ticket update failed")
+            finally:
+                db2.close()
 
         scheduler.add_job(scheduled_mvl_daily, "cron", hour=7, minute=0,
                           id="mvl_daily_screenings",

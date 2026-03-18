@@ -65,6 +65,11 @@ MOVIELAND_BRANCHES = {
         "city_he": "תל אביב",
         "slug": "tel-aviv",
         "aliases": ["הצוק", "ת\"א", "ת״א"],
+        "fallback_urls": [
+            "https://movieland.co.il/tel-aviv/",
+            "https://movieland.co.il/theater/1/tel-aviv/",
+            "https://movieland.co.il/theater/1/%D7%AA%D7%9C-%D7%90%D7%91%D7%99%D7%91/",
+        ],
     },
     "netanya": {
         "name": "Movieland Netanya",
@@ -72,6 +77,11 @@ MOVIELAND_BRANCHES = {
         "city": "Netanya",
         "city_he": "נתניה",
         "slug": "netanya",
+        "fallback_urls": [
+            "https://movieland.co.il/netanya/",
+            "https://movieland.co.il/theater/2/netanya/",
+            "https://movieland.co.il/theater/2/%D7%A0%D7%AA%D7%A0%D7%99%D7%94/",
+        ],
     },
     "haifa": {
         "name": "Movieland Haifa",
@@ -79,6 +89,11 @@ MOVIELAND_BRANCHES = {
         "city": "Haifa",
         "city_he": "חיפה",
         "slug": "haifa",
+        "fallback_urls": [
+            "https://movieland.co.il/haifa/",
+            "https://movieland.co.il/theater/3/haifa/",
+            "https://movieland.co.il/theater/3/%D7%97%D7%99%D7%A4%D7%94/",
+        ],
     },
     "karmiel": {
         "name": "Movieland Karmiel",
@@ -86,6 +101,11 @@ MOVIELAND_BRANCHES = {
         "city": "Karmiel",
         "city_he": "כרמיאל",
         "slug": "karmiel",
+        "fallback_urls": [
+            "https://movieland.co.il/karmiel/",
+            "https://movieland.co.il/theater/4/karmiel/",
+            "https://movieland.co.il/theater/4/%D7%9B%D7%A8%D7%9E%D7%99%D7%90%D7%9C/",
+        ],
     },
     "afula": {
         "name": "Movieland Afula",
@@ -93,6 +113,11 @@ MOVIELAND_BRANCHES = {
         "city": "Afula",
         "city_he": "עפולה",
         "slug": "afula",
+        "fallback_urls": [
+            "https://movieland.co.il/afula/",
+            "https://movieland.co.il/theater/5/afula/",
+            "https://movieland.co.il/theater/5/%D7%A2%D7%A4%D7%95%D7%9C%D7%94/",
+        ],
     },
 }
 
@@ -306,133 +331,57 @@ class MovielandScraper(BaseScraper):
     async def _discover_branch_urls(self, page: Page) -> dict[str, str]:
         """Discover branch page URLs from the site.
 
-        Movieland branch pages follow the pattern:
-        https://movieland.co.il/theater/{theater_id}/{city_he}
+        Strategy:
+        1. Try each branch's fallback_urls list — probe with a HEAD-like
+           navigation and check if the page has movie content (.date-cont).
+        2. Only if fallbacks fail, fall back to homepage link scanning.
 
         Returns {branch_key: full_url} for each known branch.
         """
         branch_urls: dict[str, str] = {}
 
-        # Navigate to homepage first
-        await self._open_url(page, BASE_URL, wait_for_network=True)
-
-        try:
-            await page.screenshot(
-                path=_debug_screenshot_path("page", branch="home")
-            )
-        except Exception:
-            pass
-
-        # Strategy 1: Find /theater/ links anywhere on the page
-        # These follow the pattern /theater/{id}/{city_he}
-        all_links = await page.query_selector_all('a[href]')
-        theater_links: list[tuple[str, str]] = []  # (href, text)
-
-        for link in all_links:
-            try:
-                href = await link.get_attribute("href") or ""
-                if self._is_junk_link(href):
-                    continue
-                text = (await link.inner_text()).strip()
-
-                # Collect /theater/ links specifically
-                if "/theater/" in href or "/theater/" in href.lower():
-                    if href.startswith("/"):
-                        href = f"{BASE_URL}{href}"
-                    theater_links.append((href, text))
-
-                # Also try to match branches by city name in any link
-                for bid, binfo in MOVIELAND_BRANCHES.items():
-                    if bid in branch_urls:
-                        continue
-                    # Match by URL or link text containing city name or alias
-                    if _branch_matches(binfo, href) or _branch_matches(binfo, text):
-                        if self._is_junk_link(href):
-                            continue
-                        if href.startswith("/"):
-                            href = f"{BASE_URL}{href}"
-                        if href.startswith("http") and "movieland.co.il" in href:
-                            branch_urls[bid] = href
-                            logger.info(f"[Movieland] Found branch URL: {binfo['name']} -> {href}")
-
-            except Exception:
-                continue
-
-        # Process collected /theater/ links
-        for href, text in theater_links:
-            for bid, binfo in MOVIELAND_BRANCHES.items():
-                if bid in branch_urls:
-                    continue
-                # Check if this theater link matches a branch
-                if _branch_matches(binfo, href) or _branch_matches(binfo, text):
-                    branch_urls[bid] = href
-                    logger.info(f"[Movieland] Found branch URL via /theater/: {binfo['name']} -> {href}")
-
-        logger.info(f"[Movieland] Strategy 1 (page links): found {len(branch_urls)} branches")
-
-        # Strategy 2: Hover over "סניפים" in the nav to reveal dropdown
-        if len(branch_urls) < len(MOVIELAND_BRANCHES):
-            try:
-                nav_items = await page.query_selector_all(
-                    'nav a, header a, [class*="menu"] a, [class*="nav"] a, '
-                    'li a, .menu-item a'
-                )
-                snifim_el = None
-                for item in nav_items:
-                    text = (await item.inner_text()).strip()
-                    if "סניפים" in text or "סניף" in text:
-                        snifim_el = item
+        # ── Strategy 1: probe known fallback URLs (fast) ──────────────────
+        for bid, binfo in MOVIELAND_BRANCHES.items():
+            for url in binfo.get("fallback_urls", []):
+                try:
+                    resp = await page.request.get(url, timeout=8000)
+                    if resp.status == 200:
+                        branch_urls[bid] = url
+                        logger.info(f"[Movieland] Branch URL (fallback probe): {binfo['name']} -> {url}")
                         break
+                except Exception:
+                    continue
 
-                if snifim_el:
-                    # Try hover
-                    await snifim_el.hover()
-                    await asyncio.sleep(1.5)
-                    logger.info("[Movieland] Hovered on 'סניפים' menu item")
+        if len(branch_urls) >= len(MOVIELAND_BRANCHES):
+            logger.info(f"[Movieland] All {len(branch_urls)} branches found via fallback URLs")
+            return branch_urls
 
-                    try:
-                        await page.screenshot(
-                            path=_debug_screenshot_path("dropdown", branch="snifim")
-                        )
-                    except Exception:
-                        pass
+        # ── Strategy 2: scan homepage links (slower fallback) ─────────────
+        logger.info(f"[Movieland] Fallback found {len(branch_urls)}/{len(MOVIELAND_BRANCHES)}, scanning homepage")
+        try:
+            await self._open_url(page, BASE_URL, wait_for_network=True)
 
-                    # Also try clicking it
-                    try:
-                        await snifim_el.click()
-                        await asyncio.sleep(2)
-                    except Exception:
-                        pass
+            all_links = await page.query_selector_all('a[href]')
+            for link in all_links:
+                try:
+                    href = await link.get_attribute("href") or ""
+                    if self._is_junk_link(href):
+                        continue
+                    text = (await link.inner_text()).strip()
 
-                    # Scan for new links
-                    dropdown_links = await page.query_selector_all('a[href]')
-                    for link in dropdown_links:
-                        try:
-                            href = await link.get_attribute("href") or ""
-                            if self._is_junk_link(href):
-                                continue
-                            text = (await link.inner_text()).strip()
-
-                            for bid, binfo in MOVIELAND_BRANCHES.items():
-                                if bid in branch_urls:
-                                    continue
-                                if _branch_matches(binfo, href) or _branch_matches(binfo, text):
-                                    if href.startswith("/"):
-                                        href = f"{BASE_URL}{href}"
-                                    if href.startswith("http") and "movieland.co.il" in href:
-                                        branch_urls[bid] = href
-                                        logger.info(f"[Movieland] Found branch URL via dropdown: {binfo['name']} -> {href}")
-                        except Exception:
+                    for bid2, binfo2 in MOVIELAND_BRANCHES.items():
+                        if bid2 in branch_urls:
                             continue
-
-                    # Navigate back to homepage if we left it
-                    if page.url != BASE_URL and page.url != f"{BASE_URL}/":
-                        await self._open_url(page, BASE_URL, wait_for_network=True)
-
-            except Exception as e:
-                logger.warning(f"[Movieland] Dropdown discovery failed: {e}")
-
-        logger.info(f"[Movieland] Strategy 2 (dropdown): total {len(branch_urls)} branches")
+                        if _branch_matches(binfo2, href) or _branch_matches(binfo2, text):
+                            if href.startswith("/"):
+                                href = f"{BASE_URL}{href}"
+                            if href.startswith("http") and "movieland.co.il" in href:
+                                branch_urls[bid2] = href
+                                logger.info(f"[Movieland] Found branch URL (homepage): {binfo2['name']} -> {href}")
+                except Exception:
+                    continue
+        except Exception as e:
+            logger.warning(f"[Movieland] Homepage scanning failed: {e}")
 
         logger.info(f"[Movieland] Discovered {len(branch_urls)}/{len(MOVIELAND_BRANCHES)} branch URLs")
         return branch_urls
@@ -960,11 +909,97 @@ class MovielandScraper(BaseScraper):
 
     # ── Navigate calendar days on a branch page ──────────────────────────
 
+    async def _click_date_tab(self, page: Page, target_date, binfo: dict) -> bool:
+        """Try to click a date tab on the current branch page.
+
+        Movieland branch pages typically have a horizontal day bar with
+        clickable date elements.  We use a targeted JS approach to find
+        the right element instead of overly broad CSS selectors.
+        """
+        target_str = target_date.strftime("%d/%m")
+        target_str2 = target_date.strftime("%d.%m")
+        target_day = str(target_date.day)
+        target_iso = target_date.isoformat()
+
+        # Use JS to find and click the matching date element
+        clicked = await page.evaluate("""(opts) => {
+            const { targetStr, targetStr2, targetDay, targetIso } = opts;
+
+            // Strategy A: elements with data-date attribute
+            const dataDateEls = document.querySelectorAll('[data-date]');
+            for (const el of dataDateEls) {
+                const dd = el.getAttribute('data-date') || '';
+                if (dd.includes(targetIso) || dd.includes(targetStr) || dd.includes(targetStr2)) {
+                    el.click();
+                    return 'data-date';
+                }
+            }
+
+            // Strategy B: look for day-tab / date-tab / swiper-slide elements
+            //   that are NOT .date-cont (movie containers)
+            const tabSelectors = [
+                '.day-tab', '.date-tab', '.swiper-slide',
+                '[class*="day-item"]', '[class*="date-item"]',
+                '[class*="dayTab"]', '[class*="dateTab"]',
+                '[class*="day-btn"]', '[class*="date-btn"]',
+                '.days-bar a', '.days-bar button', '.days-bar li',
+                '.calendar-bar a', '.calendar-bar button',
+            ];
+            for (const sel of tabSelectors) {
+                const els = document.querySelectorAll(sel);
+                for (const el of els) {
+                    const text = el.textContent.trim();
+                    if (text.includes(targetStr) || text.includes(targetStr2) ||
+                        (text.match(/^\\d{1,2}$/) && text === targetDay)) {
+                        el.click();
+                        return 'tab-' + sel;
+                    }
+                }
+            }
+
+            // Strategy C: small clickable elements containing the target day number
+            //   (exclude .date-cont which are movie containers)
+            const candidates = document.querySelectorAll(
+                'a, button, [role="tab"], [role="button"], li[class*="day"], li[class*="date"]'
+            );
+            for (const el of candidates) {
+                if (el.closest('.date-cont')) continue;       // skip movie containers
+                if (el.offsetHeight > 100) continue;          // skip large elements
+                const text = el.textContent.trim();
+                if (text.length > 30) continue;               // skip elements with too much text
+                if (text.includes(targetStr) || text.includes(targetStr2)) {
+                    el.click();
+                    return 'candidate-date';
+                }
+            }
+
+            return null;
+        }""", {
+            "targetStr": target_str,
+            "targetStr2": target_str2,
+            "targetDay": target_day,
+            "targetIso": target_iso,
+        })
+
+        if clicked:
+            logger.info(f"[Movieland] Clicked date tab for {target_date} via {clicked} "
+                        f"(branch: {binfo['name']})")
+            await asyncio.sleep(1.5)
+            return True
+        return False
+
     async def _navigate_branch_calendar(self, page: Page, branch_url: str,
                                          binfo: dict, days: int = 7,
                                          collect_booking_urls: bool = False,
                                          ) -> tuple[list[ScrapedMovie], list[ScrapedScreening], list[dict]]:
-        """Scrape a branch page across multiple days using calendar navigation."""
+        """Scrape a branch page across multiple days.
+
+        Approach (in priority order for each day):
+        1. Reload the branch URL with a date query parameter
+           (?date=DD/MM/YYYY or ?day=YYYY-MM-DD).
+        2. Click a date tab on the currently loaded page.
+        3. If neither works, log and continue to the next day (don't break).
+        """
         all_movies: list[ScrapedMovie] = []
         all_screenings: list[ScrapedScreening] = []
         all_booking_items: list[dict] = []
@@ -980,56 +1015,60 @@ class MovielandScraper(BaseScraper):
         for m in movies:
             seen_titles.add(m.title)
 
-        # Try to navigate to subsequent days via calendar/date selectors
+        day0_screening_count = len(screenings)
+        logger.info(f"[Movieland] Branch '{binfo['name']}' day 0: "
+                    f"{len(movies)} movies, {day0_screening_count} screenings")
+
+        # Try to navigate to subsequent days
+        consecutive_empty = 0
         for day_offset in range(1, days):
             target_date = datetime.now().date() + timedelta(days=day_offset)
 
             try:
-                # Look for date/calendar navigation elements
-                date_buttons = await page.query_selector_all(
-                    '[class*="date"], [class*="day"], [class*="calendar"], '
-                    '[class*="Date"], [class*="Day"], [class*="Calendar"], '
-                    'button[data-date], a[data-date]'
-                )
+                navigated = False
 
-                clicked = False
-                target_str = target_date.strftime("%d/%m")
-                target_str2 = target_date.strftime("%d.%m")
-                target_day = str(target_date.day)
-
-                for btn in date_buttons:
+                # Method 1: URL with date parameter
+                for date_param_fmt in [
+                    ("date", target_date.strftime("%d/%m/%Y")),
+                    ("date", target_date.strftime("%Y-%m-%d")),
+                    ("day", target_date.strftime("%Y-%m-%d")),
+                ]:
+                    param_name, param_val = date_param_fmt
+                    sep = "&" if "?" in branch_url else "?"
+                    day_url = f"{branch_url}{sep}{param_name}={param_val}"
                     try:
-                        btn_text = (await btn.inner_text()).strip()
-                        data_date = await btn.get_attribute("data-date") or ""
-
-                        if (target_str in btn_text or target_str2 in btn_text or
-                                target_date.isoformat() in data_date or
-                                (btn_text.isdigit() and btn_text == target_day)):
-                            await btn.click()
-                            await asyncio.sleep(1)  # Reduced from 2s
-                            clicked = True
-                            logger.info(f"[Movieland] Clicked calendar day {target_date}")
+                        await self._open_url(page, day_url, wait_for_network=True)
+                        # Check if page has movie content
+                        has_content = await page.evaluate(
+                            "() => document.querySelectorAll('.date-cont').length > 0 "
+                            "|| document.querySelectorAll('a[href*=\"/order/\"]').length > 0"
+                        )
+                        if has_content:
+                            navigated = True
+                            logger.info(f"[Movieland] Day {day_offset} via URL param "
+                                        f"{param_name}={param_val}")
                             break
                     except Exception:
                         continue
 
-                if not clicked:
-                    # Try clicking "next day" arrow/button
-                    next_btns = await page.query_selector_all(
-                        '[class*="next"], [class*="arrow"], [class*="forward"], '
-                        'button[aria-label*="next"], button[aria-label*="הבא"]'
-                    )
-                    for btn in next_btns:
-                        try:
-                            await btn.click()
-                            await asyncio.sleep(1)  # Reduced from 2s
-                            clicked = True
-                            break
-                        except Exception:
-                            continue
+                # Method 2: Click date tab on the branch page
+                if not navigated:
+                    # Make sure we're on the branch page
+                    if branch_url not in page.url:
+                        await self._open_url(page, branch_url, wait_for_network=True)
+                    navigated = await self._click_date_tab(page, target_date, binfo)
 
-                if not clicked:
-                    break  # No more calendar navigation possible
+                if not navigated:
+                    logger.debug(f"[Movieland] Could not navigate to day {day_offset} "
+                                 f"({target_date}) for {binfo['name']}")
+                    consecutive_empty += 1
+                    if consecutive_empty >= 3:
+                        logger.info(f"[Movieland] Stopping calendar nav for {binfo['name']} "
+                                    f"after {consecutive_empty} consecutive failures")
+                        break
+                    continue
+
+                consecutive_empty = 0
 
                 # Scrape this day's content
                 day_movies, day_screenings, day_bookings = await self._scrape_branch_page(
@@ -1061,9 +1100,15 @@ class MovielandScraper(BaseScraper):
                 all_screenings.extend(day_screenings)
                 all_booking_items.extend(day_bookings)
 
+                logger.info(f"[Movieland] Branch '{binfo['name']}' day {day_offset} "
+                            f"({target_date}): {len(day_screenings)} screenings")
+
             except Exception as e:
                 logger.debug(f"[Movieland] Calendar navigation failed for day {day_offset}: {e}")
-                break
+                consecutive_empty += 1
+                if consecutive_empty >= 3:
+                    break
+                continue
 
         return all_movies, all_screenings, all_booking_items
 
