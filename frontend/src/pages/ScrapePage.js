@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { fetchScrapeLogs, triggerScrape, getDebugScreenshotUrl, getDebugScreenshotTicketsUrl, fetchDebugScreenshots, getDebugScreenshotFileUrl, clearDebugScreenshots } from '../api/client';
+import { fetchScrapeLogs, triggerScrape, getDebugScreenshotUrl, getDebugScreenshotTicketsUrl, fetchDebugScreenshots, getDebugScreenshotFileUrl, clearDebugScreenshots, fetchBlockedSeatsStats } from '../api/client';
 
 function ScrapePage() {
   const [logs, setLogs] = useState([]);
@@ -122,6 +122,9 @@ function ScrapePage() {
           {message}
         </div>
       )}
+
+      {/* Blocked Seats Stats */}
+      <BlockedSeatsPanel />
 
       {/* Debug Screenshots */}
       <DebugScreenshotsGallery />
@@ -356,6 +359,183 @@ function parseScreenshotFilename(filename) {
 function getStepLabel(step) {
   return STEP_LABELS[step] || step;
 }
+
+
+// ── Blocked Seats Learning Panel ─────────────────────────────────────────
+
+function BlockedSeatsPanel() {
+  const [expanded, setExpanded] = useState(false);
+  const [data, setData] = useState(null);
+  const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    if (expanded && !data) {
+      setLoading(true);
+      fetchBlockedSeatsStats()
+        .then(setData)
+        .catch(() => setData(null))
+        .finally(() => setLoading(false));
+    }
+  }, [expanded, data]);
+
+  const summary = data?.summary;
+  const halls = data?.halls || [];
+
+  return (
+    <div style={{
+      background: '#1e293b',
+      borderRadius: 12,
+      border: '1px solid #334155',
+      marginBottom: 24,
+      overflow: 'hidden',
+    }}>
+      <div
+        onClick={() => setExpanded(!expanded)}
+        style={{
+          padding: '14px 20px',
+          display: 'flex',
+          justifyContent: 'space-between',
+          alignItems: 'center',
+          cursor: 'pointer',
+          userSelect: 'none',
+        }}
+      >
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+          <span style={{ fontSize: 16, fontWeight: 600 }}>
+            מושבים חסומים - מצב למידה
+          </span>
+          {summary && (
+            <span style={{
+              background: summary.total_blocked_seats > 0 ? '#22c55e22' : '#eab30822',
+              color: summary.total_blocked_seats > 0 ? '#22c55e' : '#eab308',
+              padding: '2px 8px',
+              borderRadius: 10,
+              fontSize: 12,
+              fontWeight: 600,
+            }}>
+              {summary.total_blocked_seats > 0
+                ? `${summary.total_blocked_seats} חסומים`
+                : `${summary.halls_tracked} אולמות במעקב`}
+            </span>
+          )}
+        </div>
+        <span style={{ color: '#64748b', fontSize: 18 }}>
+          {expanded ? '\u25B2' : '\u25BC'}
+        </span>
+      </div>
+
+      {expanded && (
+        <div style={{ padding: '0 20px 16px' }}>
+          {loading ? (
+            <div style={{ color: '#64748b', fontSize: 14, textAlign: 'center', padding: 16 }}>
+              טוען...
+            </div>
+          ) : !data || halls.length === 0 ? (
+            <div style={{ color: '#64748b', fontSize: 14, textAlign: 'center', padding: 16 }}>
+              אין נתונים עדיין. המערכת צריכה לפחות 2 סריקות כרטיסים כדי להתחיל לזהות מושבים חסומים.
+            </div>
+          ) : (
+            <>
+              {/* Summary cards */}
+              <div style={{ display: 'flex', gap: 12, marginBottom: 16, flexWrap: 'wrap' }}>
+                <div style={blockedStatStyle}>
+                  <div style={{ fontSize: 22, fontWeight: 800, color: '#60a5fa' }}>{summary.halls_tracked}</div>
+                  <div style={{ fontSize: 12, color: '#94a3b8' }}>אולמות במעקב</div>
+                </div>
+                <div style={blockedStatStyle}>
+                  <div style={{ fontSize: 22, fontWeight: 800, color: '#f59e0b' }}>{summary.total_scans}</div>
+                  <div style={{ fontSize: 12, color: '#94a3b8' }}>סריקות סה"כ</div>
+                </div>
+                <div style={blockedStatStyle}>
+                  <div style={{ fontSize: 22, fontWeight: 800, color: summary.total_blocked_seats > 0 ? '#22c55e' : '#64748b' }}>
+                    {summary.total_blocked_seats}
+                  </div>
+                  <div style={{ fontSize: 12, color: '#94a3b8' }}>מושבים חסומים</div>
+                </div>
+              </div>
+
+              {/* Halls table */}
+              <div style={{ overflowX: 'auto' }}>
+                <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
+                  <thead>
+                    <tr style={{ borderBottom: '1px solid #334155' }}>
+                      <th style={thStyle}>קולנוע</th>
+                      <th style={thStyle}>עיר</th>
+                      <th style={thStyle}>אולם</th>
+                      <th style={thStyle}>סריקות</th>
+                      <th style={thStyle}>מושבים במעקב</th>
+                      <th style={thStyle}>חסומים</th>
+                      <th style={thStyle}>עדכון אחרון</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {halls.map((h, i) => (
+                      <tr key={i} style={{ borderBottom: '1px solid #1e293b' }}>
+                        <td style={tdStyle}>{h.cinema}</td>
+                        <td style={tdStyle}>{h.city}</td>
+                        <td style={tdStyle}>{h.hall}</td>
+                        <td style={tdStyle}>
+                          <span style={{
+                            color: h.scan_count >= 2 ? '#22c55e' : '#eab308',
+                            fontWeight: 600,
+                          }}>
+                            {h.scan_count}
+                          </span>
+                          {h.scan_count < 2 && (
+                            <span style={{ color: '#64748b', fontSize: 11, marginRight: 4 }}>
+                              (צריך {2 - h.scan_count} עוד)
+                            </span>
+                          )}
+                        </td>
+                        <td style={tdStyle}>{h.tracked_seats}</td>
+                        <td style={tdStyle}>
+                          <span style={{
+                            fontWeight: 700,
+                            color: h.blocked_count > 0 ? '#ef4444' : '#64748b',
+                          }}>
+                            {h.blocked_count}
+                          </span>
+                        </td>
+                        <td style={{ ...tdStyle, fontSize: 12, color: '#64748b' }}>
+                          {h.updated_at ? new Date(h.updated_at).toLocaleString('he-IL') : '-'}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+
+              {/* Refresh button */}
+              <div style={{ marginTop: 12, textAlign: 'center' }}>
+                <button
+                  onClick={() => {
+                    setLoading(true);
+                    fetchBlockedSeatsStats()
+                      .then(setData)
+                      .catch(() => {})
+                      .finally(() => setLoading(false));
+                  }}
+                  style={screenshotBtnStyle}
+                >
+                  רענן
+                </button>
+              </div>
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+const blockedStatStyle = {
+  background: '#0f172a',
+  borderRadius: 8,
+  padding: '12px 20px',
+  textAlign: 'center',
+  flex: '1 1 100px',
+  border: '1px solid #1e293b',
+};
 
 
 // ── Hierarchical gallery component ───────────────────────────────────────
