@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { fetchScrapeLogs, triggerScrape, getDebugScreenshotUrl, getDebugScreenshotTicketsUrl, fetchDebugScreenshots, getDebugScreenshotFileUrl, clearDebugScreenshots, fetchBlockedSeatsStats } from '../api/client';
+import { fetchScrapeLogs, triggerScrape, triggerTicketScan, getDebugScreenshotUrl, getDebugScreenshotTicketsUrl, fetchDebugScreenshots, getDebugScreenshotFileUrl, clearDebugScreenshots, fetchBlockedSeatsStats } from '../api/client';
 
 function ScrapePage() {
   const [logs, setLogs] = useState([]);
@@ -32,6 +32,18 @@ function ScrapePage() {
         setTimeout(loadLogs, 2000);
       })
       .catch(() => setMessage('שגיאה בהפעלת הסריקה'))
+      .finally(() => setScraping(false));
+  };
+
+  const handleTicketScan = (chain) => {
+    setScraping(true);
+    setMessage(null);
+    triggerTicketScan(chain)
+      .then((res) => {
+        setMessage(res.message || 'סריקת כיסאות הופעלה');
+        setTimeout(loadLogs, 2000);
+      })
+      .catch(() => setMessage('שגיאה בהפעלת סריקת הכיסאות'))
       .finally(() => setScraping(false));
   };
 
@@ -106,6 +118,37 @@ function ScrapePage() {
           >
             מובילנד בלבד
           </button>
+        </div>
+        <div style={{ borderTop: '1px solid #475569', marginTop: 14, paddingTop: 14 }}>
+          <div style={{ color: '#94a3b8', fontSize: 13, marginBottom: 10 }}>
+            סריקת כיסאות בלבד (ללא סריקת סרטים/הקרנות)
+          </div>
+          <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
+            <button
+              onClick={() => handleTicketScan('hot_cinema')}
+              disabled={scraping || !!runningLog}
+              style={{
+                ...triggerBtnStyle,
+                background: (scraping || runningLog) ? '#475569' : '#b91c1c',
+                opacity: (scraping || runningLog) ? 0.7 : 1,
+                cursor: (scraping || runningLog) ? 'not-allowed' : 'pointer',
+              }}
+            >
+              כיסאות הוט סינמה
+            </button>
+            <button
+              onClick={() => handleTicketScan('movieland')}
+              disabled={scraping || !!runningLog}
+              style={{
+                ...triggerBtnStyle,
+                background: (scraping || runningLog) ? '#475569' : '#6d28d9',
+                opacity: (scraping || runningLog) ? 0.7 : 1,
+                cursor: (scraping || runningLog) ? 'not-allowed' : 'pointer',
+              }}
+            >
+              כיסאות מובילנד
+            </button>
+          </div>
         </div>
       </div>
 

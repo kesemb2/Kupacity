@@ -270,10 +270,6 @@ async def run_initial_scrape(db: Session):
         screenings = await scraper.scrape_screenings(on_progress=progress_cb)
         _upsert_screenings(db, chain, screenings)
 
-        # Skip ticket updates on initial scrape - they are very slow (clicks
-        # each showtime individually). The scheduled ticket job will pick them
-        # up shortly after startup.
-
         duration = (datetime.utcnow() - start).total_seconds()
         log.status = "success"
         log.movies_found = len(movies)
@@ -292,6 +288,10 @@ async def run_initial_scrape(db: Session):
         logger.error(f"[Hot Cinema] Initial scrape failed: {e}")
     finally:
         await scraper.close()
+
+    # Chain ticket update after initial scrape completes
+    logger.info("[Hot Cinema] Initial scrape done → running ticket update")
+    await hot_cinema_update_tickets(db)
 
 
 async def run_movieland_initial_scrape(db: Session):
@@ -317,9 +317,6 @@ async def run_movieland_initial_scrape(db: Session):
         screenings = await scraper.scrape_screenings(on_progress=progress_cb)
         _upsert_screenings(db, chain, screenings)
 
-        # Skip ticket updates on initial scrape - they are very slow.
-        # The scheduled ticket job will pick them up shortly after startup.
-
         duration = (datetime.utcnow() - start).total_seconds()
         log.status = "success"
         log.movies_found = len(movies)
@@ -338,6 +335,10 @@ async def run_movieland_initial_scrape(db: Session):
         logger.error(f"[Movieland] Initial scrape failed: {e}")
     finally:
         await scraper.close()
+
+    # Chain ticket update after initial scrape completes
+    logger.info("[Movieland] Initial scrape done → running ticket update")
+    await movieland_update_tickets(db)
 
 
 async def hot_cinema_weekly_movies(db: Session):

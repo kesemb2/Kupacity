@@ -27,6 +27,7 @@ export const fetchBranchEfficiency = () => api.get('/analytics/branch-efficiency
 export const fetchGenreStats = () => api.get('/analytics/genre-stats').then(r => r.data);
 export const fetchScrapeLogs = () => api.get('/scrape-logs').then(r => r.data);
 export const triggerScrape = (chain) => api.post(`/scrape/trigger${chain ? `?chain=${chain}` : ''}`).then(r => r.data);
+export const triggerTicketScan = (chain) => api.post(`/scrape/tickets${chain ? `?chain=${chain}` : ''}`).then(r => r.data);
 
 export const checkHealth = () => api.get('/health', { timeout: 15000 })
   .then(() => ({ ok: true }))

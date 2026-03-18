@@ -654,6 +654,44 @@ async def trigger_scrape(chain: Optional[str] = Query(default=None)):
         return {"status": "started", "message": "סריקת שתי הרשתות הופעלה ברקע (במקביל)."}
 
 
+@router.post("/scrape/tickets")
+async def trigger_ticket_scan(chain: Optional[str] = Query(default=None)):
+    """סריקת כיסאות ידנית - רץ ברקע.
+
+    chain: "hot_cinema", "movieland", or None (both sequentially)
+    """
+    from scrapers.manager import hot_cinema_update_tickets, movieland_update_tickets
+
+    async def run_hot_tickets():
+        db = SessionLocal()
+        try:
+            await hot_cinema_update_tickets(db)
+        except Exception as e:
+            logger.error(f"Manual Hot Cinema ticket scan failed: {e}")
+        finally:
+            db.close()
+
+    async def run_mvl_tickets():
+        db = SessionLocal()
+        try:
+            await movieland_update_tickets(db)
+        except Exception as e:
+            logger.error(f"Manual Movieland ticket scan failed: {e}")
+        finally:
+            db.close()
+
+    if chain == "hot_cinema":
+        asyncio.create_task(run_hot_tickets())
+        return {"status": "started", "message": "סריקת כיסאות הוט סינמה הופעלה ברקע."}
+    elif chain == "movieland":
+        asyncio.create_task(run_mvl_tickets())
+        return {"status": "started", "message": "סריקת כיסאות מובילנד הופעלה ברקע."}
+    else:
+        asyncio.create_task(run_hot_tickets())
+        asyncio.create_task(run_mvl_tickets())
+        return {"status": "started", "message": "סריקת כיסאות שתי הרשתות הופעלה ברקע (במקביל)."}
+
+
 # ─── Scrape Logs ─────────────────────────────────────────────────────
 
 @router.get("/scrape-logs")
