@@ -218,7 +218,7 @@ class MovielandScraper(BaseScraper):
         except Exception as e:
             logger.warning(f"[Movieland] Page load timeout for {url}: {e}")
 
-        await asyncio.sleep(2)
+        await asyncio.sleep(1)  # Reduced from 2s — page already loaded
 
         # Dismiss any popup/modal that appears
         await self._dismiss_popup(page)
@@ -439,7 +439,7 @@ class MovielandScraper(BaseScraper):
         seen_titles: set[str] = set()
 
         await self._open_url(page, branch_url, wait_for_network=True)
-        await asyncio.sleep(2)
+        await asyncio.sleep(1)  # Reduced from 2s
 
         try:
             await page.screenshot(
@@ -1080,7 +1080,7 @@ class MovielandScraper(BaseScraper):
                                 target_date.isoformat() in data_date or
                                 (btn_text.isdigit() and btn_text == target_day)):
                             await btn.click()
-                            await asyncio.sleep(2)
+                            await asyncio.sleep(1)  # Reduced from 2s
                             clicked = True
                             logger.info(f"[Movieland] Clicked calendar day {target_date}")
                             break
@@ -1096,7 +1096,7 @@ class MovielandScraper(BaseScraper):
                     for btn in next_btns:
                         try:
                             await btn.click()
-                            await asyncio.sleep(2)
+                            await asyncio.sleep(1)  # Reduced from 2s
                             clicked = True
                             break
                         except Exception:
@@ -1156,7 +1156,7 @@ class MovielandScraper(BaseScraper):
         sold = 0
         sold_positions = []
 
-        await asyncio.sleep(3)  # wait for Angular/SPA to render seat map
+        await asyncio.sleep(1.5)  # wait for SPA to render seat map (reduced from 3s)
 
         seat_data = await page.evaluate("""() => {
             // ===== METHOD A: IMAGE-BASED DETECTION (Movieland specific) =====
@@ -1488,41 +1488,50 @@ class MovielandScraper(BaseScraper):
     # ── Movie discovery ──────────────────────────────────────────────────
 
     async def scrape_movies(self, on_progress=None) -> list[ScrapedMovie]:
-        """Scrape movie catalog by visiting each branch page."""
+        """Scrape movie catalog by visiting each branch page (parallel)."""
         pw, browser, context = await self._launch_browser()
         all_movies: list[ScrapedMovie] = []
         seen_titles: set[str] = set()
 
         try:
-            page = await context.new_page()
+            PAGE_POOL_SIZE = 4
+            pages = [await context.new_page() for _ in range(PAGE_POOL_SIZE)]
 
             if on_progress:
                 on_progress("סריקת סרטים - מובילנד", 0, len(MOVIELAND_BRANCHES), "מחפש סניפים")
 
-            branch_urls = await self._discover_branch_urls(page)
+            branch_urls = await self._discover_branch_urls(pages[0])
 
-            for idx, (bid, binfo) in enumerate(MOVIELAND_BRANCHES.items()):
-                if on_progress:
-                    on_progress("סריקת סרטים - מובילנד", idx + 1,
-                                len(MOVIELAND_BRANCHES), binfo["name_he"])
+            # Parallel branch scraping
+            branch_items = list(MOVIELAND_BRANCHES.items())
+            branch_sem = asyncio.Semaphore(PAGE_POOL_SIZE)
 
+            async def _scrape_branch(idx, bid, binfo):
                 url = branch_urls.get(bid)
                 if not url:
                     logger.warning(f"[Movieland] No URL for branch {binfo['name']}, skipping")
+                    return []
+                async with branch_sem:
+                    p = pages[idx % PAGE_POOL_SIZE]
+                    movies, _, _ = await self._scrape_branch_page(p, url, binfo)
+                    return movies
+
+            branch_results = await asyncio.gather(*[
+                _scrape_branch(i, bid, binfo)
+                for i, (bid, binfo) in enumerate(branch_items)
+            ], return_exceptions=True)
+
+            for idx, result in enumerate(branch_results):
+                if on_progress:
+                    on_progress("סריקת סרטים - מובילנד", idx + 1,
+                                len(MOVIELAND_BRANCHES), branch_items[idx][1]["name_he"])
+                if isinstance(result, Exception):
+                    logger.warning(f"[Movieland] Branch {branch_items[idx][1]['name']} failed: {result}")
                     continue
-
-                try:
-                    movies, _, _ = await self._scrape_branch_page(page, url, binfo)
-
-                    for m in movies:
-                        if m.title not in seen_titles:
-                            seen_titles.add(m.title)
-                            all_movies.append(m)
-                except Exception as e:
-                    logger.warning(f"[Movieland] Branch {binfo['name']} failed: {e}")
-                    continue
-
-                await self._human_delay(0.5, 1.0)
+                for m in result:
+                    if m.title not in seen_titles:
+                        seen_titles.add(m.title)
+                        all_movies.append(m)
 
             if on_progress:
                 on_progress("סריקת סרטים - מובילנד", len(MOVIELAND_BRANCHES),
@@ -1541,38 +1550,48 @@ class MovielandScraper(BaseScraper):
     # ── Screening discovery ──────────────────────────────────────────────
 
     async def scrape_screenings(self, on_progress=None) -> list[ScrapedScreening]:
-        """Scrape screening schedule from all branch pages with calendar navigation."""
+        """Scrape screening schedule from all branch pages with calendar navigation (parallel)."""
         pw, browser, context = await self._launch_browser()
         all_screenings: list[ScrapedScreening] = []
 
         try:
-            page = await context.new_page()
+            PAGE_POOL_SIZE = 4
+            pages = [await context.new_page() for _ in range(PAGE_POOL_SIZE)]
 
             if on_progress:
                 on_progress("סריקת הקרנות - מובילנד", 0, len(MOVIELAND_BRANCHES), "מחפש סניפים")
 
-            branch_urls = await self._discover_branch_urls(page)
+            branch_urls = await self._discover_branch_urls(pages[0])
 
-            for idx, (bid, binfo) in enumerate(MOVIELAND_BRANCHES.items()):
-                if on_progress:
-                    on_progress("סריקת הקרנות - מובילנד", idx + 1,
-                                len(MOVIELAND_BRANCHES), binfo["name_he"])
+            # Parallel branch calendar scraping
+            branch_items = list(MOVIELAND_BRANCHES.items())
+            branch_sem = asyncio.Semaphore(PAGE_POOL_SIZE)
 
+            async def _scrape_branch_cal(idx, bid, binfo):
                 url = branch_urls.get(bid)
                 if not url:
                     logger.warning(f"[Movieland] No URL for branch {binfo['name']}, skipping")
-                    continue
-
-                try:
+                    return []
+                async with branch_sem:
+                    p = pages[idx % PAGE_POOL_SIZE]
                     _, screenings, _ = await self._navigate_branch_calendar(
-                        page, url, binfo, days=7
+                        p, url, binfo, days=7
                     )
-                    all_screenings.extend(screenings)
-                except Exception as e:
-                    logger.warning(f"[Movieland] Screenings failed for {binfo['name']}: {e}")
-                    continue
+                    return screenings
 
-                await self._human_delay(0.5, 1.0)
+            branch_results = await asyncio.gather(*[
+                _scrape_branch_cal(i, bid, binfo)
+                for i, (bid, binfo) in enumerate(branch_items)
+            ], return_exceptions=True)
+
+            for idx, result in enumerate(branch_results):
+                if on_progress:
+                    on_progress("סריקת הקרנות - מובילנד", idx + 1,
+                                len(MOVIELAND_BRANCHES), branch_items[idx][1]["name_he"])
+                if isinstance(result, Exception):
+                    logger.warning(f"[Movieland] Screenings failed for {branch_items[idx][1]['name']}: {result}")
+                    continue
+                all_screenings.extend(result)
 
             if on_progress:
                 on_progress("סריקת הקרנות - מובילנד", len(MOVIELAND_BRANCHES),
@@ -1593,7 +1612,7 @@ class MovielandScraper(BaseScraper):
 
     async def scrape_ticket_updates(self, on_progress=None,
                                      on_screening_update=None) -> list[ScrapedScreening]:
-        """Navigate to each screening's seat map and count seats.
+        """Navigate to each screening's seat map and count seats (parallel).
 
         Movieland uses two types of booking URLs:
         1. /order/?eventID=X&theaterId=Y → redirects to ecom.biggerpicture.ai seat map
@@ -1605,30 +1624,40 @@ class MovielandScraper(BaseScraper):
         results: list[ScrapedScreening] = []
 
         try:
-            page = await context.new_page()
+            PAGE_POOL_SIZE = 4
+            SEAT_POOL_SIZE = 4
+            pages = [await context.new_page() for _ in range(PAGE_POOL_SIZE)]
 
             if on_progress:
                 on_progress("סורק כיסאות - מובילנד", 0, 1, "אוסף הקרנות מסניפים")
 
-            # Collect booking URLs from all branch pages
-            branch_urls = await self._discover_branch_urls(page)
+            # Phase 1: Collect booking URLs from all branch pages (parallel)
+            branch_urls = await self._discover_branch_urls(pages[0])
             all_booking_items: list[dict] = []
+            branch_sem = asyncio.Semaphore(PAGE_POOL_SIZE)
 
-            for bid, binfo in MOVIELAND_BRANCHES.items():
-                url = branch_urls.get(bid)
-                if not url:
-                    continue
+            branch_items = [(bid, binfo) for bid, binfo in MOVIELAND_BRANCHES.items()
+                            if branch_urls.get(bid)]
 
-                try:
+            async def _collect_branch(idx, bid, binfo):
+                async with branch_sem:
+                    p = pages[idx % PAGE_POOL_SIZE]
+                    url = branch_urls[bid]
                     _, _, booking_items = await self._scrape_branch_page(
-                        page, url, binfo, collect_booking_urls=True
+                        p, url, binfo, collect_booking_urls=True
                     )
-                    all_booking_items.extend(booking_items)
-                except Exception as e:
-                    logger.warning(f"[Movieland] Booking URL collection failed for {binfo['name']}: {e}")
-                    continue
+                    return booking_items
 
-                await self._human_delay(0.3, 0.8)
+            branch_results = await asyncio.gather(*[
+                _collect_branch(i, bid, binfo)
+                for i, (bid, binfo) in enumerate(branch_items)
+            ], return_exceptions=True)
+
+            for idx, result in enumerate(branch_results):
+                if isinstance(result, Exception):
+                    logger.warning(f"[Movieland] Booking URL collection failed for {branch_items[idx][1]['name']}: {result}")
+                    continue
+                all_booking_items.extend(result)
 
             # Deduplicate by booking URL
             seen_urls: set[str] = set()
@@ -1644,28 +1673,32 @@ class MovielandScraper(BaseScraper):
             if on_progress:
                 on_progress("סורק כיסאות - מובילנד", 0, len(unique_items), "מתחיל סריקת כיסאות")
 
-            # Navigate to each booking URL and count seats
-            for idx, item in enumerate(unique_items):
-                if on_progress:
-                    on_progress("סורק כיסאות - מובילנד", idx + 1, len(unique_items),
-                                f"{item['movie_title']} @ {item.get('branch_he', '')}")
+            # Phase 2: Navigate to each booking URL and count seats (parallel)
+            seat_pages = [await context.new_page() for _ in range(SEAT_POOL_SIZE)]
+            seat_sem = asyncio.Semaphore(SEAT_POOL_SIZE)
+            screening_counter = 0
 
-                try:
+            async def _check_seats(task_idx, item):
+                nonlocal screening_counter
+                async with seat_sem:
+                    screening_counter += 1
+                    if on_progress:
+                        on_progress("סורק כיסאות - מובילנד", screening_counter, len(unique_items),
+                                    f"{item['movie_title']} @ {item.get('branch_he', '')}")
+
+                    p = seat_pages[task_idx % SEAT_POOL_SIZE]
                     booking_url = item["booking_url"]
                     is_order_url = "/order/" in booking_url and "eventID" in booking_url
 
                     if is_order_url:
-                        # /order/ URLs redirect to ecom.biggerpicture.ai
-                        # Navigate and wait for redirect to complete
                         logger.info(f"[Movieland] Navigating to order URL: {booking_url}")
                         try:
-                            await page.goto(booking_url, wait_until="domcontentloaded", timeout=30000)
+                            await p.goto(booking_url, wait_until="domcontentloaded", timeout=30000)
                         except Exception as e:
                             logger.warning(f"[Movieland] Order URL navigation: {e}")
 
-                        # Step 3: screenshot after order URL load (before redirect)
                         try:
-                            await page.screenshot(path=_debug_screenshot_path(
+                            await p.screenshot(path=_debug_screenshot_path(
                                 "step3_order",
                                 movie=item["movie_title"],
                                 branch=item.get("branch_he", ""),
@@ -1674,34 +1707,31 @@ class MovielandScraper(BaseScraper):
                         except Exception:
                             pass
 
-                        # Wait for redirect to biggerpicture
                         for _ in range(10):
-                            if BOOKING_DOMAIN in page.url:
+                            if BOOKING_DOMAIN in p.url:
                                 break
                             await asyncio.sleep(1)
 
-                        if BOOKING_DOMAIN not in page.url:
+                        if BOOKING_DOMAIN not in p.url:
                             logger.warning(
                                 f"[Movieland] Order URL did not redirect to {BOOKING_DOMAIN}. "
-                                f"Current URL: {page.url}"
+                                f"Current URL: {p.url}"
                             )
-                            # Take a debug screenshot to see what happened
                             try:
-                                await page.screenshot(path=_debug_screenshot_path(
+                                await p.screenshot(path=_debug_screenshot_path(
                                     "redirect_fail",
                                     movie=item["movie_title"],
                                     branch=item.get("branch_he", ""),
                                 ))
                             except Exception:
                                 pass
-                            continue
+                            return None
 
-                        logger.info(f"[Movieland] Redirected to: {page.url}")
-                        await asyncio.sleep(3)  # Wait for SPA to render
+                        logger.info(f"[Movieland] Redirected to: {p.url}")
+                        await asyncio.sleep(2)  # Reduced from 3s
 
-                        # Step 3b: screenshot after successful redirect
                         try:
-                            await page.screenshot(path=_debug_screenshot_path(
+                            await p.screenshot(path=_debug_screenshot_path(
                                 "step3_redirect",
                                 movie=item["movie_title"],
                                 branch=item.get("branch_he", ""),
@@ -1710,22 +1740,20 @@ class MovielandScraper(BaseScraper):
                         except Exception:
                             pass
                     else:
-                        # Direct biggerpicture URL
-                        await self._open_url(page, booking_url, wait_for_network=True)
-                        await asyncio.sleep(3)
+                        await self._open_url(p, booking_url, wait_for_network=True)
+                        await asyncio.sleep(2)  # Reduced from 3s
 
                     total, sold, sold_positions = await self._count_seats_on_page(
-                        page,
+                        p,
                         movie_title=item["movie_title"],
                         screening_time=item.get("time_str", ""),
                         branch_he=item.get("branch_he", ""),
                     )
 
-                    # Try to get hall from seat map page if not already known
                     hall = item["hall"]
                     if not hall:
                         try:
-                            hall_text = await page.evaluate("""() => {
+                            hall_text = await p.evaluate("""() => {
                                 const text = document.body ? document.body.textContent : '';
                                 const m = text.match(/אולם\\s*(\\d+|[A-Za-z]+)/);
                                 if (m) return m[1];
@@ -1738,35 +1766,42 @@ class MovielandScraper(BaseScraper):
                         except Exception:
                             pass
 
-                    screening = ScrapedScreening(
-                        movie_title=item["movie_title"],
-                        cinema_name=item["cinema_name"],
-                        city=item["city"],
-                        showtime=item["showtime"] or datetime.now(),
-                        hall=hall,
-                        format=item["format"],
-                        tickets_sold=sold,
-                        total_seats=total,
-                        sold_positions=sold_positions,
-                    )
-                    results.append(screening)
+                    return item, total, sold, sold_positions, hall
 
-                    if on_screening_update:
-                        on_screening_update(screening)
+            seat_results = await asyncio.gather(*[
+                _check_seats(i, item)
+                for i, item in enumerate(unique_items)
+            ], return_exceptions=True)
 
-                    logger.info(
-                        f"[Movieland] '{item['movie_title']}' @ {item['cinema_name']}: "
-                        f"{sold}/{total} seats sold"
-                        + (f" (hall {hall})" if hall else "")
-                    )
-
-                except Exception as e:
-                    logger.warning(
-                        f"[Movieland] Seat map failed for '{item['movie_title']}': {e}"
-                    )
+            for result in seat_results:
+                if isinstance(result, Exception):
+                    logger.warning(f"[Movieland] Seat task failed: {result}")
+                    continue
+                if result is None:
                     continue
 
-                await self._human_delay(1.0, 2.0)
+                item, total, sold, sold_positions, hall = result
+                screening = ScrapedScreening(
+                    movie_title=item["movie_title"],
+                    cinema_name=item["cinema_name"],
+                    city=item["city"],
+                    showtime=item["showtime"] or datetime.now(),
+                    hall=hall,
+                    format=item["format"],
+                    tickets_sold=sold,
+                    total_seats=total,
+                    sold_positions=sold_positions,
+                )
+                results.append(screening)
+
+                if on_screening_update:
+                    on_screening_update(screening)
+
+                logger.info(
+                    f"[Movieland] '{item['movie_title']}' @ {item['cinema_name']}: "
+                    f"{sold}/{total} seats sold"
+                    + (f" (hall {hall})" if hall else "")
+                )
 
         except Exception as e:
             logger.error(f"[Movieland] scrape_ticket_updates failed: {e}")

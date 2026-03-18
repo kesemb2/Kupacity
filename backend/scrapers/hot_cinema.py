@@ -213,7 +213,7 @@ class HotCinemaScraper(BaseScraper):
         except Exception as e:
             logger.warning(f"[Hot Cinema] Page load timeout for {url}: {e}")
 
-        await asyncio.sleep(2)
+        await asyncio.sleep(1)  # Reduced from 2s — page already loaded
 
         if take_debug_screenshot:
             try:
@@ -236,7 +236,7 @@ class HotCinemaScraper(BaseScraper):
         sold_positions = []
 
         # Wait a bit for seat map to render (Angular SPA)
-        await asyncio.sleep(2)
+        await asyncio.sleep(1)
 
         # Run BOTH detection methods in parallel inside one page.evaluate
         seat_data = await page.evaluate("""() => {
@@ -1073,7 +1073,7 @@ class HotCinemaScraper(BaseScraper):
                 logger.debug(f"[Hot Cinema] API call failed for movie {movie_id} date {date_str}: {e}")
                 continue
 
-            await asyncio.sleep(0.3)  # Brief pause between date calls
+            await asyncio.sleep(0.1)  # Brief pause between API calls
 
         logger.info(f"[Hot Cinema] '{movie_title}' (id={movie_id}): {len(all_parsed)} screenings from API over {days} days")
         return all_parsed
@@ -1350,7 +1350,7 @@ class HotCinemaScraper(BaseScraper):
         try:
             logger.warning(f"[Hot Cinema] Seat map: navigating to {booking_url}")
             await self._open_url(page, booking_url, wait_for_network=True)
-            await asyncio.sleep(4)  # SPA needs time to render
+            await asyncio.sleep(2)  # SPA needs time to render
 
             current_url = page.url
             logger.warning(f"[Hot Cinema] Seat map: loaded {current_url}")
@@ -1384,7 +1384,7 @@ class HotCinemaScraper(BaseScraper):
                 seats_url = f"{site_match.group(1)}/seats"
                 logger.info(f"[Hot Cinema] Seat map: trying shortcut to {seats_url}")
                 await page.goto(seats_url, wait_until="networkidle", timeout=15000)
-                await asyncio.sleep(3)
+                await asyncio.sleep(1.5)
 
                 if "/seats" in page.url:
                     logger.info(f"[Hot Cinema] Seat map: shortcut worked → {page.url}")
@@ -1400,7 +1400,7 @@ class HotCinemaScraper(BaseScraper):
                 # Shortcut didn't work, go back to ticket page
                 logger.info("[Hot Cinema] Seat map: shortcut failed, going through ticket flow")
                 await self._open_url(page, booking_url, wait_for_network=True)
-                await asyncio.sleep(4)
+                await asyncio.sleep(2)
 
             # Log page structure for debugging
             page_info = await page.evaluate("""() => {
@@ -1500,7 +1500,7 @@ class HotCinemaScraper(BaseScraper):
 
             if plus_clicked:
                 logger.info(f"[Hot Cinema] Seat map: clicked + button via {plus_clicked}")
-                await asyncio.sleep(2)
+                await asyncio.sleep(1)
                 # Step 2 screenshot: after clicking +
                 try:
                     await page.screenshot(path=_debug_screenshot_path("step2_plus_click", movie_title, screening_time, branch=branch))
@@ -1547,12 +1547,12 @@ class HotCinemaScraper(BaseScraper):
 
             if proceed_clicked:
                 logger.info(f"[Hot Cinema] Seat map: clicked המשך button via {proceed_clicked}")
-                await asyncio.sleep(2)
+                await asyncio.sleep(1)
                 try:
                     await page.wait_for_load_state("networkidle", timeout=10000)
                 except Exception:
                     pass
-                await asyncio.sleep(3)
+                await asyncio.sleep(1.5)
                 # Step 3 screenshot: after clicking המשך
                 try:
                     await page.screenshot(path=_debug_screenshot_path("step3_continue", movie_title, screening_time, branch=branch))
@@ -1588,20 +1588,36 @@ class HotCinemaScraper(BaseScraper):
         all_movies: dict[str, ScrapedMovie] = {}
         pw, browser, context = await self._launch_browser()
         try:
-            page = await context.new_page()
+            PAGE_POOL_SIZE = 5
+            pages = [await context.new_page() for _ in range(PAGE_POOL_SIZE)]
 
-            # Collect movies from theater pages
+            # Collect movies from theater pages (parallel)
             branch_items = list(HOT_CINEMA_BRANCHES.items())
-            for idx, (branch_id, branch_info) in enumerate(branch_items):
+            branch_sem = asyncio.Semaphore(PAGE_POOL_SIZE)
+
+            async def _scrape_branch(idx, branch_id, branch_info):
+                async with branch_sem:
+                    p = pages[idx % PAGE_POOL_SIZE]
+                    return await self._scrape_theater_page(p, branch_id, branch_info)
+
+            branch_results = await asyncio.gather(*[
+                _scrape_branch(i, bid, binfo)
+                for i, (bid, binfo) in enumerate(branch_items)
+            ], return_exceptions=True)
+
+            for idx, result in enumerate(branch_results):
                 if on_progress:
-                    on_progress("סורק סניפים", idx + 1, len(branch_items), branch_info["name"])
-                movies = await self._scrape_theater_page(page, branch_id, branch_info)
-                for m in movies:
+                    on_progress("סורק סניפים", idx + 1, len(branch_items), branch_items[idx][1]["name"])
+                if isinstance(result, Exception):
+                    logger.warning(f"[Hot Cinema] Branch {branch_items[idx][0]} failed: {result}")
+                    continue
+                for m in result:
                     if m.title and m.title not in all_movies:
                         all_movies[m.title] = m
 
             # Also collect from homepage movie detail pages
             try:
+                page = pages[0]
                 await self._open_url(page, BASE_URL)
                 links = await page.query_selector_all('a[href*="/movie/"]')
                 movie_paths: set[str] = set()
@@ -1633,16 +1649,32 @@ class HotCinemaScraper(BaseScraper):
         all_screenings: list[ScrapedScreening] = []
         pw, browser, context = await self._launch_browser()
         try:
-            page = await context.new_page()
+            # Create page pool for parallel operations
+            PAGE_POOL_SIZE = 5
+            pages = [await context.new_page() for _ in range(PAGE_POOL_SIZE)]
 
-            # Step 1: Collect unique movie URLs from all branches
+            # Step 1: Collect unique movie URLs from all branches (parallel)
             movie_urls: dict[str, str] = {}  # title -> URL
             branch_items = list(HOT_CINEMA_BRANCHES.items())
-            for idx, (branch_id, branch_info) in enumerate(branch_items):
+            branch_sem = asyncio.Semaphore(PAGE_POOL_SIZE)
+
+            async def _scrape_branch(idx, branch_id, branch_info):
+                async with branch_sem:
+                    p = pages[idx % PAGE_POOL_SIZE]
+                    return await self._scrape_theater_page(p, branch_id, branch_info)
+
+            branch_results = await asyncio.gather(*[
+                _scrape_branch(i, bid, binfo)
+                for i, (bid, binfo) in enumerate(branch_items)
+            ], return_exceptions=True)
+
+            for idx, result in enumerate(branch_results):
                 if on_progress:
-                    on_progress("סורק סניפים", idx + 1, len(branch_items), branch_info["name"])
-                movies = await self._scrape_theater_page(page, branch_id, branch_info)
-                for m in movies:
+                    on_progress("סורק סניפים", idx + 1, len(branch_items), branch_items[idx][1]["name"])
+                if isinstance(result, Exception):
+                    logger.warning(f"[Hot Cinema] Branch {branch_items[idx][0]} failed: {result}")
+                    continue
+                for m in result:
                     if m.detail_url and m.title not in movie_urls:
                         movie_urls[m.title] = m.detail_url
 
@@ -1659,13 +1691,31 @@ class HotCinemaScraper(BaseScraper):
                 movie_list = movie_list[:self._TEST_MOVIE_LIMIT]
                 logger.info(f"[Hot Cinema] Testing with {len(movie_list)} movies")
 
-            # Step 3: Fetch screenings via direct API calls (7 days)
+            # Step 3: Fetch screenings via direct API calls (7 days) — parallel
+            api_sem = asyncio.Semaphore(PAGE_POOL_SIZE)
+            progress_counter = 0
+
+            async def _fetch_movie_screenings(idx, title, url, mid):
+                nonlocal progress_counter
+                async with api_sem:
+                    p = pages[idx % PAGE_POOL_SIZE]
+                    result = await self._fetch_screenings_api(p, mid, title, days=7)
+                    progress_counter += 1
+                    if on_progress:
+                        on_progress("סורק הקרנות", progress_counter, len(movie_list), title)
+                    return result
+
+            api_results = await asyncio.gather(*[
+                _fetch_movie_screenings(i, t, u, m)
+                for i, (t, u, m) in enumerate(movie_list)
+            ], return_exceptions=True)
+
             all_infos: list[dict] = []
-            for idx, (title, url, mid) in enumerate(movie_list):
-                if on_progress:
-                    on_progress("סורק הקרנות", idx + 1, len(movie_list), title)
-                infos = await self._fetch_screenings_api(page, mid, title, days=7)
-                all_infos.extend(infos)
+            for result in api_results:
+                if isinstance(result, Exception):
+                    logger.warning(f"[Hot Cinema] API fetch failed: {result}")
+                    continue
+                all_infos.extend(result)
 
             logger.info(f"[Hot Cinema] Total screenings from API: {len(all_infos)}")
 
@@ -1700,16 +1750,32 @@ class HotCinemaScraper(BaseScraper):
         all_screenings: list[ScrapedScreening] = []
         pw, browser, context = await self._launch_browser()
         try:
-            page = await context.new_page()
+            PAGE_POOL_SIZE = 5
+            SEAT_POOL_SIZE = 4
+            pages = [await context.new_page() for _ in range(PAGE_POOL_SIZE)]
 
-            # Collect movie URLs from all branches
+            # Phase 1: Collect movie URLs from all branches (parallel)
             movie_urls: dict[str, str] = {}
             branch_items = list(HOT_CINEMA_BRANCHES.items())
-            for idx, (branch_id, branch_info) in enumerate(branch_items):
+            branch_sem = asyncio.Semaphore(PAGE_POOL_SIZE)
+
+            async def _scrape_branch(idx, branch_id, branch_info):
+                async with branch_sem:
+                    p = pages[idx % PAGE_POOL_SIZE]
+                    return await self._scrape_theater_page(p, branch_id, branch_info)
+
+            branch_results = await asyncio.gather(*[
+                _scrape_branch(i, bid, binfo)
+                for i, (bid, binfo) in enumerate(branch_items)
+            ], return_exceptions=True)
+
+            for idx, result in enumerate(branch_results):
                 if on_progress:
-                    on_progress("סורק סניפים", idx + 1, len(branch_items), branch_info["name"])
-                movies = await self._scrape_theater_page(page, branch_id, branch_info)
-                for m in movies:
+                    on_progress("סורק סניפים", idx + 1, len(branch_items), branch_items[idx][1]["name"])
+                if isinstance(result, Exception):
+                    logger.warning(f"[Hot Cinema] Branch {branch_items[idx][0]} failed: {result}")
+                    continue
+                for m in result:
                     if m.detail_url and m.title not in movie_urls:
                         movie_urls[m.title] = m.detail_url
 
@@ -1726,68 +1792,84 @@ class HotCinemaScraper(BaseScraper):
                 movie_list = movie_list[:self._TEST_MOVIE_LIMIT]
                 logger.info(f"[Hot Cinema] Ticket update: limited to {len(movie_list)} movies")
 
-            # TheaterID → siteId mapping (discovered from booking URLs)
-            theater_to_site: dict[str, str] = {}
+            # Phase 2: Fetch screenings via API for all movies (parallel)
+            api_sem = asyncio.Semaphore(PAGE_POOL_SIZE)
 
-            screening_counter = 0
-            for title, url, mid in movie_list:
-                screening_infos = await self._fetch_screenings_api(page, mid, title, days=7)
-                future_infos = [i for i in screening_infos if i["showtime"] >= datetime.now()]
+            async def _fetch_movie(idx, title, url, mid):
+                async with api_sem:
+                    p = pages[idx % PAGE_POOL_SIZE]
+                    infos = await self._fetch_screenings_api(p, mid, title, days=7)
+                    future = [i for i in infos if i["showtime"] >= datetime.now()]
+                    return title, url, future
 
-                if not future_infos:
+            api_results = await asyncio.gather(*[
+                _fetch_movie(i, t, u, m)
+                for i, (t, u, m) in enumerate(movie_list)
+            ], return_exceptions=True)
+
+            # Collect all future screenings per movie
+            movies_with_screenings: list[tuple[str, str, list[dict]]] = []
+            for result in api_results:
+                if isinstance(result, Exception):
+                    logger.warning(f"[Hot Cinema] API fetch failed: {result}")
                     continue
+                title, url, future_infos = result
+                if future_infos:
+                    movies_with_screenings.append((title, url, future_infos))
 
-                # Discover booking URLs from movie page to learn TheaterID→siteId mapping
-                # Only needed if we have theaters we haven't mapped yet
+            # Phase 3: Discover TheaterID→siteId mapping (sequential — needs movie page navigation)
+            theater_to_site: dict[str, str] = {}
+            discovery_page = pages[0]
+
+            all_future_infos = [info for _, _, infos in movies_with_screenings for info in infos]
+            # Collect all unique theater IDs we need to map
+            all_theater_ids = {str(i.get("theater_id", "")) for i in all_future_infos if i.get("theater_id")}
+
+            for title, url, future_infos in movies_with_screenings:
                 unmapped_theaters = {
                     str(i.get("theater_id", ""))
                     for i in future_infos
                     if str(i.get("theater_id", "")) and str(i.get("theater_id", "")) not in theater_to_site
                 }
 
-                if unmapped_theaters:
-                    booking_links = await self._extract_booking_urls_from_movie_page(
-                        page, url, title
-                    )
+                if not unmapped_theaters:
+                    continue
 
-                    # Extract siteId from discovered booking URLs and correlate with screenings
-                    for bl in booking_links:
-                        burl = bl["booking_url"]
-                        # URL pattern: /site/{siteId}?code={siteId}-{eventId}&...
-                        site_match = re.search(r'/site/(\d+)', burl)
-                        code_match = re.search(r'code=(\d+)-(\d+)', burl)
-                        if not site_match:
-                            continue
-                        site_id = site_match.group(1)
-                        event_id_from_url = code_match.group(2) if code_match else ""
+                booking_links = await self._extract_booking_urls_from_movie_page(
+                    discovery_page, url, title
+                )
 
-                        # Match this event_id to a screening to find the TheaterID
-                        if event_id_from_url:
-                            for info in future_infos:
-                                if str(info.get("event_id", "")) == event_id_from_url:
-                                    tid = str(info.get("theater_id", ""))
-                                    if tid and tid not in theater_to_site:
-                                        theater_to_site[tid] = site_id
-                                        logger.info(
-                                            f"[Hot Cinema] Mapped TheaterID={tid} → siteId={site_id}"
-                                        )
-                                    break
+                for bl in booking_links:
+                    burl = bl["booking_url"]
+                    site_match = re.search(r'/site/(\d+)', burl)
+                    code_match = re.search(r'code=(\d+)-(\d+)', burl)
+                    if not site_match:
+                        continue
+                    site_id = site_match.group(1)
+                    event_id_from_url = code_match.group(2) if code_match else ""
 
-                    logger.info(
-                        f"[Hot Cinema] TheaterID→siteId mapping so far: {theater_to_site}"
-                    )
+                    if event_id_from_url:
+                        for info in future_infos:
+                            if str(info.get("event_id", "")) == event_id_from_url:
+                                tid = str(info.get("theater_id", ""))
+                                if tid and tid not in theater_to_site:
+                                    theater_to_site[tid] = site_id
+                                    logger.info(
+                                        f"[Hot Cinema] Mapped TheaterID={tid} → siteId={site_id}"
+                                    )
+                                break
 
-                # Now construct booking URLs for ALL screenings using the mapping
-                for idx, info in enumerate(future_infos):
-                    screening_counter += 1
-                    if on_progress:
-                        on_progress("סורק כיסאות", screening_counter, 0, info["movie_title"])
+                # Stop early if we've mapped all known theater IDs
+                if all_theater_ids <= set(theater_to_site.keys()):
+                    logger.info("[Hot Cinema] All theater IDs mapped, skipping remaining movie pages")
+                    break
 
-                    total_seats = 0
-                    tickets_sold = 0
-                    seat_positions = []
+            logger.info(f"[Hot Cinema] TheaterID→siteId mapping: {theater_to_site}")
 
-                    # Construct booking URL from TheaterID→siteId mapping + EventId
+            # Phase 4: Build screening tasks with booking URLs
+            seat_tasks: list[tuple[dict, str]] = []  # (info, booking_url)
+            for _, _, future_infos in movies_with_screenings:
+                for info in future_infos:
                     tid = str(info.get("theater_id", ""))
                     eid = str(info.get("event_id", ""))
                     site_id = theater_to_site.get(tid, "")
@@ -1799,11 +1881,32 @@ class HotCinemaScraper(BaseScraper):
                             f"?code={site_id}-{eid}"
                             f"&saleChannelCode=WEB&languageid=he_IL"
                         )
+                    seat_tasks.append((info, booking_url))
+
+            logger.info(f"[Hot Cinema] Seat map: {len(seat_tasks)} screenings to check, "
+                        f"{sum(1 for _, url in seat_tasks if url)} with booking URLs")
+
+            # Phase 5: Navigate seat maps (parallel with SEAT_POOL_SIZE pages)
+            seat_pages = [await context.new_page() for _ in range(SEAT_POOL_SIZE)]
+            seat_sem = asyncio.Semaphore(SEAT_POOL_SIZE)
+            screening_counter = 0
+
+            async def _check_seats(task_idx, info, booking_url):
+                nonlocal screening_counter
+                async with seat_sem:
+                    screening_counter += 1
+                    if on_progress:
+                        on_progress("סורק כיסאות", screening_counter, len(seat_tasks), info["movie_title"])
+
+                    total_seats = 0
+                    tickets_sold = 0
+                    seat_positions = []
 
                     if booking_url:
                         try:
+                            p = seat_pages[task_idx % SEAT_POOL_SIZE]
                             total, sold, positions = await self._navigate_to_seat_map(
-                                page, booking_url,
+                                p, booking_url,
                                 movie_title=info["movie_title"],
                                 screening_time=info["showtime"].strftime("%H%M"),
                                 branch=info["cinema_name"],
@@ -1820,33 +1923,49 @@ class HotCinemaScraper(BaseScraper):
                         except Exception as e:
                             logger.debug(f"[Hot Cinema] Seat map failed: {e}")
                     else:
+                        tid = str(info.get("theater_id", ""))
+                        eid = str(info.get("event_id", ""))
+                        site_id = theater_to_site.get(tid, "")
                         logger.debug(
                             f"[Hot Cinema] No booking URL for TheaterID={tid} EventId={eid} "
                             f"(siteId mapping: {'found' if site_id else 'missing'})"
                         )
 
-                    screening = ScrapedScreening(
-                        movie_title=info["movie_title"],
-                        cinema_name=info["cinema_name"],
-                        city=info["city"],
-                        showtime=info["showtime"],
-                        hall=info["hall"],
-                        format=info["format"],
-                        language=info.get("language", "subtitled"),
-                        ticket_price=39.0,
-                        total_seats=total_seats,
-                        tickets_sold=tickets_sold,
-                        sold_positions=seat_positions,
-                    )
-                    screening.revenue = screening.tickets_sold * screening.ticket_price
-                    all_screenings.append(screening)
+                    return info, total_seats, tickets_sold, seat_positions
 
-                    # Save to DB immediately so dashboard updates in real-time
-                    if on_screening_update:
-                        try:
-                            on_screening_update(screening)
-                        except Exception as e:
-                            logger.debug(f"[Hot Cinema] Screening save callback failed: {e}")
+            seat_results = await asyncio.gather(*[
+                _check_seats(i, info, burl)
+                for i, (info, burl) in enumerate(seat_tasks)
+            ], return_exceptions=True)
+
+            for result in seat_results:
+                if isinstance(result, Exception):
+                    logger.debug(f"[Hot Cinema] Seat task failed: {result}")
+                    continue
+
+                info, total_seats, tickets_sold, seat_positions = result
+                screening = ScrapedScreening(
+                    movie_title=info["movie_title"],
+                    cinema_name=info["cinema_name"],
+                    city=info["city"],
+                    showtime=info["showtime"],
+                    hall=info["hall"],
+                    format=info["format"],
+                    language=info.get("language", "subtitled"),
+                    ticket_price=39.0,
+                    total_seats=total_seats,
+                    tickets_sold=tickets_sold,
+                    sold_positions=seat_positions,
+                )
+                screening.revenue = screening.tickets_sold * screening.ticket_price
+                all_screenings.append(screening)
+
+                # Save to DB immediately so dashboard updates in real-time
+                if on_screening_update:
+                    try:
+                        on_screening_update(screening)
+                    except Exception as e:
+                        logger.debug(f"[Hot Cinema] Screening save callback failed: {e}")
         finally:
             await browser.close()
             await pw.stop()
