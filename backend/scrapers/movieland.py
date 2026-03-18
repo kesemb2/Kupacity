@@ -1051,49 +1051,63 @@ class MovielandScraper(BaseScraper):
         target_str = target_date.strftime("%d/%m")
         target_iso = target_date.isoformat()
 
-        # Step 1: Find and click the dropdown trigger
+        # Step 1: Find and click the dropdown trigger ("תאריכים נוספים" button)
         dropdown_opened = await page.evaluate("""() => {
-            // Look for dropdown/calendar trigger buttons
-            // Common patterns: last item in date bar, element with calendar icon,
-            // element with "..." or dropdown arrow
+            function realClick(el) {
+                el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+            }
+
+            // Strategy 1: Look for the "תאריכים נוספים" button by text content
+            const allClickable = document.querySelectorAll('a, button, div, span, [role="button"]');
+            for (const el of allClickable) {
+                if (el.closest('.date-cont')) continue;
+                const text = el.textContent.trim();
+                if (text.includes('תאריכים נוספים') || text.includes('תאריכים') ||
+                    text.includes('לוח שנה') || text.includes('עוד תאריכים')) {
+                    if (el.offsetHeight > 5 && el.offsetHeight < 100) {
+                        realClick(el);
+                        return 'text-תאריכים-נוספים';
+                    }
+                }
+            }
+
+            // Strategy 2: Look for elements with calendar-related classes
             const selectors = [
                 '[class*="dropdown"]', '[class*="more"]', '[class*="calendar"]',
                 '[class*="Dropdown"]', '[class*="More"]', '[class*="Calendar"]',
                 '[class*="picker"]', '[class*="Picker"]',
-                'select[class*="date"]', 'select[class*="day"]',
+                '[class*="additional"]', '[class*="extra"]',
             ];
-
             for (const sel of selectors) {
                 try {
                     const els = document.querySelectorAll(sel);
                     for (const el of els) {
                         if (el.closest('.date-cont')) continue;
                         if (el.offsetHeight > 100 || el.offsetHeight < 5) continue;
-                        el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+                        realClick(el);
                         return 'dropdown-' + sel;
                     }
                 } catch(e) {}
             }
 
-            // Also try: last small clickable element in the date bar area
-            // (before the first .date-cont)
+            // Strategy 3: Find the leftmost element in the date bar
+            // (RTL layout: "תאריכים נוספים" is the leftmost/last item)
             const firstMovie = document.querySelector('.date-cont');
             if (firstMovie) {
-                const allEls = document.querySelectorAll('a, button, [role="button"]');
                 const beforeMovie = [];
-                for (const el of allEls) {
+                for (const el of allClickable) {
                     if (el.closest('.date-cont')) continue;
                     const rect = el.getBoundingClientRect();
                     const movieRect = firstMovie.getBoundingClientRect();
                     if (rect.bottom < movieRect.top && rect.height < 80 && rect.height > 10) {
-                        beforeMovie.push(el);
+                        beforeMovie.push({ el, left: rect.left });
                     }
                 }
-                // Click the last element (likely the dropdown)
+                // In RTL, the "more dates" button is leftmost
                 if (beforeMovie.length > 0) {
-                    const last = beforeMovie[beforeMovie.length - 1];
-                    last.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
-                    return 'last-before-movies';
+                    beforeMovie.sort((a, b) => a.left - b.left);
+                    realClick(beforeMovie[0].el);
+                    return 'leftmost-before-movies';
                 }
             }
 
