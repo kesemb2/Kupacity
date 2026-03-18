@@ -912,64 +912,105 @@ class MovielandScraper(BaseScraper):
     async def _click_date_tab(self, page: Page, target_date, binfo: dict) -> bool:
         """Try to click a date tab on the current branch page.
 
-        Movieland branch pages typically have a horizontal day bar with
-        clickable date elements.  We use a targeted JS approach to find
-        the right element instead of overly broad CSS selectors.
+        Movieland branch pages have a date bar with:
+        - Today, tomorrow, day-after-tomorrow as direct buttons
+        - A dropdown/calendar button for further dates (up to ~7 days)
+
+        For days 1-2 (tomorrow/day-after), we click the direct tab.
+        For days 3+, we first open the dropdown/calendar, then click the date inside.
         """
+        today = datetime.now().date()
+        day_offset = (target_date - today).days
+
         target_str = target_date.strftime("%d/%m")
         target_str2 = target_date.strftime("%d.%m")
         target_day = str(target_date.day)
+        target_day_padded = target_date.strftime("%d")
         target_iso = target_date.isoformat()
+
+        # Hebrew day names for matching
+        hebrew_days = ["ראשון", "שני", "שלישי", "רביעי", "חמישי", "שישי", "שבת"]
+        target_weekday_he = hebrew_days[target_date.weekday()]
 
         # Use JS to find and click the matching date element
         clicked = await page.evaluate("""(opts) => {
-            const { targetStr, targetStr2, targetDay, targetIso } = opts;
+            const { targetStr, targetStr2, targetDay, targetDayPadded, targetIso,
+                    dayOffset, targetWeekdayHe } = opts;
+
+            // Helper: dispatch a proper click event (works with React/Vue/Angular)
+            function realClick(el) {
+                el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+            }
 
             // Strategy A: elements with data-date attribute
             const dataDateEls = document.querySelectorAll('[data-date]');
             for (const el of dataDateEls) {
                 const dd = el.getAttribute('data-date') || '';
                 if (dd.includes(targetIso) || dd.includes(targetStr) || dd.includes(targetStr2)) {
-                    el.click();
+                    realClick(el);
                     return 'data-date';
                 }
             }
 
-            // Strategy B: look for day-tab / date-tab / swiper-slide elements
-            //   that are NOT .date-cont (movie containers)
-            const tabSelectors = [
+            // Strategy B: Direct date tabs in the date bar
+            // Look for small navigation elements (not movie containers) that match the date
+            const navSelectors = [
                 '.day-tab', '.date-tab', '.swiper-slide',
                 '[class*="day-item"]', '[class*="date-item"]',
                 '[class*="dayTab"]', '[class*="dateTab"]',
                 '[class*="day-btn"]', '[class*="date-btn"]',
                 '.days-bar a', '.days-bar button', '.days-bar li',
                 '.calendar-bar a', '.calendar-bar button',
+                // Movieland-specific: look inside navigation/header area
+                'nav a', 'nav button', 'header a', 'header button',
             ];
-            for (const sel of tabSelectors) {
-                const els = document.querySelectorAll(sel);
-                for (const el of els) {
-                    const text = el.textContent.trim();
-                    if (text.includes(targetStr) || text.includes(targetStr2) ||
-                        (text.match(/^\\d{1,2}$/) && text === targetDay)) {
-                        el.click();
-                        return 'tab-' + sel;
+            for (const sel of navSelectors) {
+                try {
+                    const els = document.querySelectorAll(sel);
+                    for (const el of els) {
+                        if (el.closest('.date-cont')) continue;
+                        const text = el.textContent.trim();
+                        if (text.includes(targetStr) || text.includes(targetStr2) ||
+                            (text.match(/^\\d{1,2}$/) && text === targetDay)) {
+                            realClick(el);
+                            return 'tab-' + sel;
+                        }
                     }
-                }
+                } catch(e) {}
             }
 
-            // Strategy C: small clickable elements containing the target day number
-            //   (exclude .date-cont which are movie containers)
+            // Strategy C: Look for all small clickable elements with date text
+            // Match by: date string, day number with Hebrew weekday, or just day number
             const candidates = document.querySelectorAll(
-                'a, button, [role="tab"], [role="button"], li[class*="day"], li[class*="date"]'
+                'a, button, [role="tab"], [role="button"], span[onclick], div[onclick], '
+                + 'li, label, [class*="day"], [class*="date"], [class*="Day"], [class*="Date"]'
             );
             for (const el of candidates) {
-                if (el.closest('.date-cont')) continue;       // skip movie containers
-                if (el.offsetHeight > 100) continue;          // skip large elements
+                if (el.closest('.date-cont')) continue;
+                if (el.offsetHeight > 100 || el.offsetHeight < 5) continue;
+                if (el.offsetWidth > 300) continue;
                 const text = el.textContent.trim();
-                if (text.length > 30) continue;               // skip elements with too much text
+                if (text.length > 40 || text.length === 0) continue;
+
+                // Match date strings
                 if (text.includes(targetStr) || text.includes(targetStr2)) {
-                    el.click();
-                    return 'candidate-date';
+                    realClick(el);
+                    return 'candidate-date-str';
+                }
+                // Match Hebrew weekday + day number
+                if (text.includes(targetWeekdayHe) && text.includes(targetDay)) {
+                    realClick(el);
+                    return 'candidate-weekday-he';
+                }
+                // Match just the day number (only for compact elements)
+                if (text.length < 5 && text.match(/^\\d{1,2}$/) && text === targetDay) {
+                    realClick(el);
+                    return 'candidate-day-num';
+                }
+                // Match padded day (e.g. "02")
+                if (text.length < 5 && text === targetDayPadded) {
+                    realClick(el);
+                    return 'candidate-day-padded';
                 }
             }
 
@@ -978,15 +1019,168 @@ class MovielandScraper(BaseScraper):
             "targetStr": target_str,
             "targetStr2": target_str2,
             "targetDay": target_day,
+            "targetDayPadded": target_day_padded,
             "targetIso": target_iso,
+            "dayOffset": day_offset,
+            "targetWeekdayHe": target_weekday_he,
         })
 
         if clicked:
             logger.info(f"[Movieland] Clicked date tab for {target_date} via {clicked} "
                         f"(branch: {binfo['name']})")
-            await asyncio.sleep(1.5)
+            await asyncio.sleep(2)
             return True
+
+        # Strategy D: For dates beyond the visible tabs, try to open a
+        # dropdown/calendar first, then click the target date inside it
+        if day_offset >= 3:
+            logger.debug(f"[Movieland] Trying dropdown/calendar for day {day_offset}")
+            opened = await self._open_date_dropdown(page, target_date, binfo)
+            if opened:
+                return True
+
         return False
+
+    async def _open_date_dropdown(self, page: Page, target_date, binfo: dict) -> bool:
+        """Try to open a date dropdown/calendar and click the target date.
+
+        Movieland date bar has a dropdown button (often the last item) that
+        reveals a calendar widget for dates beyond the first 3 visible tabs.
+        """
+        target_day = str(target_date.day)
+        target_str = target_date.strftime("%d/%m")
+        target_iso = target_date.isoformat()
+
+        # Step 1: Find and click the dropdown trigger
+        dropdown_opened = await page.evaluate("""() => {
+            // Look for dropdown/calendar trigger buttons
+            // Common patterns: last item in date bar, element with calendar icon,
+            // element with "..." or dropdown arrow
+            const selectors = [
+                '[class*="dropdown"]', '[class*="more"]', '[class*="calendar"]',
+                '[class*="Dropdown"]', '[class*="More"]', '[class*="Calendar"]',
+                '[class*="picker"]', '[class*="Picker"]',
+                'select[class*="date"]', 'select[class*="day"]',
+            ];
+
+            for (const sel of selectors) {
+                try {
+                    const els = document.querySelectorAll(sel);
+                    for (const el of els) {
+                        if (el.closest('.date-cont')) continue;
+                        if (el.offsetHeight > 100 || el.offsetHeight < 5) continue;
+                        el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+                        return 'dropdown-' + sel;
+                    }
+                } catch(e) {}
+            }
+
+            // Also try: last small clickable element in the date bar area
+            // (before the first .date-cont)
+            const firstMovie = document.querySelector('.date-cont');
+            if (firstMovie) {
+                const allEls = document.querySelectorAll('a, button, [role="button"]');
+                const beforeMovie = [];
+                for (const el of allEls) {
+                    if (el.closest('.date-cont')) continue;
+                    const rect = el.getBoundingClientRect();
+                    const movieRect = firstMovie.getBoundingClientRect();
+                    if (rect.bottom < movieRect.top && rect.height < 80 && rect.height > 10) {
+                        beforeMovie.push(el);
+                    }
+                }
+                // Click the last element (likely the dropdown)
+                if (beforeMovie.length > 0) {
+                    const last = beforeMovie[beforeMovie.length - 1];
+                    last.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+                    return 'last-before-movies';
+                }
+            }
+
+            return null;
+        }""")
+
+        if not dropdown_opened:
+            return False
+
+        logger.debug(f"[Movieland] Opened date dropdown via {dropdown_opened}")
+        await asyncio.sleep(1)
+
+        # Step 2: Now look for the target date inside the opened dropdown/calendar
+        clicked = await page.evaluate("""(opts) => {
+            const { targetDay, targetStr, targetIso } = opts;
+
+            function realClick(el) {
+                el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+            }
+
+            // Look for newly visible elements (popover, dropdown, calendar)
+            const popoverSelectors = [
+                '[class*="popover"]', '[class*="dropdown-menu"]', '[class*="calendar"]',
+                '[class*="datepicker"]', '[class*="picker"]', '[class*="popup"]',
+                '[class*="Popover"]', '[class*="Dropdown"]', '[class*="Calendar"]',
+                '[class*="modal"]', '[class*="overlay"]',
+            ];
+
+            for (const sel of popoverSelectors) {
+                try {
+                    const containers = document.querySelectorAll(sel);
+                    for (const container of containers) {
+                        if (container.offsetHeight < 5) continue;
+                        // Look for clickable date elements inside
+                        const clickables = container.querySelectorAll('a, button, td, span, div, li');
+                        for (const el of clickables) {
+                            const text = el.textContent.trim();
+                            if (text === targetDay || text.includes(targetStr)) {
+                                realClick(el);
+                                return 'calendar-' + sel;
+                            }
+                        }
+                    }
+                } catch(e) {}
+            }
+
+            // Also try: any newly visible small element with the target day
+            const allSmall = document.querySelectorAll('td, [class*="day"], [class*="cell"]');
+            for (const el of allSmall) {
+                if (el.offsetHeight < 5 || el.offsetHeight > 60) continue;
+                const text = el.textContent.trim();
+                if (text === targetDay) {
+                    realClick(el);
+                    return 'calendar-cell';
+                }
+            }
+
+            return null;
+        }""", {
+            "targetDay": target_day,
+            "targetStr": target_str,
+            "targetIso": target_iso,
+        })
+
+        if clicked:
+            logger.info(f"[Movieland] Clicked date in dropdown for {target_date} via {clicked} "
+                        f"(branch: {binfo['name']})")
+            await asyncio.sleep(2)
+            return True
+
+        return False
+
+    async def _extract_event_ids(self, page: Page) -> set[str]:
+        """Extract eventID values from all order links on the current page."""
+        try:
+            ids = await page.evaluate("""() => {
+                const links = document.querySelectorAll('a[href*="/order/"]');
+                const ids = [];
+                for (const a of links) {
+                    const m = (a.getAttribute('href') || '').match(/eventID=([^&]+)/);
+                    if (m) ids.push(m[1]);
+                }
+                return ids;
+            }""")
+            return set(ids or [])
+        except Exception:
+            return set()
 
     async def _navigate_branch_calendar(self, page: Page, branch_url: str,
                                          binfo: dict, days: int = 7,
@@ -995,15 +1189,15 @@ class MovielandScraper(BaseScraper):
         """Scrape a branch page across multiple days.
 
         Approach (in priority order for each day):
-        1. Reload the branch URL with a date query parameter
-           (?date=DD/MM/YYYY or ?day=YYYY-MM-DD).
-        2. Click a date tab on the currently loaded page.
-        3. If neither works, log and continue to the next day (don't break).
+        1. Click a date tab/button on the branch page date bar.
+        2. Reload the branch URL with a date query parameter as fallback.
+        3. Validate navigation actually changed the page via eventID comparison.
         """
         all_movies: list[ScrapedMovie] = []
         all_screenings: list[ScrapedScreening] = []
         all_booking_items: list[dict] = []
         seen_titles: set[str] = set()
+        seen_screening_keys: set[str] = set()  # dedup safety: (movie_title, showtime)
 
         # First, scrape the current day (default view)
         movies, screenings, bookings = await self._scrape_branch_page(
@@ -1015,9 +1209,51 @@ class MovielandScraper(BaseScraper):
         for m in movies:
             seen_titles.add(m.title)
 
+        # Fingerprint day-0 for duplicate detection
+        day0_event_ids = await self._extract_event_ids(page)
+        for scr in screenings:
+            key = f"{scr.movie_title}|{scr.showtime}"
+            seen_screening_keys.add(key)
+
         day0_screening_count = len(screenings)
         logger.info(f"[Movieland] Branch '{binfo['name']}' day 0: "
-                    f"{len(movies)} movies, {day0_screening_count} screenings")
+                    f"{len(movies)} movies, {day0_screening_count} screenings, "
+                    f"{len(day0_event_ids)} unique eventIDs")
+
+        # Log date bar diagnostics once per branch
+        try:
+            date_bar_info = await page.evaluate("""() => {
+                const info = { elements: [], dateTexts: [] };
+                // Look for date-related navigation elements
+                const selectors = [
+                    '[class*="date"]', '[class*="day"]', '[class*="calendar"]',
+                    '[class*="swiper"]', '.days-bar', '.calendar-bar',
+                    '[class*="Date"]', '[class*="Day"]',
+                ];
+                for (const sel of selectors) {
+                    try {
+                        const els = document.querySelectorAll(sel);
+                        for (const el of els) {
+                            if (el.closest('.date-cont')) continue;
+                            if (el.offsetHeight > 200) continue;
+                            const text = el.textContent.trim().substring(0, 60);
+                            if (text.length > 0 && text.length < 60) {
+                                info.elements.push({
+                                    sel, tag: el.tagName,
+                                    cls: (el.className || '').substring(0, 80),
+                                    text, h: el.offsetHeight, w: el.offsetWidth,
+                                });
+                            }
+                        }
+                    } catch(e) {}
+                }
+                return info;
+            }""")
+            if date_bar_info and date_bar_info.get("elements"):
+                logger.info(f"[Movieland] Date bar elements for {binfo['name']}: "
+                            f"{date_bar_info['elements'][:10]}")
+        except Exception as e:
+            logger.debug(f"[Movieland] Date bar diagnostics failed: {e}")
 
         # Try to navigate to subsequent days
         consecutive_empty = 0
@@ -1027,36 +1263,52 @@ class MovielandScraper(BaseScraper):
             try:
                 navigated = False
 
-                # Method 1: URL with date parameter
-                for date_param_fmt in [
-                    ("date", target_date.strftime("%d/%m/%Y")),
-                    ("date", target_date.strftime("%Y-%m-%d")),
-                    ("day", target_date.strftime("%Y-%m-%d")),
-                ]:
-                    param_name, param_val = date_param_fmt
-                    sep = "&" if "?" in branch_url else "?"
-                    day_url = f"{branch_url}{sep}{param_name}={param_val}"
-                    try:
-                        await self._open_url(page, day_url, wait_for_network=True)
-                        # Check if page has movie content
-                        has_content = await page.evaluate(
-                            "() => document.querySelectorAll('.date-cont').length > 0 "
-                            "|| document.querySelectorAll('a[href*=\"/order/\"]').length > 0"
-                        )
-                        if has_content:
-                            navigated = True
-                            logger.info(f"[Movieland] Day {day_offset} via URL param "
-                                        f"{param_name}={param_val}")
-                            break
-                    except Exception:
-                        continue
-
-                # Method 2: Click date tab on the branch page
-                if not navigated:
-                    # Make sure we're on the branch page
-                    if branch_url not in page.url:
+                # Method 1: Click date tab on the branch page (preferred)
+                # Make sure we're on the branch page
+                try:
+                    current_url = page.url
+                    if 'movieland.co.il' not in current_url:
                         await self._open_url(page, branch_url, wait_for_network=True)
-                    navigated = await self._click_date_tab(page, target_date, binfo)
+                        await asyncio.sleep(1)
+                except Exception:
+                    await self._open_url(page, branch_url, wait_for_network=True)
+                    await asyncio.sleep(1)
+
+                navigated = await self._click_date_tab(page, target_date, binfo)
+
+                if navigated:
+                    # Validate: check that eventIDs actually changed
+                    new_event_ids = await self._extract_event_ids(page)
+                    if new_event_ids and new_event_ids == day0_event_ids:
+                        logger.debug(f"[Movieland] Date tab click for day {day_offset} "
+                                     f"did not change content (same eventIDs), treating as failed")
+                        navigated = False
+
+                # Method 2: URL with date parameter (fallback)
+                if not navigated:
+                    for date_param_fmt in [
+                        ("date", target_date.strftime("%d/%m/%Y")),
+                        ("date", target_date.strftime("%Y-%m-%d")),
+                        ("day", target_date.strftime("%Y-%m-%d")),
+                    ]:
+                        param_name, param_val = date_param_fmt
+                        sep = "&" if "?" in branch_url else "?"
+                        day_url = f"{branch_url}{sep}{param_name}={param_val}"
+                        try:
+                            await self._open_url(page, day_url, wait_for_network=True)
+                            # Validate: eventIDs must differ from day 0
+                            new_event_ids = await self._extract_event_ids(page)
+                            has_content = len(new_event_ids) > 0
+                            is_different = new_event_ids != day0_event_ids
+
+                            if has_content and is_different:
+                                navigated = True
+                                logger.info(f"[Movieland] Day {day_offset} via URL param "
+                                            f"{param_name}={param_val} "
+                                            f"({len(new_event_ids)} eventIDs)")
+                                break
+                        except Exception:
+                            continue
 
                 if not navigated:
                     logger.debug(f"[Movieland] Could not navigate to day {day_offset} "
@@ -1097,11 +1349,23 @@ class MovielandScraper(BaseScraper):
                         seen_titles.add(m.title)
                         all_movies.append(m)
 
-                all_screenings.extend(day_screenings)
+                # Dedup screenings: skip if (movie_title, showtime) already seen
+                new_count = 0
+                for scr in day_screenings:
+                    key = f"{scr.movie_title}|{scr.showtime}"
+                    if key not in seen_screening_keys:
+                        seen_screening_keys.add(key)
+                        all_screenings.append(scr)
+                        new_count += 1
+                    else:
+                        logger.debug(f"[Movieland] Skipping duplicate screening: {key}")
+
                 all_booking_items.extend(day_bookings)
 
                 logger.info(f"[Movieland] Branch '{binfo['name']}' day {day_offset} "
-                            f"({target_date}): {len(day_screenings)} screenings")
+                            f"({target_date}): {new_count} new screenings"
+                            + (f" ({len(day_screenings) - new_count} duplicates skipped)"
+                               if new_count < len(day_screenings) else ""))
 
             except Exception as e:
                 logger.debug(f"[Movieland] Calendar navigation failed for day {day_offset}: {e}")
@@ -1131,10 +1395,8 @@ class MovielandScraper(BaseScraper):
 
         seat_data = await page.evaluate("""() => {
             // ===== METHOD A: IMAGE-BASED DETECTION (Movieland specific) =====
-            const imgTotal = { count: 0 };
-            const imgSold = { count: 0 };
-            const imgSoldPositions = [];
-            const imgSamples = [];
+            // Phase 1: Collect all seat candidates into an array
+            const imgCandidates = [];
             const seen = new Set();
 
             const images = document.querySelectorAll('image, [style*="mvl-seat"]');
@@ -1155,28 +1417,15 @@ class MovielandScraper(BaseScraper):
                 if (seen.has(posKey)) continue;
                 seen.add(posKey);
 
-                imgTotal.count++;
-
-                const isSold = src.includes('/unavailable/');
-                const isAvail = src.includes('/available/');
-
-                if (isSold) {
-                    imgSold.count++;
-                    imgSoldPositions.push([Math.round(bbox.left / 5), Math.round(bbox.top / 5)]);
-                }
-
-                if (imgSamples.length < 15) {
-                    imgSamples.push({
-                        tag: el.tagName,
-                        href: href.substring(0, 80),
-                        bgImg: bgImg.substring(0, 80),
-                        w: Math.round(bbox.width),
-                        h: Math.round(bbox.height),
-                        x: Math.round(bbox.left),
-                        y: Math.round(bbox.top),
-                        status: isSold ? 'sold' : (isAvail ? 'available' : 'unknown'),
-                    });
-                }
+                imgCandidates.push({
+                    top: bbox.top, left: bbox.left,
+                    width: bbox.width, height: bbox.height,
+                    isSold: src.includes('/unavailable/'),
+                    isAvail: src.includes('/available/'),
+                    tag: el.tagName,
+                    href: href.substring(0, 80),
+                    bgImg: bgImg.substring(0, 80),
+                });
             }
 
             // Also check all elements for background-image containing mvl-seat
@@ -1194,24 +1443,58 @@ class MovielandScraper(BaseScraper):
                 if (seen.has(posKey)) continue;
                 seen.add(posKey);
 
-                imgTotal.count++;
+                imgCandidates.push({
+                    top: bbox.top, left: bbox.left,
+                    width: bbox.width, height: bbox.height,
+                    isSold: bgImg.includes('/unavailable/'),
+                    isAvail: !bgImg.includes('/unavailable/'),
+                    tag: el.tagName,
+                    href: '',
+                    bgImg: bgImg.substring(0, 80),
+                });
+            }
 
-                const isSold = bgImg.includes('/unavailable/');
-                if (isSold) {
-                    imgSold.count++;
-                    imgSoldPositions.push([Math.round(bbox.left / 5), Math.round(bbox.top / 5)]);
+            // Phase 2: Legend exclusion via Y-position gap
+            const ys = imgCandidates.map(c => c.top).sort((a, b) => a - b);
+            let maxGap = 0, gapY = Infinity;
+            for (let i = 1; i < ys.length; i++) {
+                const gap = ys[i] - ys[i - 1];
+                if (gap > maxGap) { maxGap = gap; gapY = ys[i]; }
+            }
+            const cutoffY = maxGap > 150 ? gapY : Infinity;
+
+            // Phase 3: Count seats, excluding legend elements below cutoff
+            let imgTotalCount = 0, imgSoldCount = 0, cutByLegend = 0;
+            const imgSoldPositions = [];
+            const imgSamples = [];
+            const imgExcludedSample = [];
+
+            for (const c of imgCandidates) {
+                if (c.top >= cutoffY) {
+                    cutByLegend++;
+                    if (imgExcludedSample.length < 5) {
+                        imgExcludedSample.push({
+                            tag: c.tag, y: Math.round(c.top),
+                            x: Math.round(c.left), reason: 'legend_cutoff',
+                        });
+                    }
+                    continue;
                 }
-
+                imgTotalCount++;
+                if (c.isSold) {
+                    imgSoldCount++;
+                    imgSoldPositions.push([Math.round(c.left / 5), Math.round(c.top / 5)]);
+                }
                 if (imgSamples.length < 15) {
                     imgSamples.push({
-                        tag: el.tagName,
-                        href: '',
-                        bgImg: bgImg.substring(0, 80),
-                        w: Math.round(bbox.width),
-                        h: Math.round(bbox.height),
-                        x: Math.round(bbox.left),
-                        y: Math.round(bbox.top),
-                        status: isSold ? 'sold' : 'available',
+                        tag: c.tag,
+                        href: c.href,
+                        bgImg: c.bgImg,
+                        w: Math.round(c.width),
+                        h: Math.round(c.height),
+                        x: Math.round(c.left),
+                        y: Math.round(c.top),
+                        status: c.isSold ? 'sold' : (c.isAvail ? 'available' : 'unknown'),
                     });
                 }
             }
@@ -1274,10 +1557,14 @@ class MovielandScraper(BaseScraper):
 
             return {
                 imageMethod: {
-                    total: imgTotal.count,
-                    sold: imgSold.count,
+                    total: imgTotalCount,
+                    sold: imgSoldCount,
                     soldPositions: imgSoldPositions,
                     samples: imgSamples,
+                    cutByLegend,
+                    cutoffY: cutoffY === Infinity ? 'none' : Math.round(cutoffY),
+                    maxGap: Math.round(maxGap),
+                    excludedSample: imgExcludedSample,
                 },
                 classMethod: {
                     total: classTotal,
@@ -1300,12 +1587,13 @@ class MovielandScraper(BaseScraper):
             pass
 
         # ── Annotate seats for visual debugging ──────────────────────
-        # Add colored borders: green=available, red=sold, orange=unknown
+        # Add colored borders: green=available, red=sold, blue=legend, orange=unknown
         try:
             await page.evaluate("""() => {
                 const seen = new Set();
+                const candidates = [];
 
-                // Find all mvl-seat image elements
+                // Collect all mvl-seat image elements
                 const images = document.querySelectorAll('image, [style*="mvl-seat"]');
                 for (const el of images) {
                     const href = el.getAttribute('href')
@@ -1324,17 +1612,13 @@ class MovielandScraper(BaseScraper):
                     if (seen.has(posKey)) continue;
                     seen.add(posKey);
 
-                    const isSold = src.includes('/unavailable/');
-                    const isAvail = src.includes('/available/');
-                    const borderColor = isSold ? '#ff0000' : (isAvail ? '#00ff00' : '#ff8800');
-
-                    const div = document.createElement('div');
-                    div.style.cssText = `position:fixed;left:${bbox.left}px;top:${bbox.top}px;`
-                        + `width:${bbox.width}px;height:${bbox.height}px;`
-                        + `border:2px solid ${borderColor};`
-                        + `pointer-events:none;z-index:99999;box-sizing:border-box;`;
-                    div.className = '_mvl_seat_debug_overlay';
-                    document.body.appendChild(div);
+                    candidates.push({
+                        top: bbox.top, left: bbox.left,
+                        width: bbox.width, height: bbox.height,
+                        isSold: src.includes('/unavailable/'),
+                        isAvail: src.includes('/available/'),
+                        type: 'img',
+                    });
                 }
 
                 // Also check background-image elements
@@ -1352,12 +1636,34 @@ class MovielandScraper(BaseScraper):
                     if (seen.has(posKey)) continue;
                     seen.add(posKey);
 
-                    const isSold = bgImg.includes('/unavailable/');
-                    const borderColor = isSold ? '#ff0000' : '#00ff00';
+                    candidates.push({
+                        top: bbox.top, left: bbox.left,
+                        width: bbox.width, height: bbox.height,
+                        isSold: bgImg.includes('/unavailable/'),
+                        isAvail: !bgImg.includes('/unavailable/'),
+                        type: 'bg',
+                    });
+                }
 
+                // Compute legend cutoff (same Y-gap algorithm as counting)
+                const ys = candidates.map(c => c.top).sort((a, b) => a - b);
+                let maxGap = 0, gapY = Infinity;
+                for (let i = 1; i < ys.length; i++) {
+                    const gap = ys[i] - ys[i - 1];
+                    if (gap > maxGap) { maxGap = gap; gapY = ys[i]; }
+                }
+                const cutoffY = maxGap > 150 ? gapY : Infinity;
+
+                // Draw overlays with legend elements in blue
+                for (const c of candidates) {
+                    const isLegend = c.top >= cutoffY;
+                    const borderColor = isLegend ? '#0088ff'
+                        : c.isSold ? '#ff0000'
+                        : c.isAvail ? '#00ff00'
+                        : '#ff8800';
                     const div = document.createElement('div');
-                    div.style.cssText = `position:fixed;left:${bbox.left}px;top:${bbox.top}px;`
-                        + `width:${bbox.width}px;height:${bbox.height}px;`
+                    div.style.cssText = `position:fixed;left:${c.left}px;top:${c.top}px;`
+                        + `width:${c.width}px;height:${c.height}px;`
                         + `border:2px solid ${borderColor};`
                         + `pointer-events:none;z-index:99999;box-sizing:border-box;`;
                     div.className = '_mvl_seat_debug_overlay';
@@ -1430,6 +1736,13 @@ class MovielandScraper(BaseScraper):
                 f"{cls.get('sold', 0)} sold"
                 + (f" | Hall: {hall_from_page}" if hall_from_page else "")
             )
+            if img.get("cutByLegend", 0) > 0:
+                logger.info(
+                    f"[Movieland] Legend filter: excluded {img['cutByLegend']} seats "
+                    f"(cutoffY={img.get('cutoffY', '?')}, maxGap={img.get('maxGap', '?')})"
+                )
+                if img.get("excludedSample"):
+                    logger.debug(f"[Movieland] Excluded by legend: {img['excludedSample']}")
 
             img_total = img.get("total", 0)
             class_total = cls.get("total", 0)
