@@ -270,12 +270,9 @@ async def run_initial_scrape(db: Session):
         screenings = await scraper.scrape_screenings(on_progress=progress_cb)
         _upsert_screenings(db, chain, screenings)
 
-        # Run ticket updates to get real seat counts (saved incrementally)
-        screening_cb, hall_data = _make_screening_callback(db, chain, log)
-        ticket_screenings = await scraper.scrape_ticket_updates(
-            on_progress=progress_cb, on_screening_update=screening_cb,
-        )
-        _finalize_blocked_seats(db, hall_data)
+        # Skip ticket updates on initial scrape - they are very slow (clicks
+        # each showtime individually). The scheduled ticket job will pick them
+        # up shortly after startup.
 
         duration = (datetime.utcnow() - start).total_seconds()
         log.status = "success"
@@ -320,12 +317,8 @@ async def run_movieland_initial_scrape(db: Session):
         screenings = await scraper.scrape_screenings(on_progress=progress_cb)
         _upsert_screenings(db, chain, screenings)
 
-        # Run ticket updates to get real seat counts
-        screening_cb, hall_data = _make_screening_callback(db, chain, log)
-        await scraper.scrape_ticket_updates(
-            on_progress=progress_cb, on_screening_update=screening_cb,
-        )
-        _finalize_blocked_seats(db, hall_data)
+        # Skip ticket updates on initial scrape - they are very slow.
+        # The scheduled ticket job will pick them up shortly after startup.
 
         duration = (datetime.utcnow() - start).total_seconds()
         log.status = "success"
