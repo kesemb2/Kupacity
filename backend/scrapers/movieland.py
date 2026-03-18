@@ -770,6 +770,7 @@ class MovielandScraper(BaseScraper):
             logger.info(f"[Movieland] Strategy 2 (CSS selectors): {len(movies)} movies, {len(screenings)} screenings")
 
         # ── Fallback: scan ALL links on the page for booking URLs ────
+        all_page_links = await page.query_selector_all('a[href]')
         if collect_booking_urls and not booking_items:
             for link in all_page_links:
                 try:
@@ -1405,7 +1406,25 @@ class MovielandScraper(BaseScraper):
         sold = 0
         sold_positions = []
 
-        await asyncio.sleep(1.5)  # wait for SPA to render seat map (reduced from 3s)
+        # Wait for Angular SPA to render seat elements (up to 12s)
+        for _wait in range(24):
+            has_seats = await page.evaluate("""() => {
+                // Check for Movieland seat images
+                const imgs = document.querySelectorAll('image[href*="mvl-seat"], [style*="mvl-seat"]');
+                if (imgs.length > 0) return true;
+                // Check for any seat-like elements
+                const seats = document.querySelectorAll('[class*="seat"]');
+                if (seats.length > 5) return true;
+                // Check if app-root has rendered content (not just loading spinner)
+                const appRoot = document.querySelector('app-root');
+                if (appRoot && appRoot.children.length > 1) return true;
+                return false;
+            }""")
+            if has_seats:
+                break
+            await asyncio.sleep(0.5)
+        else:
+            logger.warning(f"[Movieland] Seat elements did not appear after 12s wait")
 
         seat_data = await page.evaluate("""() => {
             // ===== METHOD A: IMAGE-BASED DETECTION (Movieland specific) =====
