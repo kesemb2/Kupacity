@@ -64,6 +64,7 @@ MOVIELAND_BRANCHES = {
         "city": "Tel Aviv",
         "city_he": "תל אביב",
         "slug": "tel-aviv",
+        "aliases": ["הצוק", "ת\"א", "ת״א"],
     },
     "netanya": {
         "name": "Movieland Netanya",
@@ -107,6 +108,21 @@ _BRANCH_NAME_MAP: dict[str, dict] = {}
 for _bid, _binfo in MOVIELAND_BRANCHES.items():
     _BRANCH_NAME_MAP[_binfo["city_he"]] = _binfo
     _BRANCH_NAME_MAP[_binfo["name_he"]] = _binfo
+
+# Alternative names used on the Movieland website
+_BRANCH_NAME_MAP["הצוק"] = MOVIELAND_BRANCHES["tel_aviv"]
+_BRANCH_NAME_MAP["ת\"א"] = MOVIELAND_BRANCHES["tel_aviv"]
+_BRANCH_NAME_MAP["ת״א"] = MOVIELAND_BRANCHES["tel_aviv"]
+
+
+def _branch_matches(binfo: dict, text: str) -> bool:
+    """Check if text matches a branch by city_he or aliases."""
+    if binfo["city_he"] in text:
+        return True
+    for alias in binfo.get("aliases", []):
+        if alias in text:
+            return True
+    return False
 
 
 def _resolve_cinema(text: str) -> tuple[str, str]:
@@ -329,9 +345,8 @@ class MovielandScraper(BaseScraper):
                 for bid, binfo in MOVIELAND_BRANCHES.items():
                     if bid in branch_urls:
                         continue
-                    city_he = binfo["city_he"]
-                    # Match by URL containing city name or by link text
-                    if city_he in href or city_he in text:
+                    # Match by URL or link text containing city name or alias
+                    if _branch_matches(binfo, href) or _branch_matches(binfo, text):
                         if self._is_junk_link(href):
                             continue
                         if href.startswith("/"):
@@ -349,8 +364,7 @@ class MovielandScraper(BaseScraper):
                 if bid in branch_urls:
                     continue
                 # Check if this theater link matches a branch
-                city_he = binfo["city_he"]
-                if city_he in href or city_he in text:
+                if _branch_matches(binfo, href) or _branch_matches(binfo, text):
                     branch_urls[bid] = href
                     logger.info(f"[Movieland] Found branch URL via /theater/: {binfo['name']} -> {href}")
 
@@ -402,8 +416,7 @@ class MovielandScraper(BaseScraper):
                             for bid, binfo in MOVIELAND_BRANCHES.items():
                                 if bid in branch_urls:
                                     continue
-                                city_he = binfo["city_he"]
-                                if city_he in href or city_he in text:
+                                if _branch_matches(binfo, href) or _branch_matches(binfo, text):
                                     if href.startswith("/"):
                                         href = f"{BASE_URL}{href}"
                                     if href.startswith("http") and "movieland.co.il" in href:
