@@ -33,8 +33,8 @@ cinema/
 │   ├── seed_data.py            # Seeds Hot Cinema chain + 10 branches
 │   │
 │   ├── models/
-│   │   └── models.py           # 5 ORM models: CinemaChain, Cinema, Movie,
-│   │                           #   Screening, ScrapeLog
+│   │   └── models.py           # 7 ORM models: CinemaChain, Cinema, Movie,
+│   │                           #   Screening, TicketSnapshot, HallSeatStats, ScrapeLog
 │   │
 │   ├── api/
 │   │   └── routes.py           # All REST API endpoints (/api/*)
@@ -128,6 +128,30 @@ Engine: SQLite with WAL mode, check_same_thread=False, timeout=30s
   created_at    DATETIME default=utcnow
   → relationships: movie (→ Movie), cinema (→ Cinema)
 
+--- TABLE: ticket_snapshots ---
+  id            INTEGER  PK, auto-increment
+  screening_id  INTEGER  FK → screenings.id, NOT NULL
+  tickets_sold  INTEGER  default=0
+  total_seats   INTEGER  default=0
+  recorded_at   DATETIME default=utcnow
+  → relationship: screening (→ Screening)
+  Purpose: Historical record of ticket sales progression over time.
+           A new snapshot is created each time the scraper detects a change
+           in tickets_sold for an existing screening.
+
+--- TABLE: hall_seat_stats ---
+  id                INTEGER  PK, auto-increment
+  cinema_id         INTEGER  FK → cinemas.id, NOT NULL
+  hall              STRING   NOT NULL
+  scan_count        INTEGER  default=0
+  seat_sold_counts  STRING   default="{}"   (JSON: {"x,y": count})
+  blocked_seats     STRING   default="[]"   (JSON: ["x,y", ...])
+  blocked_count     INTEGER  default=0
+  updated_at        DATETIME default=utcnow
+  → relationship: cinema (→ Cinema)
+  → constraint: UNIQUE(cinema_id, hall)
+  Purpose: Tracks per-seat sell frequency to identify permanently blocked seats.
+
 --- TABLE: scrape_logs ---
   id                INTEGER  PK, auto-increment
   chain_name        STRING   NOT NULL  (e.g. "Hot Cinema")
@@ -174,6 +198,7 @@ CITIES:
 ANALYTICS:
   GET /api/analytics/tickets-by-date?days=14
     → [{ date, tickets_sold, screenings_count }]
+    days=0 returns all-time data (no time filter)
 
   GET /api/analytics/tickets-by-branch
     → [{ name, city, tickets_sold, screenings_count }]
@@ -183,6 +208,12 @@ ANALYTICS:
 
   GET /api/analytics/occupancy-by-format
     → [{ format, screenings_count, avg_occupancy, total_tickets }]
+
+  GET /api/analytics/movie-lifetime/{movie_id}
+    → { movie_id, title, title_he, total_tickets_sold, total_seats,
+        total_screenings, avg_occupancy, first_screening, last_screening,
+        by_date: [{ date, tickets_sold, screenings_count }] }
+    All-time stats for a movie across its entire cinema run.
 
 SCRAPING:
   POST /api/scrape/trigger
@@ -298,6 +329,7 @@ Helper Functions:
   _upsert_screenings(db, chain, screenings)
     - Creates cinema/movie if needed
     - Updates existing screening only if total_seats > 0 (real seat data)
+    - Records a TicketSnapshot when tickets_sold changes on an existing screening
     - Otherwise creates new screening record
   _make_progress_callback(db, log) → callback function
     - Updates ScrapeLog.progress JSON field in real-time
@@ -482,7 +514,9 @@ DATA FLOW
 ENVIRONMENT VARIABLES
 ================================================================================
 
-Backend (optional):
+Backend:
+  DATA_DIR                - Directory for SQLite database file
+                            (default: ./data, set to /app/data in Docker)
   SCRAPER_PROXY_SERVER    - Proxy URL for Playwright (http://host:port)
   SCRAPER_PROXY_USERNAME  - Proxy authentication username
   SCRAPER_PROXY_PASSWORD  - Proxy authentication password
@@ -497,6 +531,7 @@ KEY DESIGN DECISIONS
 
 1. SQLite (not Postgres): Lightweight, zero-config, single-file DB
    WAL mode enabled for concurrent read/write
+   Database stored in Docker volume (cinema-data) for persistence across rebuilds
 2. Playwright (not Selenium): Better stealth, built-in browser management
 3. Seat counting via color parsing: Hot Cinema has no API for ticket counts,
    so the scraper reads the seat map UI and counts colored seats

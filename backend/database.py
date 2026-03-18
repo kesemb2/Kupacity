@@ -1,7 +1,12 @@
+import os
+
 from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker, declarative_base
 
-DATABASE_URL = "sqlite:///./cinema.db"
+# Store DB in a persistent directory (mounted as Docker volume)
+DATA_DIR = os.environ.get("DATA_DIR", "./data")
+os.makedirs(DATA_DIR, exist_ok=True)
+DATABASE_URL = f"sqlite:///{DATA_DIR}/cinema.db"
 
 engine = create_engine(
     DATABASE_URL,

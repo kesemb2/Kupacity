@@ -17,7 +17,7 @@ import logging
 from datetime import datetime, timedelta
 from sqlalchemy.orm import Session
 
-from models.models import CinemaChain, Cinema, Movie, Screening, ScrapeLog, HallSeatStats
+from models.models import CinemaChain, Cinema, Movie, Screening, ScrapeLog, HallSeatStats, TicketSnapshot
 from scrapers.base import BaseScraper, ScrapedMovie, ScrapedScreening
 from scrapers.hot_cinema import HotCinemaScraper, HOT_CINEMA_BRANCHES
 from scrapers.movieland import MovielandScraper, MOVIELAND_BRANCHES
@@ -155,6 +155,13 @@ def _upsert_screenings(db: Session, chain: CinemaChain, screenings: list[Scraped
             # Only update seat data if the new scrape has real data
             # (total_seats > 0 means seat map was successfully read)
             if ss.total_seats > 0:
+                if ss.tickets_sold != existing.tickets_sold:
+                    snapshot = TicketSnapshot(
+                        screening_id=existing.id,
+                        tickets_sold=ss.tickets_sold,
+                        total_seats=ss.total_seats,
+                    )
+                    db.add(snapshot)
                 existing.tickets_sold = ss.tickets_sold
                 existing.total_seats = ss.total_seats
             existing.scraped_at = datetime.utcnow()

@@ -83,6 +83,19 @@ class Screening(Base):
     cinema = relationship("Cinema", back_populates="screenings")
 
 
+class TicketSnapshot(Base):
+    """צילום מצב של מכירת כרטיסים - לשמירת היסטוריה לאורך זמן"""
+    __tablename__ = "ticket_snapshots"
+
+    id = Column(Integer, primary_key=True, index=True)
+    screening_id = Column(Integer, ForeignKey("screenings.id"), nullable=False)
+    tickets_sold = Column(Integer, default=0)
+    total_seats = Column(Integer, default=0)
+    recorded_at = Column(DateTime, default=datetime.utcnow)
+
+    screening = relationship("Screening")
+
+
 class HallSeatStats(Base):
     """מעקב אחר תדירות מכירה לכל מושב - לזיהוי מושבים חסומים לצמיתות"""
     __tablename__ = "hall_seat_stats"

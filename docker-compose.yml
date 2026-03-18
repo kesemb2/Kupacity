@@ -5,6 +5,9 @@ services:
       - "8000:8000"
     environment:
       - PORT=8000
+      - DATA_DIR=/app/data
+    volumes:
+      - cinema-data:/app/data
 
   frontend:
     build: ./frontend
@@ -12,3 +15,6 @@ services:
       - "3000:80"
     depends_on:
       - backend
+
+volumes:
+  cinema-data:

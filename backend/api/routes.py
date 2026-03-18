@@ -8,7 +8,7 @@ from typing import Optional
 from datetime import datetime, timedelta
 
 from database import get_db, SessionLocal
-from models.models import CinemaChain, Cinema, Movie, Screening, ScrapeLog
+from models.models import CinemaChain, Cinema, Movie, Screening, ScrapeLog, TicketSnapshot
 
 router = APIRouter(prefix="/api")
 logger = logging.getLogger(__name__)
@@ -249,15 +249,17 @@ def get_cities(db: Session = Depends(get_db)):
 
 @router.get("/analytics/tickets-by-date")
 def get_tickets_by_date(days: int = Query(default=14), db: Session = Depends(get_db)):
-    """כרטיסים לפי תאריך"""
-    cutoff = datetime.now() - timedelta(days=days)
+    """כרטיסים לפי תאריך. days=0 מחזיר את כל ההיסטוריה"""
+    query = db.query(
+        func.date(Screening.showtime).label("date"),
+        func.sum(Screening.tickets_sold).label("tickets"),
+        func.count(Screening.id).label("screenings"),
+    )
+    if days > 0:
+        cutoff = datetime.now() - timedelta(days=days)
+        query = query.filter(Screening.showtime >= cutoff)
     results = (
-        db.query(
-            func.date(Screening.showtime).label("date"),
-            func.sum(Screening.tickets_sold).label("tickets"),
-            func.count(Screening.id).label("screenings"),
-        )
-        .filter(Screening.showtime >= cutoff)
+        query
         .group_by(func.date(Screening.showtime))
         .order_by("date")
         .all()
@@ -679,3 +681,52 @@ def get_scrape_logs(limit: int = Query(default=20), db: Session = Depends(get_db
         }
         for log in logs
     ]
+
+
+@router.get("/analytics/movie-lifetime/{movie_id}")
+def get_movie_lifetime(movie_id: int, db: Session = Depends(get_db)):
+    """סטטיסטיקות מלאות של סרט לאורך כל חייו בקולנוע"""
+    movie = db.query(Movie).filter(Movie.id == movie_id).first()
+    if not movie:
+        return {"error": "Movie not found"}
+
+    screenings = (
+        db.query(Screening)
+        .filter(Screening.movie_id == movie_id)
+        .all()
+    )
+
+    total_tickets = sum(s.tickets_sold or 0 for s in screenings)
+    total_seats = sum(s.total_seats or 0 for s in screenings)
+    showtimes = [s.showtime for s in screenings if s.showtime]
+    first_screening = min(showtimes).isoformat() if showtimes else None
+    last_screening = max(showtimes).isoformat() if showtimes else None
+
+    # פירוט לפי תאריך
+    by_date = (
+        db.query(
+            func.date(Screening.showtime).label("date"),
+            func.sum(Screening.tickets_sold).label("tickets"),
+            func.count(Screening.id).label("screenings"),
+        )
+        .filter(Screening.movie_id == movie_id)
+        .group_by(func.date(Screening.showtime))
+        .order_by("date")
+        .all()
+    )
+
+    return {
+        "movie_id": movie.id,
+        "title": movie.title,
+        "title_he": movie.title_he,
+        "total_tickets_sold": total_tickets,
+        "total_seats": total_seats,
+        "total_screenings": len(screenings),
+        "avg_occupancy": round(total_tickets * 100 / total_seats, 1) if total_seats > 0 else 0,
+        "first_screening": first_screening,
+        "last_screening": last_screening,
+        "by_date": [
+            {"date": str(d), "tickets_sold": t or 0, "screenings_count": s}
+            for d, t, s in by_date
+        ],
+    }
