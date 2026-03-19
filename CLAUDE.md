@@ -1,4 +1,4 @@
-# Kupacity - Israel Cinema Seat Analytics
+# Kupacity - Israel Cinema Seat Analytics (v1.3.0)
 
 > כל הכיסאות בפריים אחד
 
@@ -6,10 +6,10 @@ Real-time cinema seat/ticket analytics for Israeli cinema chains. Scrapes screen
 
 ## Tech Stack
 
-- **Backend**: Python 3 / FastAPI 0.115.6 / SQLAlchemy 2.0.36 / SQLite (WAL mode)
+- **Backend**: Python 3.11 / FastAPI 0.115.6 / SQLAlchemy 2.0.36 / SQLite (WAL mode)
 - **Scraping**: Playwright headless Chromium (with playwright-stealth)
-- **Scheduling**: APScheduler (AsyncIOScheduler)
-- **Frontend**: React 18 / Recharts / Axios
+- **Scheduling**: APScheduler 3.11.0 (AsyncIOScheduler)
+- **Frontend**: React 18.3 / Recharts 2.15 / Axios 1.7
 - **Deploy**: Docker Compose (backend:8000, frontend:3000→80 via nginx)
 - **Hosting**: Render (backend URL: cinema-back-kjkx.onrender.com)
 
@@ -31,7 +31,7 @@ docker-compose up --build
 ## Project Structure
 
 ```
-cinema/
+Kupacity/
 ├── docker-compose.yml          # backend:8000 + frontend:3000→80
 ├── CLAUDE.md                   # This file
 ├── README.md                   # Project overview
@@ -40,12 +40,12 @@ cinema/
 │   ├── main.py                 # FastAPI app, lifespan, APScheduler config
 │   ├── database.py             # SQLAlchemy engine, SessionLocal, SQLite WAL
 │   ├── seed_data.py            # Seeds Hot Cinema chain + 10 branches on first run
-│   ├── models/models.py        # 7 ORM models (see below)
+│   ├── models/models.py        # 8 ORM models (see below)
 │   ├── api/routes.py           # All REST API endpoints under /api/
 │   └── scrapers/
 │       ├── base.py             # BaseScraper ABC, ScrapedMovie, ScrapedScreening
-│       ├── hot_cinema.py       # Hot Cinema scraper (Playwright, ~1800 lines)
-│       ├── movieland.py        # Movieland scraper (Playwright, ~1600 lines)
+│       ├── hot_cinema.py       # Hot Cinema scraper (Playwright, ~2020 lines)
+│       ├── movieland.py        # Movieland scraper (Playwright, ~2240 lines)
 │       ├── cinema_city.py      # Cinema City / Yes Planet (REST API)
 │       ├── lev_cinema.py       # Lev Cinema (HTML parsing)
 │       ├── globus_max.py       # Globus Max (REST API)
@@ -62,7 +62,8 @@ cinema/
         │   ├── CinemasPage.js  # Cinema branches list
         │   ├── CitiesPage.js   # City-level analytics
         │   ├── AnalyticsPage.js # Advanced analytics
-        │   └── ScrapePage.js   # Trigger scrape, progress bar, logs, debug screenshots
+        │   ├── ScrapePage.js   # Trigger scrape, progress bar, logs, debug screenshots
+        │   └── AdminPage.js    # Allowed movies whitelist management
         └── components/
             ├── StatCard.js     # Metric display card
             ├── ChartCard.js    # Chart wrapper
@@ -79,6 +80,7 @@ cinema/
 | `Screening` | `screenings` | הקרנה - showtime, hall, format, language, tickets_sold, total_seats, blocked_seats_excluded, status (active/closed) |
 | `TicketSnapshot` | `ticket_snapshots` | Historical ticket count snapshots per screening |
 | `HallSeatStats` | `hall_seat_stats` | Per-hall seat frequency tracking for blocked seat learning. UNIQUE(cinema_id, hall) |
+| `AllowedMovie` | `allowed_movies` | סרט מאושר - whitelist of movies to track. UNIQUE(title). Has title_normalized + is_active flag |
 | `ScrapeLog` | `scrape_logs` | Scrape run log with progress JSON for live UI updates |
 
 ## Scraper Architecture
@@ -91,6 +93,7 @@ cinema/
 - Ticket pages: `tickets.hotcinema.co.il/site/{id}`
 - Screening discovery: Intercepts the `/tickets/movieevents` API (JSON) for each movie, iterating over 7 days via date parameter
 - Seat counting: Playwright navigates to booking page SVG seat map, counts seats by image href (`/available/` vs `/unavailable/`) and color analysis
+- Seat map batching: Processes screenings in batches of 25 with SEAT_POOL_SIZE=3 concurrent pages per batch
 
 **Movieland** (מובילנד) - 5 branches:
 - Tel Aviv, Netanya, Haifa, Karmiel, Afula
@@ -98,7 +101,8 @@ cinema/
 - Booking: `ecom.biggerpicture.ai` (BiggerPicture platform)
 - Branch page structure: `.date-cont` containers hold movies, each with `a.bg-theater-c` (title), `.bg-genre` (genre/duration), `a[href*="/order/"]` (screening links with `eventID`)
 - Seat counting: Image href matching `/mvl-seat/(available|unavailable)/` on BiggerPicture seat map pages
-- Date navigation: URL-based (?date=) + JS date tab clicking. Branch URLs have fallback_urls in MOVIELAND_BRANCHES dict
+- Date navigation: URL-based (?date=) + JS date tab clicking + dropdown/calendar for days 3+. Branch URLs have fallback_urls in MOVIELAND_BRANCHES dict
+- Both `scrape_screenings` and `scrape_ticket_updates` use `_navigate_branch_calendar(days=7)` to cover the full week
 
 ### Inactive Scrapers (code exists but not scheduled)
 
@@ -106,12 +110,12 @@ cinema/
 - **Lev Cinema**: HTML parsing with BeautifulSoup
 - **Globus Max**: REST API at `/api/screenings/{branch_id}?date=...`
 
-### Scraper Pipeline (3 phases)
+### Scraper Pipeline (4 phases)
 
 ```
 Phase 1 - Weekly (Sun):    scrape_movies()           → movie catalog
 Phase 2 - Daily:           scrape_screenings()       → screening schedule (7 days)
-Phase 3 - Post-daily + 5h: scrape_ticket_updates()  → seat map counts
+Phase 3 - Post-daily + 5h: scrape_ticket_updates()  → seat map counts (7 days)
 Phase 4 - Every 1 min:    close_expired_screenings() → mark past screenings "closed"
 ```
 
@@ -134,7 +138,7 @@ Key functions:
 - `_upsert_screenings(db, chain, screenings)` - Main upsert: creates cinema/movie if needed, updates screening only if `total_seats > 0`, creates `TicketSnapshot` on ticket count changes
 - `_make_progress_callback(db, log)` - Returns callback that updates ScrapeLog.progress JSON in real-time
 - `_make_screening_callback(db, chain, log)` - Returns per-screening update callback + hall_data accumulator for blocked seats
-- `_finalize_blocked_seats(db, hall_data)` - Intersection-based blocked seat learning (90% threshold, 3+ scans)
+- `_finalize_blocked_seats(db, hall_data)` - Intersection-based blocked seat learning (80% threshold, 2+ scans)
 - `run_initial_scrape(db)` / `run_movieland_initial_scrape(db)` - Startup scrape if DB empty (movies → screenings, skips tickets)
 
 ## API Endpoints (backend/api/routes.py)
@@ -162,7 +166,13 @@ All under `/api/`:
 | `/analytics/movie-lifetime/{id}` | GET | All-time movie stats |
 | `/analytics/blocked-seats` | GET | Blocked seat learning stats per hall |
 | `/scrape/trigger?chain=` | POST | Trigger manual scrape (background task) |
+| `/scrape/tickets?chain=` | POST | Trigger manual ticket/seat scan (background task) |
 | `/scrape-logs?limit=20` | GET | Recent scrape logs with progress JSON |
+| `/admin/allowed-movies` | GET | List allowed movies whitelist with match status |
+| `/admin/allowed-movies?title=` | POST | Add movie to whitelist |
+| `/admin/allowed-movies/{movie_id}?is_active=` | PUT | Update allowed movie active status |
+| `/admin/allowed-movies/{movie_id}` | DELETE | Remove movie from whitelist |
+| `/admin/unmatched-titles` | GET | Scraped movies not matching the whitelist |
 
 Additional endpoints in main.py:
 - `GET /api/health` - Health check
@@ -182,7 +192,7 @@ Additional endpoints in main.py:
 Per (cinema_id, hall) in `HallSeatStats`:
 1. Each scrape run records sold seat positions
 2. `scan_count` incremented per run, `seat_sold_counts` JSON tracks per-position frequency
-3. After 3+ scans, positions sold in ≥90% of runs are classified as permanently blocked
+3. After 2+ scans, positions sold in ≥80% of runs are classified as permanently blocked
 4. `blocked_seats` JSON array and `blocked_count` updated
 5. `Screening.blocked_seats_excluded` tracks how many blocked seats were subtracted from tickets_sold
 
@@ -211,9 +221,12 @@ Per (cinema_id, hall) in `HallSeatStats`:
 
 ## Known Issues / Recent Changes
 
+- **v1.3.0**: Fixed Hot Cinema `SEAT_POOL_SIZE` undefined bug — crashed all seat counting batches silently. Fixed `_navigate_to_seat_map` returning 2-tuple instead of 3-tuple on error.
+- **v1.3.0**: Fixed Movieland ticket updater only collecting booking URLs from today. Now uses `_navigate_branch_calendar(days=7)` for full week coverage.
 - Movieland branch discovery: Uses fallback URL probing (fast) instead of homepage scanning. Fallback URLs defined in `MOVIELAND_BRANCHES[bid]["fallback_urls"]`.
-- Movieland date navigation: URL-based (`?date=`) + JS tab clicking. Old approach used `[class*="date"]` which matched `.date-cont` movie containers instead of date tabs.
+- Movieland date navigation: URL-based (`?date=`) + JS date tab clicking + dropdown/calendar for days beyond visible tabs. Old approach used `[class*="date"]` which matched `.date-cont` movie containers instead of date tabs.
 - Ticket updates are chained after daily scraping (not just independent 5h intervals).
 - Only Hot Cinema and Movieland are actively scheduled. Cinema City, Lev Cinema, Globus Max scrapers exist but are not integrated into the scheduler.
 - No test suite exists.
 - Frontend uses all inline styles with a dark theme and Heebo Hebrew font.
+- Admin page allows managing an allowed-movies whitelist; unmatched scraped titles are surfaced for review.

@@ -150,7 +150,7 @@ function App() {
         alignItems: 'center',
         gap: 16,
       }}>
-        <span>Kupacity • כל הכיסאות בפריים אחד • v1.2.0</span>
+        <span>Kupacity • כל הכיסאות בפריים אחד • v1.3.0</span>
         <span style={{
           display: 'inline-flex',
           alignItems: 'center',

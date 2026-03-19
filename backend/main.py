@@ -206,7 +206,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Kupacity - Israel Cinema Seat Analytics",
     description="כל הכיסאות בפריים אחד — דאשבורד נתוני מושבים לבתי קולנוע בישראל",
-    version="1.2.0",
+    version="1.3.0",
     lifespan=lifespan,
 )
 
