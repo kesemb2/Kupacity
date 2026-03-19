@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Float, DateTime, ForeignKey, UniqueConstraint
+from sqlalchemy import Column, Integer, String, Float, DateTime, ForeignKey, UniqueConstraint, Boolean
 from sqlalchemy.orm import relationship
 from datetime import datetime
 
@@ -114,6 +114,17 @@ class HallSeatStats(Base):
     __table_args__ = (
         UniqueConstraint("cinema_id", "hall", name="uq_hall_seat_stats"),
     )
+
+
+class AllowedMovie(Base):
+    """סרט מאושר - רק סרטים ברשימה הזו ייסרקו ויעקבו"""
+    __tablename__ = "allowed_movies"
+
+    id = Column(Integer, primary_key=True, index=True)
+    title = Column(String, unique=True, nullable=False)
+    title_normalized = Column(String, nullable=False)
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
 
 
 class ScrapeLog(Base):

@@ -17,12 +17,19 @@ import logging
 from datetime import datetime, timedelta
 from sqlalchemy.orm import Session
 
-from models.models import CinemaChain, Cinema, Movie, Screening, ScrapeLog, HallSeatStats, TicketSnapshot
+from models.models import CinemaChain, Cinema, Movie, Screening, ScrapeLog, HallSeatStats, TicketSnapshot, AllowedMovie
 from scrapers.base import BaseScraper, ScrapedMovie, ScrapedScreening
 from scrapers.hot_cinema import HotCinemaScraper, HOT_CINEMA_BRANCHES
 from scrapers.movieland import MovielandScraper, MOVIELAND_BRANCHES
+from scrapers.title_normalizer import normalize_title, match_title, extract_language
 
 logger = logging.getLogger(__name__)
+
+
+def _load_allowed_movies_cache(db: Session) -> dict:
+    """Load all active allowed movies, keyed by normalized title."""
+    allowed = db.query(AllowedMovie).filter_by(is_active=True).all()
+    return {m.title_normalized: m for m in allowed}
 
 
 def _get_or_create_chain(db: Session, name: str, name_he: str, website: str) -> CinemaChain:
@@ -148,15 +155,36 @@ def _finalize_blocked_seats(db: Session, hall_data: dict) -> None:
         db.rollback()
 
 
-def _upsert_screenings(db: Session, chain: CinemaChain, screenings: list[ScrapedScreening]):
-    """Insert new screenings or update existing ones (tickets_sold)."""
+def _upsert_screenings(db: Session, chain: CinemaChain, screenings: list[ScrapedScreening],
+                       allowed_cache: dict = None):
+    """Insert new screenings or update existing ones (tickets_sold).
+
+    If allowed_cache is provided, only movies matching the whitelist are processed.
+    When the whitelist is empty (no entries), all movies pass through.
+    """
+    if allowed_cache is None:
+        allowed_cache = _load_allowed_movies_cache(db)
+    whitelist_active = len(allowed_cache) > 0
+
     for ss in screenings:
+        canonical_title = ss.movie_title
+        detected_language = None
+
+        if whitelist_active:
+            result = match_title(ss.movie_title, allowed_cache)
+            if result is None:
+                logger.debug(f"[Whitelist] Skipping non-allowed movie: {ss.movie_title}")
+                continue
+            canonical_title, detected_language = result
+
         name_he, city_he = _lookup_hebrew(ss.cinema_name)
         cinema = _get_or_create_cinema(db, chain.id, ss.cinema_name, ss.city,
                                        name_he=name_he, city_he=city_he)
-        movie = db.query(Movie).filter_by(title=ss.movie_title).first()
+        movie = db.query(Movie).filter_by(title=canonical_title).first()
         if not movie:
-            movie = _get_or_create_movie(db, ScrapedMovie(title=ss.movie_title))
+            movie = _get_or_create_movie(db, ScrapedMovie(title=canonical_title))
+
+        language = detected_language or ss.language
 
         existing = db.query(Screening).filter_by(
             movie_id=movie.id,
@@ -177,6 +205,8 @@ def _upsert_screenings(db: Session, chain: CinemaChain, screenings: list[Scraped
                     db.add(snapshot)
                 existing.tickets_sold = ss.tickets_sold
                 existing.total_seats = ss.total_seats
+            if language:
+                existing.language = language
             existing.scraped_at = datetime.utcnow()
         else:
             screening = Screening(
@@ -185,7 +215,7 @@ def _upsert_screenings(db: Session, chain: CinemaChain, screenings: list[Scraped
                 showtime=ss.showtime,
                 hall=ss.hall,
                 format=ss.format,
-                language=ss.language,
+                language=language,
                 ticket_price=ss.ticket_price,
                 tickets_sold=ss.tickets_sold,
                 total_seats=ss.total_seats,
@@ -357,17 +387,31 @@ async def hot_cinema_weekly_movies(db: Session):
         chain = _get_or_create_chain(
             db, scraper.chain_name, scraper.chain_name_he, scraper.base_url
         )
+        allowed_cache = _load_allowed_movies_cache(db)
+        whitelist_active = len(allowed_cache) > 0
+        created = 0
         for sm in movies:
+            if whitelist_active:
+                result = match_title(sm.title, allowed_cache)
+                if result is None:
+                    continue
+                sm = ScrapedMovie(
+                    title=result[0], title_he=sm.title_he, genre=sm.genre,
+                    duration_minutes=sm.duration_minutes, release_date=sm.release_date,
+                    poster_url=sm.poster_url, rating=sm.rating, director=sm.director,
+                )
             _get_or_create_movie(db, sm)
+            created += 1
 
         duration = (datetime.utcnow() - start).total_seconds()
         log.status = "success"
-        log.movies_found = len(movies)
+        log.movies_found = created
         log.screenings_found = 0
         log.duration_seconds = duration
         log.progress = None
         db.commit()
-        logger.info(f"[Hot Cinema] Weekly movies refresh: {len(movies)} movies")
+        logger.info(f"[Hot Cinema] Weekly movies refresh: {created} movies"
+                     + (f" (filtered from {len(movies)})" if whitelist_active else ""))
     except Exception as e:
         duration = (datetime.utcnow() - start).total_seconds()
         log.status = "error"
@@ -479,17 +523,31 @@ async def movieland_weekly_movies(db: Session):
         chain = _get_or_create_chain(
             db, scraper.chain_name, scraper.chain_name_he, scraper.base_url
         )
+        allowed_cache = _load_allowed_movies_cache(db)
+        whitelist_active = len(allowed_cache) > 0
+        created = 0
         for sm in movies:
+            if whitelist_active:
+                result = match_title(sm.title, allowed_cache)
+                if result is None:
+                    continue
+                sm = ScrapedMovie(
+                    title=result[0], title_he=sm.title_he, genre=sm.genre,
+                    duration_minutes=sm.duration_minutes, release_date=sm.release_date,
+                    poster_url=sm.poster_url, rating=sm.rating, director=sm.director,
+                )
             _get_or_create_movie(db, sm)
+            created += 1
 
         duration = (datetime.utcnow() - start).total_seconds()
         log.status = "success"
-        log.movies_found = len(movies)
+        log.movies_found = created
         log.screenings_found = 0
         log.duration_seconds = duration
         log.progress = None
         db.commit()
-        logger.info(f"[Movieland] Weekly movies refresh: {len(movies)} movies")
+        logger.info(f"[Movieland] Weekly movies refresh: {created} movies"
+                     + (f" (filtered from {len(movies)})" if whitelist_active else ""))
     except Exception as e:
         duration = (datetime.utcnow() - start).total_seconds()
         log.status = "error"

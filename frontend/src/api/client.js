@@ -41,4 +41,11 @@ export const fetchDebugScreenshots = () => api.get('/debug-screenshots').then(r 
 export const getDebugScreenshotFileUrl = (filename) => `${API_BASE}/api/debug-screenshots/${filename}`;
 export const clearDebugScreenshots = () => api.delete('/debug-screenshots').then(r => r.data);
 
+// Admin - Allowed Movies
+export const fetchAllowedMovies = () => api.get('/admin/allowed-movies').then(r => r.data);
+export const addAllowedMovie = (title) => api.post(`/admin/allowed-movies?title=${encodeURIComponent(title)}`).then(r => r.data);
+export const updateAllowedMovie = (id, isActive) => api.put(`/admin/allowed-movies/${id}?is_active=${isActive}`).then(r => r.data);
+export const deleteAllowedMovie = (id) => api.delete(`/admin/allowed-movies/${id}`).then(r => r.data);
+export const fetchUnmatchedTitles = () => api.get('/admin/unmatched-titles').then(r => r.data);
+
 export default api;

@@ -8,7 +8,8 @@ from typing import Optional
 from datetime import datetime, timedelta
 
 from database import get_db, SessionLocal
-from models.models import CinemaChain, Cinema, Movie, Screening, ScrapeLog, TicketSnapshot, HallSeatStats
+from models.models import CinemaChain, Cinema, Movie, Screening, ScrapeLog, TicketSnapshot, HallSeatStats, AllowedMovie
+from scrapers.title_normalizer import normalize_title, match_title
 
 router = APIRouter(prefix="/api")
 logger = logging.getLogger(__name__)
@@ -690,6 +691,98 @@ async def trigger_ticket_scan(chain: Optional[str] = Query(default=None)):
         asyncio.create_task(run_hot_tickets())
         asyncio.create_task(run_mvl_tickets())
         return {"status": "started", "message": "סריקת כיסאות שתי הרשתות הופעלה ברקע (במקביל)."}
+
+
+# ─── Admin: Allowed Movies ───────────────────────────────────────────
+
+@router.get("/admin/allowed-movies")
+def get_allowed_movies(db: Session = Depends(get_db)):
+    """רשימת סרטים מאושרים"""
+    allowed = db.query(AllowedMovie).order_by(AllowedMovie.created_at.desc()).all()
+    result = []
+    for am in allowed:
+        matched_movies = db.query(Movie).filter(Movie.title == am.title).all()
+        screening_count = 0
+        if matched_movies:
+            movie_ids = [m.id for m in matched_movies]
+            screening_count = db.query(Screening).filter(
+                Screening.movie_id.in_(movie_ids),
+                Screening.status == "active",
+            ).count()
+        result.append({
+            "id": am.id,
+            "title": am.title,
+            "title_normalized": am.title_normalized,
+            "is_active": am.is_active,
+            "created_at": am.created_at.isoformat() if am.created_at else None,
+            "has_data": len(matched_movies) > 0,
+            "screening_count": screening_count,
+        })
+    return result
+
+
+@router.post("/admin/allowed-movies")
+def add_allowed_movie(title: str = Query(...), db: Session = Depends(get_db)):
+    """הוספת סרט לרשימה המאושרת"""
+    normalized = normalize_title(title.strip())
+    existing = db.query(AllowedMovie).filter_by(title_normalized=normalized).first()
+    if existing:
+        return {"error": "סרט עם שם דומה כבר קיים", "existing": existing.title}
+    am = AllowedMovie(
+        title=title.strip(),
+        title_normalized=normalized,
+        is_active=True,
+    )
+    db.add(am)
+    db.commit()
+    return {"id": am.id, "title": am.title, "title_normalized": am.title_normalized}
+
+
+@router.put("/admin/allowed-movies/{movie_id}")
+def update_allowed_movie(movie_id: int, is_active: bool = Query(...),
+                          db: Session = Depends(get_db)):
+    """עדכון סטטוס סרט מאושר"""
+    am = db.query(AllowedMovie).filter_by(id=movie_id).first()
+    if not am:
+        return {"error": "לא נמצא"}
+    am.is_active = is_active
+    db.commit()
+    return {"id": am.id, "is_active": am.is_active}
+
+
+@router.delete("/admin/allowed-movies/{movie_id}")
+def delete_allowed_movie(movie_id: int, db: Session = Depends(get_db)):
+    """מחיקת סרט מהרשימה המאושרת"""
+    am = db.query(AllowedMovie).filter_by(id=movie_id).first()
+    if not am:
+        return {"error": "לא נמצא"}
+    db.delete(am)
+    db.commit()
+    return {"deleted": True}
+
+
+@router.get("/admin/unmatched-titles")
+def get_unmatched_titles(db: Session = Depends(get_db)):
+    """סרטים שנסרקו אבל לא תואמים לרשימה - עוזר לאדמין לזהות סרטים חסרים"""
+    allowed_cache = {m.title_normalized: m
+                     for m in db.query(AllowedMovie).filter_by(is_active=True).all()}
+    if not allowed_cache:
+        return []  # No whitelist = nothing is "unmatched"
+    all_movies = db.query(Movie).all()
+    unmatched = []
+    for m in all_movies:
+        if not match_title(m.title, allowed_cache):
+            screening_count = db.query(Screening).filter(
+                Screening.movie_id == m.id,
+                Screening.status == "active",
+            ).count()
+            unmatched.append({
+                "id": m.id,
+                "title": m.title,
+                "title_he": m.title_he,
+                "screening_count": screening_count,
+            })
+    return unmatched
 
 
 # ─── Scrape Logs ─────────────────────────────────────────────────────

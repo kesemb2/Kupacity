@@ -7,6 +7,7 @@ import CitiesPage from './pages/CitiesPage';
 import MovieDetail from './pages/MovieDetail';
 import ScrapePage from './pages/ScrapePage';
 import AnalyticsPage from './pages/AnalyticsPage';
+import AdminPage from './pages/AdminPage';
 import { checkHealth } from './api/client';
 
 const NAV_ITEMS = [
@@ -16,6 +17,7 @@ const NAV_ITEMS = [
   { key: 'cinemas', label: 'סניפים' },
   { key: 'cities', label: 'ערים' },
   { key: 'scrape', label: 'סריקה' },
+  { key: 'admin', label: 'ניהול' },
 ];
 
 function App() {
@@ -51,6 +53,8 @@ function App() {
         return <AnalyticsPage />;
       case 'scrape':
         return <ScrapePage />;
+      case 'admin':
+        return <AdminPage />;
       case 'movieDetail':
         return <MovieDetail movieId={selectedMovieId} onBack={() => setPage('movies')} />;
       default:
