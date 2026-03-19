@@ -1487,14 +1487,53 @@ class MovielandScraper(BaseScraper):
                 });
             }
 
-            // Phase 2: Legend exclusion via Y-position gap
+            // Phase 2: Legend exclusion
+            // Method A: Find the largest Y-gap between seat rows (lowered threshold to 40px)
             const ys = imgCandidates.map(c => c.top).sort((a, b) => a - b);
             let maxGap = 0, gapY = Infinity;
             for (let i = 1; i < ys.length; i++) {
                 const gap = ys[i] - ys[i - 1];
                 if (gap > maxGap) { maxGap = gap; gapY = ys[i]; }
             }
-            const cutoffY = maxGap > 150 ? gapY : Infinity;
+            let cutoffY = maxGap > 40 ? gapY : Infinity;
+
+            // Method B: Detect legend by checking if elements are inside a
+            // container whose text contains legend labels like "זמין", "תפוס"
+            // or whose ancestors have "legend"/"key" in class/id.
+            const legendParents = new Set();
+            for (const c of imgCandidates) {
+                // Walk up from the element position to find legend containers
+                const elAtPoint = document.elementFromPoint(c.left + c.width/2, c.top + c.height/2);
+                if (!elAtPoint) continue;
+                let ancestor = elAtPoint;
+                for (let d = 0; d < 5 && ancestor; d++) {
+                    const cls = (ancestor.className || '').toString().toLowerCase();
+                    const id = (ancestor.id || '').toLowerCase();
+                    const text = ancestor.textContent || '';
+                    // Check for legend indicators
+                    if (cls.includes('legend') || cls.includes('key') || id.includes('legend') || id.includes('key')
+                        || (text.includes('זמין') && text.includes('תפוס'))) {
+                        legendParents.add(ancestor);
+                        break;
+                    }
+                    ancestor = ancestor.parentElement;
+                }
+            }
+            // If we found legend containers, mark their items
+            const legendRects = [];
+            for (const lp of legendParents) {
+                const r = lp.getBoundingClientRect();
+                legendRects.push({ top: r.top, bottom: r.bottom, left: r.left, right: r.right });
+            }
+
+            // Use the stricter cutoff: items below gap OR inside legend container
+            const isInLegend = (c) => {
+                if (c.top >= cutoffY) return true;
+                for (const lr of legendRects) {
+                    if (c.top >= lr.top && c.top <= lr.bottom && c.left >= lr.left && c.left <= lr.right) return true;
+                }
+                return false;
+            };
 
             // Phase 3: Count seats, excluding legend elements below cutoff
             let imgTotalCount = 0, imgSoldCount = 0, cutByLegend = 0;
@@ -1503,7 +1542,7 @@ class MovielandScraper(BaseScraper):
             const imgExcludedSample = [];
 
             for (const c of imgCandidates) {
-                if (c.top >= cutoffY) {
+                if (isInLegend(c)) {
                     cutByLegend++;
                     if (imgExcludedSample.length < 5) {
                         imgExcludedSample.push({
@@ -1685,11 +1724,42 @@ class MovielandScraper(BaseScraper):
                     const gap = ys[i] - ys[i - 1];
                     if (gap > maxGap) { maxGap = gap; gapY = ys[i]; }
                 }
-                const cutoffY = maxGap > 150 ? gapY : Infinity;
+                const cutoffY = maxGap > 40 ? gapY : Infinity;
+
+                // Also detect legend containers
+                const legendParents = new Set();
+                for (const c of candidates) {
+                    const elAtPoint = document.elementFromPoint(c.left + c.width/2, c.top + c.height/2);
+                    if (!elAtPoint) continue;
+                    let anc = elAtPoint;
+                    for (let d = 0; d < 5 && anc; d++) {
+                        const acls = (anc.className || '').toString().toLowerCase();
+                        const aid = (anc.id || '').toLowerCase();
+                        const text = anc.textContent || '';
+                        if (acls.includes('legend') || acls.includes('key') || aid.includes('legend') || aid.includes('key')
+                            || (text.includes('זמין') && text.includes('תפוס'))) {
+                            legendParents.add(anc);
+                            break;
+                        }
+                        anc = anc.parentElement;
+                    }
+                }
+                const legendRects = [];
+                for (const lp of legendParents) {
+                    const r = lp.getBoundingClientRect();
+                    legendRects.push({ top: r.top, bottom: r.bottom, left: r.left, right: r.right });
+                }
+                const isInLegendAnnot = (c) => {
+                    if (c.top >= cutoffY) return true;
+                    for (const lr of legendRects) {
+                        if (c.top >= lr.top && c.top <= lr.bottom && c.left >= lr.left && c.left <= lr.right) return true;
+                    }
+                    return false;
+                };
 
                 // Draw overlays with legend elements in blue
                 for (const c of candidates) {
-                    const isLegend = c.top >= cutoffY;
+                    const isLegend = isInLegendAnnot(c);
                     const borderColor = isLegend ? '#0088ff'
                         : c.isSold ? '#ff0000'
                         : c.isAvail ? '#00ff00'
@@ -2045,7 +2115,26 @@ class MovielandScraper(BaseScraper):
                             return None
 
                         logger.info(f"[Movieland] Redirected to: {p.url}")
-                        await asyncio.sleep(2)  # Reduced from 3s
+
+                        # Wait for seat elements to appear (up to 15s)
+                        try:
+                            await p.wait_for_selector(
+                                'image[href*="mvl-seat"], [style*="mvl-seat"]',
+                                timeout=15000
+                            )
+                        except Exception:
+                            logger.debug(f"[Movieland] Seat selector timeout, will still try counting")
+
+                        # Extra stabilization: wait until seat count stops changing
+                        prev_count = 0
+                        for _ in range(6):
+                            cur_count = await p.evaluate("""() => {
+                                return document.querySelectorAll('image[href*="mvl-seat"], [style*="mvl-seat"]').length;
+                            }""")
+                            if cur_count > 0 and cur_count == prev_count:
+                                break
+                            prev_count = cur_count
+                            await asyncio.sleep(0.5)
 
                         try:
                             await p.screenshot(path=_debug_screenshot_path(
@@ -2058,7 +2147,26 @@ class MovielandScraper(BaseScraper):
                             pass
                     else:
                         await self._open_url(p, booking_url, wait_for_network=True)
-                        await asyncio.sleep(2)  # Reduced from 3s
+
+                        # Wait for seat elements to appear (up to 15s)
+                        try:
+                            await p.wait_for_selector(
+                                'image[href*="mvl-seat"], [style*="mvl-seat"]',
+                                timeout=15000
+                            )
+                        except Exception:
+                            logger.debug(f"[Movieland] Seat selector timeout, will still try counting")
+
+                        # Extra stabilization: wait until seat count stops changing
+                        prev_count = 0
+                        for _ in range(6):
+                            cur_count = await p.evaluate("""() => {
+                                return document.querySelectorAll('image[href*="mvl-seat"], [style*="mvl-seat"]').length;
+                            }""")
+                            if cur_count > 0 and cur_count == prev_count:
+                                break
+                            prev_count = cur_count
+                            await asyncio.sleep(0.5)
 
                     total, sold, sold_positions = await self._count_seats_on_page(
                         p,

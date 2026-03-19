@@ -1895,7 +1895,7 @@ class HotCinemaScraper(BaseScraper):
 
         # Phase 5: Navigate seat maps in batches to prevent OOM
         # Each batch gets a fresh browser to keep memory under control
-        BATCH_SIZE = 50
+        BATCH_SIZE = 25
         screening_counter = 0
 
         for batch_start in range(0, len(seat_tasks), BATCH_SIZE):
@@ -1905,88 +1905,112 @@ class HotCinemaScraper(BaseScraper):
             logger.info(f"[Hot Cinema] Seat batch {batch_num}/{total_batches}: "
                         f"{len(batch)} screenings")
 
-            pw2, browser2, context2 = await self._launch_browser()
-            try:
-                seat_pages = [await context2.new_page() for _ in range(SEAT_POOL_SIZE)]
-                seat_sem = asyncio.Semaphore(SEAT_POOL_SIZE)
+            # Retry batch up to 2 times on connection/browser crashes
+            for attempt in range(2):
+                pw2, browser2, context2 = await self._launch_browser()
+                try:
+                    seat_pages = [await context2.new_page() for _ in range(SEAT_POOL_SIZE)]
+                    seat_sem = asyncio.Semaphore(SEAT_POOL_SIZE)
 
-                async def _check_seats(task_idx, info, booking_url):
-                    nonlocal screening_counter
-                    async with seat_sem:
-                        screening_counter += 1
-                        if on_progress:
-                            on_progress("סורק כיסאות", screening_counter, len(seat_tasks), info["movie_title"])
+                    async def _check_seats(task_idx, info, booking_url):
+                        nonlocal screening_counter
+                        async with seat_sem:
+                            screening_counter += 1
+                            if on_progress:
+                                on_progress("סורק כיסאות", screening_counter, len(seat_tasks), info["movie_title"])
 
-                        total_seats = 0
-                        tickets_sold = 0
-                        seat_positions = []
+                            total_seats = 0
+                            tickets_sold = 0
+                            seat_positions = []
 
-                        if booking_url:
-                            try:
-                                p = seat_pages[task_idx % SEAT_POOL_SIZE]
-                                total, sold, positions = await self._navigate_to_seat_map(
-                                    p, booking_url,
-                                    movie_title=info["movie_title"],
-                                    screening_time=info["showtime"].strftime("%H%M"),
-                                    branch=info["cinema_name"],
-                                )
-                                if total > 0:
-                                    total_seats = total
-                                    tickets_sold = sold
-                                    seat_positions = positions
-                                    logger.info(
-                                        f"  [{info['cinema_name']}] {info['movie_title']} "
-                                        f"{info['showtime'].strftime('%d/%m %H:%M')}: "
-                                        f"{tickets_sold}/{total_seats} seats"
+                            if booking_url:
+                                try:
+                                    p = seat_pages[task_idx % SEAT_POOL_SIZE]
+                                    total, sold, positions = await self._navigate_to_seat_map(
+                                        p, booking_url,
+                                        movie_title=info["movie_title"],
+                                        screening_time=info["showtime"].strftime("%H%M"),
+                                        branch=info["cinema_name"],
                                     )
+                                    if total > 0:
+                                        total_seats = total
+                                        tickets_sold = sold
+                                        seat_positions = positions
+                                        logger.info(
+                                            f"  [{info['cinema_name']}] {info['movie_title']} "
+                                            f"{info['showtime'].strftime('%d/%m %H:%M')}: "
+                                            f"{tickets_sold}/{total_seats} seats"
+                                        )
+                                except Exception as e:
+                                    logger.debug(f"[Hot Cinema] Seat map failed: {e}")
+                            else:
+                                tid = str(info.get("theater_id", ""))
+                                eid = str(info.get("event_id", ""))
+                                site_id = theater_to_site.get(tid, "")
+                                logger.debug(
+                                    f"[Hot Cinema] No booking URL for TheaterID={tid} EventId={eid} "
+                                    f"(siteId mapping: {'found' if site_id else 'missing'})"
+                                )
+
+                            return info, total_seats, tickets_sold, seat_positions
+
+                    seat_results = await asyncio.gather(*[
+                        _check_seats(i, info, burl)
+                        for i, (info, burl) in enumerate(batch)
+                    ], return_exceptions=True)
+
+                    for result in seat_results:
+                        if isinstance(result, Exception):
+                            logger.debug(f"[Hot Cinema] Seat task failed: {result}")
+                            continue
+
+                        info, total_seats, tickets_sold, seat_positions = result
+                        screening = ScrapedScreening(
+                            movie_title=info["movie_title"],
+                            cinema_name=info["cinema_name"],
+                            city=info["city"],
+                            showtime=info["showtime"],
+                            hall=info["hall"],
+                            format=info["format"],
+                            language=info.get("language", "subtitled"),
+                            ticket_price=39.0,
+                            total_seats=total_seats,
+                            tickets_sold=tickets_sold,
+                            sold_positions=seat_positions,
+                        )
+                        screening.revenue = screening.tickets_sold * screening.ticket_price
+                        all_screenings.append(screening)
+
+                        if on_screening_update:
+                            try:
+                                on_screening_update(screening)
                             except Exception as e:
-                                logger.debug(f"[Hot Cinema] Seat map failed: {e}")
-                        else:
-                            tid = str(info.get("theater_id", ""))
-                            eid = str(info.get("event_id", ""))
-                            site_id = theater_to_site.get(tid, "")
-                            logger.debug(
-                                f"[Hot Cinema] No booking URL for TheaterID={tid} EventId={eid} "
-                                f"(siteId mapping: {'found' if site_id else 'missing'})"
-                            )
-
-                        return info, total_seats, tickets_sold, seat_positions
-
-                seat_results = await asyncio.gather(*[
-                    _check_seats(i, info, burl)
-                    for i, (info, burl) in enumerate(batch)
-                ], return_exceptions=True)
-
-                for result in seat_results:
-                    if isinstance(result, Exception):
-                        logger.debug(f"[Hot Cinema] Seat task failed: {result}")
+                                logger.debug(f"[Hot Cinema] Screening save callback failed: {e}")
+                    break  # Success — no need to retry
+                except Exception as e:
+                    err_msg = str(e).lower()
+                    if ("connection closed" in err_msg or "browser has been closed" in err_msg
+                            or "target closed" in err_msg) and attempt < 1:
+                        logger.warning(
+                            f"[Hot Cinema] Browser crashed in batch {batch_num} (attempt {attempt+1}): {e}. "
+                            f"Retrying with fresh browser..."
+                        )
+                        # Reset counter for retry
+                        screening_counter -= len(batch)
+                        await asyncio.sleep(2)
                         continue
-
-                    info, total_seats, tickets_sold, seat_positions = result
-                    screening = ScrapedScreening(
-                        movie_title=info["movie_title"],
-                        cinema_name=info["cinema_name"],
-                        city=info["city"],
-                        showtime=info["showtime"],
-                        hall=info["hall"],
-                        format=info["format"],
-                        language=info.get("language", "subtitled"),
-                        ticket_price=39.0,
-                        total_seats=total_seats,
-                        tickets_sold=tickets_sold,
-                        sold_positions=seat_positions,
-                    )
-                    screening.revenue = screening.tickets_sold * screening.ticket_price
-                    all_screenings.append(screening)
-
-                    if on_screening_update:
-                        try:
-                            on_screening_update(screening)
-                        except Exception as e:
-                            logger.debug(f"[Hot Cinema] Screening save callback failed: {e}")
-            finally:
-                await browser2.close()
-                await pw2.stop()
+                    else:
+                        logger.error(f"[Hot Cinema] Seat batch {batch_num} failed: {e}")
+                        break
+                finally:
+                    try:
+                        await browser2.close()
+                    except Exception:
+                        pass
+                    try:
+                        await pw2.stop()
+                    except Exception:
+                        pass
 
         logger.info(f"[Hot Cinema] Ticket update: {len(all_screenings)} screenings counted")
         return all_screenings
