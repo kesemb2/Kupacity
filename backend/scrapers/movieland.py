@@ -2028,8 +2028,8 @@ class MovielandScraper(BaseScraper):
                 async with branch_sem:
                     p = pages[idx % PAGE_POOL_SIZE]
                     url = branch_urls[bid]
-                    _, _, booking_items = await self._scrape_branch_page(
-                        p, url, binfo, collect_booking_urls=True
+                    _, _, booking_items = await self._navigate_branch_calendar(
+                        p, url, binfo, days=7, collect_booking_urls=True
                     )
                     return booking_items
 
