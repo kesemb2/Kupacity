@@ -154,7 +154,8 @@ class HotCinemaScraper(BaseScraper):
                 "--disable-dev-shm-usage",
                 "--disable-gpu",
                 "--disable-infobars",
-                "--js-flags=--max-old-space-size=512",
+                "--single-process",
+                "--js-flags=--max-old-space-size=256",
             ],
             proxy=proxy_cfg,
         )
@@ -1652,100 +1653,97 @@ class HotCinemaScraper(BaseScraper):
     async def scrape_screenings(self, on_progress=None) -> list[ScrapedScreening]:
         """Daily: fetch screenings via API (seat counts deferred to ticket updates)."""
         all_screenings: list[ScrapedScreening] = []
-        pw, browser, context = await self._launch_browser()
-        try:
-            # Create page pool for parallel operations
-            PAGE_POOL_SIZE = 5
-            pages = [await context.new_page() for _ in range(PAGE_POOL_SIZE)]
 
-            # Step 1: Collect unique movie URLs from all branches (parallel)
-            movie_urls: dict[str, str] = {}  # title -> URL
-            branch_items = list(HOT_CINEMA_BRANCHES.items())
-            branch_sem = asyncio.Semaphore(PAGE_POOL_SIZE)
+        # Step 1: Collect unique movie URLs — one branch at a time to save memory
+        movie_urls: dict[str, str] = {}
+        branch_items = list(HOT_CINEMA_BRANCHES.items())
 
-            async def _scrape_branch(idx, branch_id, branch_info):
-                async with branch_sem:
-                    p = pages[idx % PAGE_POOL_SIZE]
-                    return await self._scrape_theater_page(p, branch_id, branch_info)
-
-            branch_results = await asyncio.gather(*[
-                _scrape_branch(i, bid, binfo)
-                for i, (bid, binfo) in enumerate(branch_items)
-            ], return_exceptions=True)
-
-            for idx, result in enumerate(branch_results):
-                if on_progress:
-                    on_progress("סורק סניפים", idx + 1, len(branch_items), branch_items[idx][1]["name"])
-                if isinstance(result, Exception):
-                    logger.warning(f"[Hot Cinema] Branch {branch_items[idx][0]} failed: {result}")
-                    continue
+        for branch_idx, (bid, binfo) in enumerate(branch_items):
+            if on_progress:
+                on_progress("סורק סניפים", branch_idx + 1, len(branch_items), binfo["name"])
+            pw, browser, context = await self._launch_browser()
+            try:
+                page = await context.new_page()
+                result = await self._scrape_theater_page(page, bid, binfo)
                 for m in result:
                     if m.detail_url and m.title not in movie_urls:
                         movie_urls[m.title] = m.detail_url
+            except Exception as e:
+                logger.warning(f"[Hot Cinema] Branch {bid} failed: {e}")
+            finally:
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
+                try:
+                    await pw.stop()
+                except Exception:
+                    pass
 
-            logger.info(f"[Hot Cinema] Found {len(movie_urls)} unique movie URLs")
+        logger.info(f"[Hot Cinema] Found {len(movie_urls)} unique movie URLs")
 
-            # Step 2: Extract movie IDs and apply test limit
-            movie_list: list[tuple[str, str, str]] = []  # (title, url, movie_id)
-            for title, url in movie_urls.items():
-                mid = _extract_movie_id(url)
-                if mid:
-                    movie_list.append((title, url, mid))
+        # Step 2: Extract movie IDs and apply test limit
+        movie_list: list[tuple[str, str, str]] = []
+        for title, url in movie_urls.items():
+            mid = _extract_movie_id(url)
+            if mid:
+                movie_list.append((title, url, mid))
 
-            if self._TEST_MOVIE_LIMIT:
-                movie_list = movie_list[:self._TEST_MOVIE_LIMIT]
-                logger.info(f"[Hot Cinema] Testing with {len(movie_list)} movies")
+        if self._TEST_MOVIE_LIMIT:
+            movie_list = movie_list[:self._TEST_MOVIE_LIMIT]
+            logger.info(f"[Hot Cinema] Testing with {len(movie_list)} movies")
 
-            # Step 3: Fetch screenings via direct API calls (7 days) — parallel
-            api_sem = asyncio.Semaphore(PAGE_POOL_SIZE)
-            progress_counter = 0
+        # Step 3: Fetch screenings via API — sequential, fresh browser per batch
+        BATCH_SIZE = 10
+        all_infos: list[dict] = []
+        progress_counter = 0
 
-            async def _fetch_movie_screenings(idx, title, url, mid):
-                nonlocal progress_counter
-                async with api_sem:
-                    p = pages[idx % PAGE_POOL_SIZE]
-                    result = await self._fetch_screenings_api(p, mid, title, days=7)
+        for batch_start in range(0, len(movie_list), BATCH_SIZE):
+            batch = movie_list[batch_start:batch_start + BATCH_SIZE]
+            pw, browser, context = await self._launch_browser()
+            try:
+                page = await context.new_page()
+                for title, url, mid in batch:
+                    try:
+                        infos = await self._fetch_screenings_api(page, mid, title, days=7)
+                        all_infos.extend(infos)
+                    except Exception as e:
+                        logger.warning(f"[Hot Cinema] API fetch failed for {title}: {e}")
                     progress_counter += 1
                     if on_progress:
                         on_progress("סורק הקרנות", progress_counter, len(movie_list), title)
-                    return result
+            except Exception as e:
+                logger.warning(f"[Hot Cinema] Batch {batch_start // BATCH_SIZE + 1} failed: {e}")
+            finally:
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
+                try:
+                    await pw.stop()
+                except Exception:
+                    pass
 
-            api_results = await asyncio.gather(*[
-                _fetch_movie_screenings(i, t, u, m)
-                for i, (t, u, m) in enumerate(movie_list)
-            ], return_exceptions=True)
+        logger.info(f"[Hot Cinema] Total screenings from API: {len(all_infos)}")
 
-            all_infos: list[dict] = []
-            for result in api_results:
-                if isinstance(result, Exception):
-                    logger.warning(f"[Hot Cinema] API fetch failed: {result}")
-                    continue
-                all_infos.extend(result)
-
-            logger.info(f"[Hot Cinema] Total screenings from API: {len(all_infos)}")
-
-            # Step 4: Build screenings (seat counts deferred to scrape_ticket_updates)
-            for info in all_infos:
-                if info["showtime"] < datetime.now():
-                    continue
-
-                screening = ScrapedScreening(
-                    movie_title=info["movie_title"],
-                    cinema_name=info["cinema_name"],
-                    city=info["city"],
-                    showtime=info["showtime"],
-                    hall=info["hall"],
-                    format=info["format"],
-                    language=info.get("language", "subtitled"),
-                    ticket_price=39.0,
-                    total_seats=0,
-                    tickets_sold=0,
-                )
-                screening.revenue = 0
-                all_screenings.append(screening)
-        finally:
-            await browser.close()
-            await pw.stop()
+        # Step 4: Build screenings (seat counts deferred to scrape_ticket_updates)
+        for info in all_infos:
+            if info["showtime"] < datetime.now():
+                continue
+            screening = ScrapedScreening(
+                movie_title=info["movie_title"],
+                cinema_name=info["cinema_name"],
+                city=info["city"],
+                showtime=info["showtime"],
+                hall=info["hall"],
+                format=info["format"],
+                language=info.get("language", "subtitled"),
+                ticket_price=39.0,
+                total_seats=0,
+                tickets_sold=0,
+            )
+            screening.revenue = 0
+            all_screenings.append(screening)
 
         logger.info(f"[Hot Cinema] Daily scrape: {len(all_screenings)} screenings from {len(movie_list)} movies")
         return all_screenings
@@ -1753,82 +1751,83 @@ class HotCinemaScraper(BaseScraper):
     async def scrape_ticket_updates(self, on_progress=None, on_screening_update=None) -> list[ScrapedScreening]:
         """Every 5 hours: fetch screenings via API, navigate seat maps for occupancy."""
         all_screenings: list[ScrapedScreening] = []
-        pw, browser, context = await self._launch_browser()
-        try:
-            PAGE_POOL_SIZE = 5
-            SEAT_POOL_SIZE = 4
-            pages = [await context.new_page() for _ in range(PAGE_POOL_SIZE)]
 
-            # Phase 1: Collect movie URLs from all branches (parallel)
-            movie_urls: dict[str, str] = {}
-            branch_items = list(HOT_CINEMA_BRANCHES.items())
-            branch_sem = asyncio.Semaphore(PAGE_POOL_SIZE)
+        # Phase 1: Collect movie URLs — one branch at a time
+        movie_urls: dict[str, str] = {}
+        branch_items = list(HOT_CINEMA_BRANCHES.items())
 
-            async def _scrape_branch(idx, branch_id, branch_info):
-                async with branch_sem:
-                    p = pages[idx % PAGE_POOL_SIZE]
-                    return await self._scrape_theater_page(p, branch_id, branch_info)
-
-            branch_results = await asyncio.gather(*[
-                _scrape_branch(i, bid, binfo)
-                for i, (bid, binfo) in enumerate(branch_items)
-            ], return_exceptions=True)
-
-            for idx, result in enumerate(branch_results):
-                if on_progress:
-                    on_progress("סורק סניפים", idx + 1, len(branch_items), branch_items[idx][1]["name"])
-                if isinstance(result, Exception):
-                    logger.warning(f"[Hot Cinema] Branch {branch_items[idx][0]} failed: {result}")
-                    continue
+        for branch_idx, (bid, binfo) in enumerate(branch_items):
+            if on_progress:
+                on_progress("סורק סניפים", branch_idx + 1, len(branch_items), binfo["name"])
+            pw, browser, context = await self._launch_browser()
+            try:
+                page = await context.new_page()
+                result = await self._scrape_theater_page(page, bid, binfo)
                 for m in result:
                     if m.detail_url and m.title not in movie_urls:
                         movie_urls[m.title] = m.detail_url
+            except Exception as e:
+                logger.warning(f"[Hot Cinema] Branch {bid} failed: {e}")
+            finally:
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
+                try:
+                    await pw.stop()
+                except Exception:
+                    pass
 
-            # Extract movie IDs
-            movie_list: list[tuple[str, str, str]] = []
-            for title, url in movie_urls.items():
-                mid = _extract_movie_id(url)
-                if mid:
-                    movie_list.append((title, url, mid))
+        # Extract movie IDs
+        movie_list: list[tuple[str, str, str]] = []
+        for title, url in movie_urls.items():
+            mid = _extract_movie_id(url)
+            if mid:
+                movie_list.append((title, url, mid))
 
-            logger.info(f"[Hot Cinema] Ticket update: checking {len(movie_list)} movies")
+        logger.info(f"[Hot Cinema] Ticket update: checking {len(movie_list)} movies")
 
-            if self._TEST_MOVIE_LIMIT:
-                movie_list = movie_list[:self._TEST_MOVIE_LIMIT]
-                logger.info(f"[Hot Cinema] Ticket update: limited to {len(movie_list)} movies")
+        if self._TEST_MOVIE_LIMIT:
+            movie_list = movie_list[:self._TEST_MOVIE_LIMIT]
+            logger.info(f"[Hot Cinema] Ticket update: limited to {len(movie_list)} movies")
 
-            # Phase 2: Fetch screenings via API for all movies (parallel)
-            api_sem = asyncio.Semaphore(PAGE_POOL_SIZE)
+        # Phase 2: Fetch screenings via API — sequential, fresh browser per batch
+        BATCH_SIZE = 10
+        movies_with_screenings: list[tuple[str, str, list[dict]]] = []
 
-            async def _fetch_movie(idx, title, url, mid):
-                async with api_sem:
-                    p = pages[idx % PAGE_POOL_SIZE]
-                    infos = await self._fetch_screenings_api(p, mid, title, days=7)
-                    future = [i for i in infos if i["showtime"] >= datetime.now()]
-                    return title, url, future
+        for batch_start in range(0, len(movie_list), BATCH_SIZE):
+            batch = movie_list[batch_start:batch_start + BATCH_SIZE]
+            pw, browser, context = await self._launch_browser()
+            try:
+                page = await context.new_page()
+                for title, url, mid in batch:
+                    try:
+                        infos = await self._fetch_screenings_api(page, mid, title, days=7)
+                        future = [i for i in infos if i["showtime"] >= datetime.now()]
+                        if future:
+                            movies_with_screenings.append((title, url, future))
+                    except Exception as e:
+                        logger.warning(f"[Hot Cinema] API fetch failed for {title}: {e}")
+            except Exception as e:
+                logger.warning(f"[Hot Cinema] API batch failed: {e}")
+            finally:
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
+                try:
+                    await pw.stop()
+                except Exception:
+                    pass
 
-            api_results = await asyncio.gather(*[
-                _fetch_movie(i, t, u, m)
-                for i, (t, u, m) in enumerate(movie_list)
-            ], return_exceptions=True)
+        # Phase 3: Discover TheaterID→siteId mapping — fresh browser
+        theater_to_site: dict[str, str] = {}
+        all_future_infos = [info for _, _, infos in movies_with_screenings for info in infos]
+        all_theater_ids = {str(i.get("theater_id", "")) for i in all_future_infos if i.get("theater_id")}
 
-            # Collect all future screenings per movie
-            movies_with_screenings: list[tuple[str, str, list[dict]]] = []
-            for result in api_results:
-                if isinstance(result, Exception):
-                    logger.warning(f"[Hot Cinema] API fetch failed: {result}")
-                    continue
-                title, url, future_infos = result
-                if future_infos:
-                    movies_with_screenings.append((title, url, future_infos))
-
-            # Phase 3: Discover TheaterID→siteId mapping (sequential — needs movie page navigation)
-            theater_to_site: dict[str, str] = {}
-            discovery_page = pages[0]
-
-            all_future_infos = [info for _, _, infos in movies_with_screenings for info in infos]
-            # Collect all unique theater IDs we need to map
-            all_theater_ids = {str(i.get("theater_id", "")) for i in all_future_infos if i.get("theater_id")}
+        pw, browser, context = await self._launch_browser()
+        try:
+            discovery_page = await context.new_page()
 
             for title, url, future_infos in movies_with_screenings:
                 unmapped_theaters = {
@@ -1836,7 +1835,6 @@ class HotCinemaScraper(BaseScraper):
                     for i in future_infos
                     if str(i.get("theater_id", "")) and str(i.get("theater_id", "")) not in theater_to_site
                 }
-
                 if not unmapped_theaters:
                     continue
 
@@ -1864,37 +1862,42 @@ class HotCinemaScraper(BaseScraper):
                                     )
                                 break
 
-                # Stop early if we've mapped all known theater IDs
                 if all_theater_ids <= set(theater_to_site.keys()):
                     logger.info("[Hot Cinema] All theater IDs mapped, skipping remaining movie pages")
                     break
-
-            logger.info(f"[Hot Cinema] TheaterID→siteId mapping: {theater_to_site}")
-
-            # Phase 4: Build screening tasks with booking URLs
-            seat_tasks: list[tuple[dict, str]] = []  # (info, booking_url)
-            for _, _, future_infos in movies_with_screenings:
-                for info in future_infos:
-                    tid = str(info.get("theater_id", ""))
-                    eid = str(info.get("event_id", ""))
-                    site_id = theater_to_site.get(tid, "")
-
-                    booking_url = ""
-                    if site_id and eid:
-                        booking_url = (
-                            f"https://tickets.hotcinema.co.il/site/{site_id}"
-                            f"?code={site_id}-{eid}"
-                            f"&saleChannelCode=WEB&languageid=he_IL"
-                        )
-                    seat_tasks.append((info, booking_url))
-
-            logger.info(f"[Hot Cinema] Seat map: {len(seat_tasks)} screenings to check, "
-                        f"{sum(1 for _, url in seat_tasks if url)} with booking URLs")
-
+        except Exception as e:
+            logger.warning(f"[Hot Cinema] Theater mapping failed: {e}")
         finally:
-            # Close discovery browser before starting seat map phase
-            await browser.close()
-            await pw.stop()
+            try:
+                await browser.close()
+            except Exception:
+                pass
+            try:
+                await pw.stop()
+            except Exception:
+                pass
+
+        logger.info(f"[Hot Cinema] TheaterID→siteId mapping: {theater_to_site}")
+
+        # Phase 4: Build screening tasks with booking URLs
+        seat_tasks: list[tuple[dict, str]] = []
+        for _, _, future_infos in movies_with_screenings:
+            for info in future_infos:
+                tid = str(info.get("theater_id", ""))
+                eid = str(info.get("event_id", ""))
+                site_id = theater_to_site.get(tid, "")
+
+                booking_url = ""
+                if site_id and eid:
+                    booking_url = (
+                        f"https://tickets.hotcinema.co.il/site/{site_id}"
+                        f"?code={site_id}-{eid}"
+                        f"&saleChannelCode=WEB&languageid=he_IL"
+                    )
+                seat_tasks.append((info, booking_url))
+
+        logger.info(f"[Hot Cinema] Seat map: {len(seat_tasks)} screenings to check, "
+                    f"{sum(1 for _, url in seat_tasks if url)} with booking URLs")
 
         # Phase 5: Navigate seat maps in batches to prevent OOM
         # Each batch gets a fresh browser to keep memory under control
