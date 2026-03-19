@@ -1581,7 +1581,7 @@ class HotCinemaScraper(BaseScraper):
 
         except Exception as e:
             logger.warning(f"[Hot Cinema] Seat map navigation failed: {e}")
-            return 0, 0
+            return 0, 0, []
 
     # ------------------------------------------------------------------
     # Scrape implementations
@@ -1900,6 +1900,7 @@ class HotCinemaScraper(BaseScraper):
         # Phase 5: Navigate seat maps in batches to prevent OOM
         # Each batch gets a fresh browser to keep memory under control
         BATCH_SIZE = 25
+        SEAT_POOL_SIZE = 3
         screening_counter = 0
 
         for batch_start in range(0, len(seat_tasks), BATCH_SIZE):
