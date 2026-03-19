@@ -154,7 +154,6 @@ class HotCinemaScraper(BaseScraper):
                 "--disable-dev-shm-usage",
                 "--disable-gpu",
                 "--disable-infobars",
-                "--single-process",
                 "--js-flags=--max-old-space-size=512",
             ],
             proxy=proxy_cfg,
@@ -210,12 +209,16 @@ class HotCinemaScraper(BaseScraper):
                         wait_for_network: bool = False):
         await self._human_delay()
         try:
-            wait_until = "networkidle" if wait_for_network else "domcontentloaded"
-            await page.goto(url, wait_until=wait_until, timeout=45000)
+            await page.goto(url, wait_until="domcontentloaded", timeout=45000)
+            if wait_for_network:
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=15000)
+                except Exception:
+                    pass  # Network didn't fully settle — continue anyway
         except Exception as e:
             logger.warning(f"[Hot Cinema] Page load timeout for {url}: {e}")
 
-        await asyncio.sleep(1)  # Reduced from 2s — page already loaded
+        await asyncio.sleep(2)
 
         if take_debug_screenshot:
             try:
@@ -1385,8 +1388,8 @@ class HotCinemaScraper(BaseScraper):
             if site_match:
                 seats_url = f"{site_match.group(1)}/seats"
                 logger.info(f"[Hot Cinema] Seat map: trying shortcut to {seats_url}")
-                await page.goto(seats_url, wait_until="networkidle", timeout=15000)
-                await asyncio.sleep(1.5)
+                await page.goto(seats_url, wait_until="domcontentloaded", timeout=30000)
+                await asyncio.sleep(3)
 
                 if "/seats" in page.url:
                     logger.info(f"[Hot Cinema] Seat map: shortcut worked → {page.url}")
@@ -1502,7 +1505,7 @@ class HotCinemaScraper(BaseScraper):
 
             if plus_clicked:
                 logger.info(f"[Hot Cinema] Seat map: clicked + button via {plus_clicked}")
-                await asyncio.sleep(1)
+                await asyncio.sleep(2)
                 # Step 2 screenshot: after clicking +
                 try:
                     await page.screenshot(path=_debug_screenshot_path("step2_plus_click", movie_title, screening_time, branch=branch))
@@ -1549,12 +1552,12 @@ class HotCinemaScraper(BaseScraper):
 
             if proceed_clicked:
                 logger.info(f"[Hot Cinema] Seat map: clicked המשך button via {proceed_clicked}")
-                await asyncio.sleep(1)
+                await asyncio.sleep(2)
                 try:
-                    await page.wait_for_load_state("networkidle", timeout=10000)
+                    await page.wait_for_load_state("networkidle", timeout=15000)
                 except Exception:
                     pass
-                await asyncio.sleep(1.5)
+                await asyncio.sleep(2)
                 # Step 3 screenshot: after clicking המשך
                 try:
                     await page.screenshot(path=_debug_screenshot_path("step3_continue", movie_title, screening_time, branch=branch))

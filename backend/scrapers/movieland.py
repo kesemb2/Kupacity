@@ -212,7 +212,6 @@ class MovielandScraper(BaseScraper):
                 "--disable-dev-shm-usage",
                 "--disable-gpu",
                 "--disable-infobars",
-                "--single-process",
                 "--js-flags=--max-old-space-size=512",
             ],
             proxy=proxy_cfg,
